@@ -1,0 +1,235 @@
+import { useState, useEffect } from 'react';
+import { Card, CardContent, CardHeader, CardTitle } from './ui/card';
+import { Label } from './ui/label';
+import { Input } from './ui/input';
+import { useTrackerStore } from '../store/useTrackerStore';
+import { Button } from './ui/button';
+import { LogOut, Check, RefreshCw, Database } from 'lucide-react';
+import { useAuthStore } from '../store/useAuthStore';
+import { logger } from '../lib/logger';
+import { invoke } from '@tauri-apps/api/core';
+
+interface QueueStats {
+  pending_count: number;
+  failed_count: number;
+  sent_count: number;
+  pending_by_type: Record<string, number>;
+}
+
+export function Settings() {
+  const { idleThreshold, setIdleThreshold } = useTrackerStore();
+  const { logout, user } = useAuthStore();
+  const [threshold, setThreshold] = useState(idleThreshold);
+  const [isSaving, setIsSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [queueStats, setQueueStats] = useState<QueueStats | null>(null);
+  const [isLoadingStats, setIsLoadingStats] = useState(false);
+
+  // Sync local state with store when idleThreshold changes
+  useEffect(() => {
+    setThreshold(idleThreshold);
+  }, [idleThreshold]);
+
+  // Load sync queue stats
+  const loadQueueStats = async () => {
+    setIsLoadingStats(true);
+    try {
+      const stats = await invoke<QueueStats>('get_sync_queue_stats');
+      setQueueStats(stats);
+    } catch (error) {
+      logger.error('SETTINGS', 'Failed to load queue stats', error);
+    } finally {
+      setIsLoadingStats(false);
+    }
+  };
+
+  useEffect(() => {
+    loadQueueStats();
+    // Refresh every 10 seconds
+    const interval = setInterval(loadQueueStats, 10000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const handleSave = async () => {
+    setIsSaving(true);
+    setSaved(false);
+    
+    try {
+      // Validate threshold (must be at least 1 minute)
+      const validThreshold = Math.max(1, Math.floor(threshold));
+      setThreshold(validThreshold);
+      setIdleThreshold(validThreshold);
+      
+      // Log for debugging
+      await logger.safeLogToRust(`[SETTINGS] Idle threshold saved: ${validThreshold} minutes`).catch((e) => {
+        logger.debug('SETTINGS', 'Failed to log (non-critical)', e);
+      });
+      
+      // Show notification
+      await invoke('show_notification', {
+        title: 'Настройки сохранены',
+        body: `Порог неактивности установлен: ${validThreshold} ${validThreshold === 1 ? 'минута' : validThreshold < 5 ? 'минуты' : 'минут'}`,
+      }).catch((e) => {
+        logger.warn('SETTINGS', 'Failed to show notification (non-critical)', e);
+      });
+      
+      setSaved(true);
+      // Hide saved indicator after 2 seconds
+      setTimeout(() => {
+        setSaved(false);
+      }, 2000);
+    } catch (error) {
+      logger.error('SETTINGS', 'Failed to save settings', error);
+      await invoke('show_notification', {
+        title: 'Ошибка',
+        body: 'Не удалось сохранить настройки',
+      }).catch((e) => {
+        logger.warn('SETTINGS', 'Failed to show error notification (non-critical)', e);
+      });
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  return (
+    <div className="space-y-3">
+      <Card className="border-2">
+        <CardHeader className="pb-3">
+          <CardTitle className="text-base">Настройки</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-3 pt-0">
+          <div className="space-y-2">
+            <Label htmlFor="idle-threshold" className="text-sm">
+              Порог неактивности (мин)
+            </Label>
+            <div className="flex gap-2">
+              <Input
+                id="idle-threshold"
+                type="number"
+                min="1"
+                value={threshold}
+                onChange={(e) => {
+                  const value = Number(e.target.value);
+                  setThreshold(Math.max(1, value || 1));
+                  setSaved(false); // Reset saved indicator when value changes
+                }}
+                className="h-9"
+                disabled={isSaving}
+              />
+              <Button 
+                onClick={handleSave} 
+                size="default" 
+                className="h-9 px-4"
+                disabled={isSaving || threshold === idleThreshold}
+              >
+                {isSaving ? (
+                  'Сохранение...'
+                ) : saved ? (
+                  <>
+                    <Check className="h-3.5 w-3.5 mr-1" />
+                    Сохранено
+                  </>
+                ) : (
+                  'Сохранить'
+                )}
+              </Button>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Автопауза при неактивности более {idleThreshold} {idleThreshold === 1 ? 'минуты' : idleThreshold < 5 ? 'минут' : 'минут'}
+            </p>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card className="border-2">
+        <CardHeader className="pb-3">
+          <CardTitle className="text-base">Профиль</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-3 pt-0">
+          {user && (
+            <div className="space-y-2.5">
+              <div>
+                <Label className="text-xs text-muted-foreground">Имя</Label>
+                <p className="text-sm font-medium mt-0.5">{user.name}</p>
+              </div>
+              <div>
+                <Label className="text-xs text-muted-foreground">Email</Label>
+                <p className="text-sm font-medium mt-0.5">{user.email}</p>
+              </div>
+              <div>
+                <Label className="text-xs text-muted-foreground">Компания</Label>
+                <p className="text-sm font-medium mt-0.5">{user.company.name}</p>
+              </div>
+            </div>
+          )}
+          <Button 
+            onClick={logout} 
+            variant="destructive" 
+            className="gap-2 w-full h-9 mt-2"
+          >
+            <LogOut className="h-3.5 w-3.5" />
+            Выйти
+          </Button>
+        </CardContent>
+      </Card>
+
+      <Card className="border-2">
+        <CardHeader className="pb-3">
+          <div className="flex items-center justify-between">
+            <CardTitle className="text-base flex items-center gap-2">
+              <Database className="h-4 w-4" />
+              Синхронизация
+            </CardTitle>
+            <Button
+              onClick={loadQueueStats}
+              disabled={isLoadingStats}
+              size="sm"
+              variant="ghost"
+              className="h-7 px-2"
+            >
+              <RefreshCw className={`h-3.5 w-3.5 ${isLoadingStats ? 'animate-spin' : ''}`} />
+            </Button>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-3 pt-0">
+          {queueStats ? (
+            <div className="space-y-2.5">
+              <div className="flex items-center justify-between text-sm">
+                <span className="text-muted-foreground">В очереди:</span>
+                <span className="font-medium">{queueStats.pending_count}</span>
+              </div>
+              <div className="flex items-center justify-between text-sm">
+                <span className="text-muted-foreground">Ошибки:</span>
+                <span className={`font-medium ${queueStats.failed_count > 0 ? 'text-destructive' : ''}`}>
+                  {queueStats.failed_count}
+                </span>
+              </div>
+              <div className="flex items-center justify-between text-sm">
+                <span className="text-muted-foreground">Синхронизировано:</span>
+                <span className="font-medium text-green-600 dark:text-green-500">{queueStats.sent_count}</span>
+              </div>
+              {Object.keys(queueStats.pending_by_type).length > 0 && (
+                <div className="pt-2 border-t">
+                  <Label className="text-xs text-muted-foreground mb-1.5 block">По типам задач:</Label>
+                  <div className="space-y-1">
+                    {Object.entries(queueStats.pending_by_type).map(([type, count]) => (
+                      <div key={type} className="flex items-center justify-between text-xs">
+                        <span className="text-muted-foreground/80">{type}:</span>
+                        <span className="font-medium">{count}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="text-sm text-muted-foreground">
+              {isLoadingStats ? 'Загрузка...' : 'Нет данных'}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+

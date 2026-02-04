@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>This app needs access to capture your screen for time tracking purposes.</string>
+	<key>NSAccessibilityUsageDescription</key>
+	<string>This app needs accessibility access to monitor mouse and keyboard activity for time tracking.</string>
+</dict>
+</plist>
+

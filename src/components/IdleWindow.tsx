@@ -1,0 +1,286 @@
+import { useEffect, useState } from 'react';
+import { listen } from '@tauri-apps/api/event';
+import { invoke } from '@tauri-apps/api/core';
+import { Button } from './ui/button';
+import { RotateCcw, Square } from 'lucide-react';
+import { logger } from '../lib/logger';
+
+function formatTime(seconds: number): string {
+  const displaySeconds = Math.max(0, seconds);
+  const hours = Math.floor(displaySeconds / 3600);
+  const minutes = Math.floor((displaySeconds % 3600) / 60);
+  const secs = displaySeconds % 60;
+  return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+}
+
+export function IdleWindow() {
+  const [idleTime, setIdleTime] = useState(0);
+  const [isLoading, setIsLoading] = useState(false);
+  const [idlePauseStartTime, setIdlePauseStartTime] = useState<number | null>(null);
+
+  // Log when component mounts
+  useEffect(() => {
+    logger.debug('IDLE_WINDOW', 'Component mounted');
+  }, []);
+
+  // Listen for state updates from main window via Tauri events
+  useEffect(() => {
+    logger.debug('IDLE_WINDOW', 'Setting up event listeners...');
+    let unlistenState: (() => void) | null = null;
+    let pollInterval: NodeJS.Timeout | null = null;
+    
+    const MAX_IDLE_SECONDS = 24 * 60 * 60; // 24 hours = 86400 seconds
+    
+    const updateState = (pauseTime: number | null, loading: boolean) => {
+      logger.debug('IDLE_WINDOW', 'Updating state', { pauseTime, isLoading: loading, pauseTimeType: typeof pauseTime });
+      
+      // Validate pauseTime before setting
+      let validPauseTime: number | null = null;
+      if (pauseTime !== null && pauseTime !== undefined) {
+        const numValue = Number(pauseTime);
+        if (!isNaN(numValue) && numValue > 0 && isFinite(numValue)) {
+          validPauseTime = numValue;
+          logger.debug('IDLE_WINDOW', `Valid pause time set: ${validPauseTime}`);
+        } else {
+          logger.warn('IDLE_WINDOW', `Invalid pause time: ${numValue} (isNaN: ${isNaN(numValue)}, isFinite: ${isFinite(numValue)})`);
+        }
+      }
+      
+      setIdlePauseStartTime(validPauseTime);
+      // Only set isLoading if it's actually a loading operation (not from screenshots)
+      // Screenshots should not block buttons
+      setIsLoading(loading);
+      
+      // Calculate initial time if we have pause start time
+      if (validPauseTime !== null && validPauseTime > 0) {
+        const now = Date.now();
+        const idleSeconds = Math.floor((now - validPauseTime) / 1000);
+        // Validate: ensure no NaN or negative values
+        const validIdleSeconds = isNaN(idleSeconds) ? 0 : Math.max(0, idleSeconds);
+        // Reset to 0 after 24 hours
+        const displaySeconds = validIdleSeconds >= MAX_IDLE_SECONDS ? 0 : validIdleSeconds;
+        logger.debug('IDLE_WINDOW', `Calculated initial idle time: ${idleSeconds}s, displaying: ${displaySeconds}s (max 24h)`);
+        setIdleTime(displaySeconds);
+      } else {
+        logger.debug('IDLE_WINDOW', 'No valid pause time, resetting idle time to 0');
+        setIdleTime(0);
+      }
+    };
+    
+    const setupListener = async () => {
+      try {
+        logger.debug('IDLE_WINDOW', 'Setting up idle-state-update listener...');
+        
+        // Listen for state updates (pause start time, loading state)
+        const unlistenStateFn = await listen<{ idlePauseStartTime: number | null; isLoading: boolean }>('idle-state-update', (event) => {
+          logger.debug('IDLE_WINDOW', 'State update received', event.payload);
+          
+          // Handle null values correctly
+          let pauseTime: number | null = null;
+          const rawValue = event.payload.idlePauseStartTime;
+          
+          if (rawValue !== null && rawValue !== undefined) {
+            const numValue = Number(rawValue);
+            if (!isNaN(numValue) && numValue > 0 && isFinite(numValue)) {
+              pauseTime = numValue;
+              logger.debug('IDLE_WINDOW', `Valid pause time set: ${pauseTime}`);
+            } else {
+              logger.warn('IDLE_WINDOW', `Invalid pause time value: ${numValue}`);
+            }
+          }
+          
+          updateState(pauseTime, event.payload.isLoading);
+        });
+        unlistenState = unlistenStateFn;
+        
+        logger.debug('IDLE_WINDOW', 'State listener set up successfully');
+        
+        // Request current state from main window immediately and then with delays
+        // Multiple attempts to ensure we get the state even if window opens before main window is ready
+        const requestState = async () => {
+          try {
+            await invoke('request_idle_state');
+          } catch (error) {
+            logger.error('IDLE_WINDOW', 'Failed to request state', error);
+          }
+        };
+        
+        // Request immediately
+        requestState();
+        
+        // Request after short delay (React might not be ready)
+        setTimeout(requestState, 100);
+        
+        // Request after medium delay (main window might not be ready)
+        setTimeout(requestState, 500);
+        
+        // Request after longer delay (ensure main window is ready)
+        setTimeout(requestState, 1000);
+        
+        // Request after even longer delay (fallback)
+        setTimeout(requestState, 2000);
+        
+        // Also poll state periodically as fallback (every 2 seconds initially, then every 10 seconds)
+        let pollCount = 0;
+        pollInterval = setInterval(async () => {
+          pollCount++;
+          try {
+            await invoke('request_idle_state');
+            // After 5 polls (10 seconds), reduce frequency to every 10 seconds
+            if (pollCount >= 5) {
+              clearInterval(pollInterval!);
+              pollInterval = setInterval(async () => {
+                try {
+                  await invoke('request_idle_state');
+                } catch (error) {
+                  // Ignore errors
+                }
+              }, 10000);
+            }
+          } catch (error) {
+            // Ignore errors
+          }
+        }, 2000); // Poll every 2 seconds initially
+      } catch (error) {
+        logger.error('IDLE_WINDOW', 'Failed to setup listener', error);
+      }
+    };
+    
+    setupListener();
+
+    return () => {
+      logger.debug('IDLE_WINDOW', 'Cleaning up listeners...');
+      if (unlistenState) unlistenState();
+      if (pollInterval) clearInterval(pollInterval);
+    };
+  }, []);
+
+  // Local timer that updates every second if we have pause start time
+  // Timer resets to 0 after 24 hours (86400 seconds)
+  useEffect(() => {
+    if (idlePauseStartTime !== null && idlePauseStartTime > 0 && !isNaN(idlePauseStartTime) && isFinite(idlePauseStartTime)) {
+      const MAX_IDLE_SECONDS = 24 * 60 * 60; // 24 hours = 86400 seconds
+      
+      const updateTime = () => {
+        const now = Date.now();
+        const idleSeconds = Math.floor((now - idlePauseStartTime) / 1000);
+        
+        // Validate: ensure no NaN or negative values
+        const validIdleSeconds = isNaN(idleSeconds) ? 0 : Math.max(0, idleSeconds);
+        // Reset to 0 after 24 hours
+        const displaySeconds = validIdleSeconds >= MAX_IDLE_SECONDS ? 0 : validIdleSeconds;
+        
+        setIdleTime(displaySeconds);
+      };
+      
+      // Initial update immediately
+      updateTime();
+      
+      // Update every second
+      const interval = setInterval(() => {
+        updateTime();
+      }, 1000);
+      
+      return () => {
+        clearInterval(interval);
+      };
+    } else {
+      setIdleTime(0);
+    }
+  }, [idlePauseStartTime]);
+  
+  const handleResume = async () => {
+    if (isLoading) return;
+    
+    try {
+      setIsLoading(true);
+      await invoke('resume_tracking_from_idle');
+      // Window will be closed automatically by main window
+    } catch (error) {
+      logger.error('IDLE_WINDOW', 'Failed to resume', error);
+      setIsLoading(false);
+      try {
+        await invoke('show_notification', {
+          title: 'Ошибка',
+          body: 'Не удалось возобновить трекинг',
+        });
+      } catch (notifError) {
+        // Ignore notification errors
+      }
+    }
+  };
+
+  const handleStop = async () => {
+    if (isLoading) return;
+    
+    try {
+      setIsLoading(true);
+      await invoke('stop_tracking_from_idle');
+      // Window will be closed automatically by main window
+    } catch (error) {
+      logger.error('IDLE_WINDOW', 'Failed to stop', error);
+      setIsLoading(false);
+      try {
+        await invoke('show_notification', {
+          title: 'Ошибка',
+          body: 'Не удалось остановить трекинг',
+        });
+      } catch (notifError) {
+        // Ignore notification errors
+      }
+    }
+  };
+
+  return (
+    <div className="h-screen bg-background flex flex-col items-center justify-center px-6 py-10">
+      {/* Main Timer - главный визуальный якорь */}
+      <div className="flex flex-col items-center space-y-6 mb-10 flex-1 justify-center">
+        {/* Таймер - самый крупный элемент */}
+        <div className="text-6xl font-mono font-bold text-muted-foreground/90 tracking-tight transition-colors duration-300 leading-none">
+          {formatTime(idleTime)}
+        </div>
+        
+        {/* Статус - вторичный, приглушенный */}
+        <div className="flex items-center gap-1.5 text-xs text-muted-foreground/60">
+          <div className="w-1.5 h-1.5 rounded-full bg-muted-foreground/30" />
+          <span>Приостановлено (нет активности)</span>
+        </div>
+      </div>
+      
+      {/* Кнопки управления - macOS-native стиль */}
+      <div className="flex gap-3 w-full max-w-sm pb-2">
+        {/* Primary: Возобновить */}
+        <Button
+          onClick={handleResume}
+          disabled={isLoading}
+          size="default"
+          variant="default"
+          className="gap-2 flex-1 h-10 transition-colors duration-300"
+        >
+          <RotateCcw className="h-4 w-4" />
+          Возобновить
+        </Button>
+        
+        {/* Secondary: Стоп */}
+        <Button
+          onClick={handleStop}
+          disabled={isLoading}
+          size="default"
+          variant="destructive"
+          className="gap-2 h-10 px-4 bg-destructive-soft hover:bg-destructive-soft-hover transition-colors duration-300"
+        >
+          <Square className="h-4 w-4" />
+          Стоп
+        </Button>
+      </div>
+      
+      {/* Debug info - только в development режиме */}
+      {process.env.NODE_ENV === 'development' && idlePauseStartTime && (
+        <div className="mt-4 text-[10px] text-muted-foreground/40 font-mono max-w-md break-all text-center">
+          pauseStart: {new Date(idlePauseStartTime).toLocaleTimeString()}, 
+          diff: {Math.floor((Date.now() - idlePauseStartTime) / 1000)}s
+        </div>
+      )}
+    </div>
+  );
+}
