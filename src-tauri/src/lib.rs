@@ -5,15 +5,17 @@ use aes_gcm::{
 #[allow(unused_imports)] // Local используется в тестах
 use chrono::{Local, Utc};
 use rusqlite::{params, Connection, Result as SqliteResult};
-use serde::{Deserialize, Serialize};
+use serde::{Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tauri::{AppHandle, Listener, Manager};
+use tauri::{AppHandle, Manager, Listener};
 use tracing::{debug, error, info, warn};
 mod commands;
+mod engine;
 use commands::*;
+use crate::engine::{TimerEngine, TimerState};
 // Sleep/wake handling использует проверку времени в get_state()
 // вместо прямых системных событий для упрощения реализации
 
@@ -294,7 +296,7 @@ mod tests {
             let engine = TimerEngine::new();
             let state = engine.get_state().unwrap();
 
-            assert!(matches!(state.state, TimerStateForAPI::Stopped));
+            assert!(matches!(state.state, engine::TimerStateForAPI::Stopped));
             assert_eq!(state.elapsed_seconds, 0);
             assert_eq!(state.accumulated_seconds, 0);
             assert_eq!(state.session_start, None);
@@ -307,14 +309,14 @@ mod tests {
 
             // Начальное состояние - Stopped
             let state = engine.get_state().unwrap();
-            assert!(matches!(state.state, TimerStateForAPI::Stopped));
+            assert!(matches!(state.state, engine::TimerStateForAPI::Stopped));
 
             // Переход в Running
             engine.start().unwrap();
 
             let state = engine.get_state().unwrap();
             match state.state {
-                TimerStateForAPI::Running { started_at } => {
+                engine::TimerStateForAPI::Running { started_at } => {
                     assert!(started_at > 0);
                     assert!(state.session_start.is_some());
                     assert_eq!(state.session_start.unwrap(), started_at);
@@ -334,7 +336,7 @@ mod tests {
             engine.pause().unwrap();
 
             let state = engine.get_state().unwrap();
-            assert!(matches!(state.state, TimerStateForAPI::Paused));
+            assert!(matches!(state.state, engine::TimerStateForAPI::Paused));
             // accumulated_seconds is u64 (unsigned), so >= 0 is always true; assertion removed
             assert_eq!(state.session_start, None); // В Paused нет session_start
         }
@@ -354,7 +356,7 @@ mod tests {
 
             let state = engine.get_state().unwrap();
             match state.state {
-                TimerStateForAPI::Running { started_at } => {
+                engine::TimerStateForAPI::Running { started_at } => {
                     assert!(started_at > 0);
                     assert_eq!(state.accumulated_seconds, accumulated_before); // accumulated сохраняется
                 }
@@ -373,7 +375,7 @@ mod tests {
             engine.stop().unwrap();
 
             let state = engine.get_state().unwrap();
-            assert!(matches!(state.state, TimerStateForAPI::Stopped));
+            assert!(matches!(state.state, engine::TimerStateForAPI::Stopped));
             // accumulated_seconds is u64 (unsigned), so >= 0 is always true; assertion removed
             assert_eq!(state.session_start, None);
         }
@@ -392,7 +394,7 @@ mod tests {
             engine.stop().unwrap();
 
             let state = engine.get_state().unwrap();
-            assert!(matches!(state.state, TimerStateForAPI::Stopped));
+            assert!(matches!(state.state, engine::TimerStateForAPI::Stopped));
             assert_eq!(state.accumulated_seconds, accumulated_before); // accumulated сохраняется
         }
 
@@ -577,7 +579,7 @@ mod tests {
             engine.reset_day().unwrap();
 
             let state = engine.get_state().unwrap();
-            assert!(matches!(state.state, TimerStateForAPI::Stopped));
+            assert!(matches!(state.state, engine::TimerStateForAPI::Stopped));
             assert_eq!(state.accumulated_seconds, 0);
         }
 
@@ -608,7 +610,7 @@ mod tests {
 
             // Проверяем, что таймер остановлен
             let state = engine.get_state().unwrap();
-            assert!(matches!(state.state, TimerStateForAPI::Stopped));
+            assert!(matches!(state.state, engine::TimerStateForAPI::Stopped));
             assert_eq!(state.accumulated_seconds, 0); // Новый день - accumulated обнулен
         }
 
@@ -640,7 +642,7 @@ mod tests {
 
             // Проверяем, что таймер НЕ запущен автоматически
             let state = engine.get_state().unwrap();
-            assert!(matches!(state.state, TimerStateForAPI::Stopped));
+            assert!(matches!(state.state, engine::TimerStateForAPI::Stopped));
         }
 
         #[test]
@@ -672,19 +674,17 @@ mod tests {
             // Проверяем, что elapsed == 0 (новый день, таймер остановлен)
             let state = engine.get_state().unwrap();
             assert_eq!(state.elapsed_seconds, 0);
-            assert!(matches!(state.state, TimerStateForAPI::Stopped));
+            assert!(matches!(state.state, engine::TimerStateForAPI::Stopped));
         }
 
         #[test]
         fn test_day_rollover_idempotent() {
             // Тест: Если rollover вызывается несколько раз → no-op
             let engine = TimerEngine::new();
-
+            
             // Симулируем смену дня
-            let yesterday = Local::now().date_naive() - chrono::Duration::days(1);
-            let yesterday_start = yesterday
-                .and_hms_opt(0, 0, 0)
-                .and_then(|dt| dt.and_local_timezone(Local).earliest())
+            let yesterday_start = Utc::now()
+                .checked_sub_signed(chrono::Duration::hours(25))
                 .unwrap()
                 .timestamp() as u64;
 
@@ -696,19 +696,23 @@ mod tests {
             // Первый вызов ensure_correct_day()
             engine.ensure_correct_day().unwrap();
 
+            let first_run_ts = engine.day_start_timestamp.lock().unwrap().unwrap();
+
             // Второй вызов ensure_correct_day() - должен быть no-op
             engine.ensure_correct_day().unwrap();
 
+            let second_run_ts = engine.day_start_timestamp.lock().unwrap().unwrap();
+
+            assert_eq!(first_run_ts, second_run_ts, "Second call must be no-op");
+
             // Проверяем, что день обновлен на сегодня
-            let today = Local::now().date_naive();
+            let today = Utc::now().date_naive();
             let day_start = *engine.day_start_timestamp.lock().unwrap();
-            assert!(day_start.is_some());
             let day_start_date =
                 chrono::DateTime::<Utc>::from_timestamp(day_start.unwrap() as i64, 0)
                     .unwrap()
-                    .with_timezone(&Local)
                     .date_naive();
-            assert_eq!(day_start_date, today);
+            assert_eq!(day_start_date, today, "Engine UTC date must match current UTC date");
         }
 
         #[test]
@@ -718,14 +722,14 @@ mod tests {
 
             // Начальное состояние
             let state = engine.get_state().unwrap();
-            assert!(matches!(state.state, TimerStateForAPI::Stopped));
+            assert!(matches!(state.state, engine::TimerStateForAPI::Stopped));
             assert_eq!(state.accumulated_seconds, 0);
 
             // Start
             engine.start().unwrap();
             thread::sleep(Duration::from_millis(300));
             let state = engine.get_state().unwrap();
-            assert!(matches!(state.state, TimerStateForAPI::Running { .. }));
+            assert!(matches!(state.state, engine::TimerStateForAPI::Running { .. }));
 
             // Pause
             engine.pause().unwrap();
@@ -736,13 +740,13 @@ mod tests {
             engine.resume().unwrap();
             thread::sleep(Duration::from_millis(200));
             let state = engine.get_state().unwrap();
-            assert!(matches!(state.state, TimerStateForAPI::Running { .. }));
+            assert!(matches!(state.state, engine::TimerStateForAPI::Running { .. }));
             assert_eq!(state.accumulated_seconds, accumulated_after_pause); // accumulated сохраняется
 
             // Stop
             engine.stop().unwrap();
             let state = engine.get_state().unwrap();
-            assert!(matches!(state.state, TimerStateForAPI::Stopped));
+            assert!(matches!(state.state, engine::TimerStateForAPI::Stopped));
             assert!(state.accumulated_seconds >= accumulated_after_pause); // Время увеличилось
         }
 
@@ -843,7 +847,7 @@ mod tests {
             // get_state должен обнаружить sleep, но НЕ ставить на паузу автоматически
             let state = engine.get_state().unwrap();
             // Таймер должен остаться в состоянии RUNNING (sleep detection только логирует)
-            assert!(matches!(state.state, TimerStateForAPI::Running { .. }));
+            assert!(matches!(state.state, engine::TimerStateForAPI::Running { .. }));
         }
 
         #[test]
@@ -860,7 +864,7 @@ mod tests {
             // Вызываем get_state много раз - не должно быть рекурсии
             for _ in 0..10 {
                 let state = engine.get_state().unwrap();
-                assert!(matches!(state.state, TimerStateForAPI::Running { .. }));
+                assert!(matches!(state.state, engine::TimerStateForAPI::Running { .. }));
             }
         }
 
@@ -1003,7 +1007,7 @@ mod tests {
             }
             // Если после rollover таймер остановлен, нужно запустить его снова
             let state_before = engine.get_state().unwrap();
-            if matches!(state_before.state, TimerStateForAPI::Stopped) {
+            if matches!(state_before.state, engine::TimerStateForAPI::Stopped) {
                 engine.start().unwrap();
             }
             thread::sleep(Duration::from_millis(200));
@@ -1035,7 +1039,7 @@ mod tests {
                 *day_start = Some(yesterday_start);
             }
             let state_before_stop = engine.get_state().unwrap();
-            if matches!(state_before_stop.state, TimerStateForAPI::Stopped) {
+            if matches!(state_before_stop.state, engine::TimerStateForAPI::Stopped) {
                 // Если таймер остановлен, запускаем его снова
                 engine.start().unwrap();
                 thread::sleep(Duration::from_millis(200));
@@ -3784,20 +3788,6 @@ impl SyncManager {
 // STRICT FINITE STATE MACHINE
 // ============================================
 
-/// Состояние таймера - строгая FSM
-/// Невозможные состояния физически невозможны
-#[derive(Debug, Clone)]
-pub enum TimerState {
-    /// Таймер остановлен
-    Stopped,
-    /// Таймер работает - хранит Instant начала сессии
-    Running {
-        started_at: u64,             // Unix timestamp (секунды) для API
-        started_at_instant: Instant, // Монотонное время (для расчетов)
-    },
-    /// Таймер на паузе
-    Paused,
-}
 
 // Сериализация для API (без Instant)
 impl Serialize for TimerState {
@@ -3819,1018 +3809,6 @@ impl Serialize for TimerState {
     }
 }
 
-/// Ответ для API - упрощенная версия состояния (без Instant)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TimerStateResponse {
-    #[serde(flatten)]
-    pub state: TimerStateForAPI,
-    pub elapsed_seconds: u64,
-    pub accumulated_seconds: u64,   // Накопленное время за день
-    pub session_start: Option<u64>, // Unix timestamp начала сессии (только для Running)
-    pub day_start: Option<u64>,     // Unix timestamp начала дня
-}
-
-/// Упрощенная версия TimerState для API (без Instant)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-#[serde(tag = "state")]
-pub enum TimerStateForAPI {
-    Stopped,
-    Running { started_at: u64 },
-    Paused,
-}
-
-/// Timer Engine - строгая FSM
-/// Все операции атомарны через один Mutex
-struct TimerEngine {
-    /// Состояние FSM - единственный источник истины
-    /// Внутри Running хранится started_at_instant
-    state: Arc<Mutex<TimerState>>,
-    /// Накопленное время за день (обновляется только при pause/stop)
-    accumulated_seconds: Arc<Mutex<u64>>,
-    /// Unix timestamp начала дня (для daily reset)
-    day_start_timestamp: Arc<Mutex<Option<u64>>>,
-    /// База данных для персистентности
-    db: Option<Arc<Database>>,
-}
-
-impl TimerEngine {
-    /// Создать новый TimerEngine без БД (для тестов или fallback)
-    #[allow(dead_code)] // Может использоваться в тестах или как fallback
-    fn new() -> Self {
-        Self {
-            state: Arc::new(Mutex::new(TimerState::Stopped)),
-            accumulated_seconds: Arc::new(Mutex::new(0)),
-            day_start_timestamp: Arc::new(Mutex::new(None)),
-            db: None,
-        }
-    }
-
-    /// Инициализация с базой данных
-    fn with_db(db: Arc<Database>) -> Self {
-        let engine = Self {
-            state: Arc::new(Mutex::new(TimerState::Stopped)),
-            accumulated_seconds: Arc::new(Mutex::new(0)),
-            day_start_timestamp: Arc::new(Mutex::new(None)),
-            db: Some(db),
-        };
-
-        // Восстанавливаем состояние из БД
-        if let Err(e) = engine.restore_state() {
-            eprintln!("[TIMER] Failed to restore state from DB: {}", e);
-        }
-
-        engine
-    }
-
-    /// Восстановить состояние из БД
-    /// GUARD: НИКОГДА не крашиться на ошибке восстановления
-    fn restore_state(&self) -> Result<(), String> {
-        let db = match &self.db {
-            Some(db) => db,
-            None => {
-                info!("[RECOVERY] No database available, starting with default state");
-                return Ok(()); // Нет БД - пропускаем
-            }
-        };
-
-        // GUARD: Обработка всех возможных ошибок
-        match db.load_timer_state() {
-            Ok(Some((day_str, accumulated, state_str, saved_started_at))) => {
-                let today_utc = Utc::now().format("%Y-%m-%d").to_string();
-
-                if day_str == today_utc {
-                    // CRITICAL FIX: Если было running, добавляем elapsed time к accumulated
-                    // С защитой от clock skew
-                    let final_accumulated = if state_str == "running" && saved_started_at.is_some()
-                    {
-                        let started_at = saved_started_at.unwrap();
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs();
-
-                        // CRITICAL FIX: Clock skew detection
-                        // ДОКАЗАНО: Если now < started_at, часы были переведены назад
-                        if now < started_at {
-                            // ДОКАЗАНО: Clock skew detected - часы переведены назад
-                            warn!(
-                                "[RECOVERY] Clock skew detected: now ({}) < started_at ({}). Not adding elapsed time to prevent time loss.",
-                                now, started_at
-                            );
-                            // НЕ добавляем elapsed time - используем только saved accumulated
-                            accumulated
-                        } else {
-                            let elapsed_since_save = now.saturating_sub(started_at);
-
-                            // CRITICAL FIX: Проверка на нереалистично большое время (> 24 часов)
-                            // ДОКАЗАНО: Если elapsed > 24 часов, вероятно clock skew или системная ошибка
-                            const MAX_REASONABLE_ELAPSED: u64 = 24 * 60 * 60; // 24 часа
-                            if elapsed_since_save > MAX_REASONABLE_ELAPSED {
-                                warn!(
-                                    "[RECOVERY] Unrealistic time gap detected: {}s ({} hours). Possible clock skew. Not adding elapsed time.",
-                                    elapsed_since_save, elapsed_since_save / 3600
-                                );
-                                // НЕ добавляем elapsed time - используем только saved accumulated
-                                accumulated
-                            } else {
-                                // ДОКАЗАНО: Elapsed time разумен - добавляем к accumulated
-                                let new_accumulated =
-                                    accumulated.saturating_add(elapsed_since_save);
-                                info!(
-                                    "[RECOVERY] Timer was running: accumulated={}s, started_at={}, elapsed_since_save={}s, final_accumulated={}s",
-                                    accumulated, started_at, elapsed_since_save, new_accumulated
-                                );
-                                new_accumulated
-                            }
-                        }
-                    } else {
-                        // ДОКАЗАНО: State не был running - используем saved accumulated
-                        accumulated
-                    };
-
-                    // Восстанавливаем накопленное время
-                    match self.accumulated_seconds.lock() {
-                        Ok(mut acc) => *acc = final_accumulated,
-                        Err(e) => {
-                            error!("[RECOVERY] Mutex poisoned for accumulated_seconds: {}. Using default (0).", e);
-                            // Продолжаем с дефолтным значением
-                        }
-                    }
-
-                    // Восстанавливаем состояние
-                    let state = match state_str.as_str() {
-                        "stopped" => TimerState::Stopped,
-                        "paused" => TimerState::Paused,
-                        "running" => {
-                            // Если было running, восстанавливаем как paused (безопаснее)
-                            // Пользователь может возобновить вручную
-                            TimerState::Paused
-                        }
-                        _ => {
-                            warn!(
-                                "[RECOVERY] Unknown state '{}', defaulting to Stopped",
-                                state_str
-                            );
-                            TimerState::Stopped
-                        }
-                    };
-
-                    match self.state.lock() {
-                        Ok(mut state_mutex) => *state_mutex = state,
-                        Err(e) => {
-                            error!(
-                                "[RECOVERY] Mutex poisoned for state: {}. Using default (Stopped).",
-                                e
-                            );
-                            // Продолжаем с дефолтным состоянием
-                        }
-                    }
-
-                    info!(
-                        "[RECOVERY] Restored state: day={}, accumulated={}s, state={}",
-                        day_str, final_accumulated, state_str
-                    );
-                } else {
-                    // День изменился - сбрасываем
-                    info!(
-                        "[RECOVERY] Day changed ({} → {}), resetting state",
-                        day_str, today_utc
-                    );
-                    // Не восстанавливаем состояние
-                }
-            }
-            Ok(None) => {
-                // Нет сохраненного состояния - это нормально для первого запуска
-                info!("[RECOVERY] No saved state found, starting fresh");
-            }
-            Err(e) => {
-                // GUARD: НИКОГДА не крашиться на ошибке восстановления
-                error!(
-                    "[RECOVERY] Failed to load state from DB: {}. Starting with default state.",
-                    e
-                );
-                // Продолжаем с дефолтным состоянием (Stopped, accumulated=0)
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Обработка системного sleep
-    /// Если RUNNING → pause и сохранить состояние
-    /// Примечание: Метод может использоваться в будущем для прямых системных событий sleep/wake
-    #[allow(dead_code)]
-    fn handle_system_sleep(&self) -> Result<(), String> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|e| format!("Mutex poisoned: {}", e))?;
-
-        match &*state {
-            TimerState::Running { .. } => {
-                // Допустимый переход: Running → Paused (из-за sleep)
-                drop(state); // Освобождаем lock перед вызовом pause()
-
-                eprintln!("[SLEEP] System sleep detected, pausing timer");
-
-                // Используем существующий метод pause() для корректного перехода FSM
-                self.pause()?;
-
-                eprintln!("[SLEEP] Timer paused successfully due to system sleep");
-                Ok(())
-            }
-            TimerState::Paused | TimerState::Stopped => {
-                // Уже на паузе или остановлен - ничего не делаем (идемпотентно)
-                eprintln!("[SLEEP] System sleep detected, but timer is already paused/stopped");
-                Ok(())
-            }
-        }
-    }
-
-    /// Обработка системного wake
-    /// НЕ возобновляем автоматически - оставляем PAUSED
-    /// Идемпотентно: повторные вызовы не меняют состояние
-    #[allow(dead_code)] // Используется в sleep/wake handling (может вызываться через системные события)
-    pub fn handle_system_wake(&self) -> Result<(), String> {
-        eprintln!("[WAKE] System wake detected");
-
-        // Проверяем текущее состояние
-        let state = self
-            .state
-            .lock()
-            .map_err(|e| format!("Mutex poisoned: {}", e))?;
-        let state_str = match &*state {
-            TimerState::Running { .. } => "running",
-            TimerState::Paused => "paused",
-            TimerState::Stopped => "stopped",
-        };
-        drop(state);
-
-        // Обновляем last_updated_at в БД
-        // НЕ возобновляем RUNNING автоматически - безопаснее оставить PAUSED
-        if let Err(e) = self.save_state() {
-            eprintln!("[WAKE] Failed to save state after wake: {}", e);
-        }
-
-        eprintln!(
-            "[WAKE] Timer state after wake: {} (user can resume manually)",
-            state_str
-        );
-        Ok(())
-    }
-
-    /// Сохранить состояние в БД
-    /// Публичный метод для явного сохранения (например, при закрытии приложения)
-    pub fn save_state(&self) -> Result<(), String> {
-        self.save_state_with_accumulated_override(None)
-    }
-
-    /// Сохранить состояние в БД с переопределением accumulated
-    /// CRITICAL FIX: Используется для атомарного сохранения после pause/stop
-    fn save_state_with_accumulated_override(
-        &self,
-        accumulated_override: Option<u64>,
-    ) -> Result<(), String> {
-        let db = match &self.db {
-            Some(db) => db,
-            None => return Ok(()), // Нет БД - пропускаем
-        };
-
-        let state = self
-            .state
-            .lock()
-            .map_err(|e| format!("Mutex poisoned: {}", e))?;
-        let accumulated = if let Some(override_val) = accumulated_override {
-            // Используем переданное значение (для атомарности)
-            override_val
-        } else {
-            // Используем текущее значение из памяти
-            *self
-                .accumulated_seconds
-                .lock()
-                .map_err(|e| format!("Mutex poisoned: {}", e))?
-        };
-        let day_start = *self
-            .day_start_timestamp
-            .lock()
-            .map_err(|e| format!("Mutex poisoned: {}", e))?;
-
-        // Определяем день
-        let day = if let Some(day_start_ts) = day_start {
-            // Используем сохраненный день
-            let dt = chrono::DateTime::<Utc>::from_timestamp(day_start_ts as i64, 0)
-                .ok_or_else(|| "Invalid day_start timestamp".to_string())?;
-            dt.format("%Y-%m-%d").to_string()
-        } else {
-            // Используем текущий день
-            Utc::now().format("%Y-%m-%d").to_string()
-        };
-
-        // Определяем строковое представление состояния и started_at
-        let (state_str, started_at) = match &*state {
-            TimerState::Stopped => ("stopped", None),
-            TimerState::Running { started_at, .. } => ("running", Some(*started_at)),
-            TimerState::Paused => ("paused", None),
-        };
-
-        db.save_timer_state(&day, accumulated, state_str, started_at)
-            .map_err(|e| format!("Failed to save state to DB: {}", e))?;
-
-        Ok(())
-    }
-
-    /// Переход: Stopped → Running или Paused → Running
-    /// Атомарная операция - один mutex lock на весь переход
-    fn start(&self) -> Result<(), String> {
-        // Проверяем смену дня перед любыми операциями
-        self.ensure_correct_day()?;
-
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|e| format!("Mutex poisoned: {}", e))?;
-
-        match &*state {
-            TimerState::Stopped => {
-                // Допустимый переход: Stopped → Running
-                let now_instant = Instant::now();
-                let now_timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_err(|e| format!("Failed to get timestamp: {}", e))?
-                    .as_secs();
-
-                // Если это первый старт за день, фиксируем начало дня
-                let mut day_start = self
-                    .day_start_timestamp
-                    .lock()
-                    .map_err(|e| format!("Mutex poisoned: {}", e))?;
-                if day_start.is_none() {
-                    *day_start = Some(now_timestamp);
-                }
-                drop(day_start); // Освобождаем lock
-
-                // Переход в Running с данными внутри
-                *state = TimerState::Running {
-                    started_at: now_timestamp,
-                    started_at_instant: now_instant,
-                };
-                drop(state); // Освобождаем lock перед сохранением
-
-                // Сохраняем состояние в БД
-                if let Err(e) = self.save_state() {
-                    eprintln!("[TIMER] Failed to save state after start: {}", e);
-                }
-
-                Ok(())
-            }
-            TimerState::Paused => {
-                // Допустимый переход: Paused → Running (resume через start)
-                let now_instant = Instant::now();
-                let now_timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_err(|e| format!("Failed to get timestamp: {}", e))?
-                    .as_secs();
-
-                // Переход в Running (accumulated сохраняется)
-                *state = TimerState::Running {
-                    started_at: now_timestamp,
-                    started_at_instant: now_instant,
-                };
-                drop(state); // Освобождаем lock перед сохранением
-
-                // FIX: Сохраняем состояние в БД (как в других переходах start())
-                if let Err(e) = self.save_state() {
-                    eprintln!(
-                        "[TIMER] Failed to save state after start (Paused→Running): {}",
-                        e
-                    );
-                }
-
-                Ok(())
-            }
-            TimerState::Running { .. } => {
-                // Недопустимый переход: Running → Running
-                warn!("[FSM] Invalid transition: Running → Running (already running)");
-                Err("Timer is already running".to_string())
-            }
-        }
-    }
-
-    /// Переход: Running → Paused
-    /// Сохраняет время сессии в accumulated
-    fn pause(&self) -> Result<(), String> {
-        // Проверяем смену дня перед любыми операциями
-        self.ensure_correct_day()?;
-
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|e| format!("Mutex poisoned: {}", e))?;
-
-        match &*state {
-            TimerState::Running {
-                started_at_instant, ..
-            } => {
-                // Допустимый переход: Running → Paused
-                let now = Instant::now();
-                let session_elapsed = now.duration_since(*started_at_instant).as_secs();
-
-                // CRITICAL FIX: Вычисляем новый accumulated БЕЗ обновления в памяти
-                // Это позволяет сохранить атомарность: либо обновляем и сохраняем, либо ничего
-                let new_accumulated = {
-                    let accumulated = self
-                        .accumulated_seconds
-                        .lock()
-                        .map_err(|e| format!("Mutex poisoned: {}", e))?;
-                    let old_value = *accumulated;
-                    let new = accumulated.saturating_add(session_elapsed);
-                    if old_value > new {
-                        // Произошло насыщение (переполнение предотвращено)
-                        warn!(
-                            "[TIMER] Accumulated seconds overflow prevented: {} + {} = {} (saturated at u64::MAX)",
-                            old_value, session_elapsed, new
-                        );
-                    }
-                    new
-                };
-
-                // CRITICAL FIX: Обновляем accumulated в памяти ТОЛЬКО после успешного сохранения
-                // Это гарантирует, что если save_state() падает, accumulated не обновлен
-                // Переход в Paused (started_at_instant удаляется из state)
-                *state = TimerState::Paused;
-                drop(state); // Освобождаем lock перед сохранением
-
-                // CRITICAL FIX: Сохраняем состояние с новым accumulated в одной транзакции
-                // Если сохранение успешно, обновляем accumulated в памяти
-                match self.save_state_with_accumulated_override(Some(new_accumulated)) {
-                    Ok(_) => {
-                        // ДОКАЗАНО: Сохранение успешно - обновляем accumulated в памяти
-                        let mut accumulated = self
-                            .accumulated_seconds
-                            .lock()
-                            .map_err(|e| format!("Mutex poisoned: {}", e))?;
-                        *accumulated = new_accumulated;
-                        // Lock освобождается автоматически
-                    }
-                    Err(e) => {
-                        // ДОКАЗАНО: Сохранение не удалось - accumulated НЕ обновлен в памяти
-                        // State уже изменен на Paused, но accumulated остался старым
-                        // Это безопаснее, чем обновить accumulated до сохранения
-                        eprintln!("[TIMER] Failed to save state after pause: {}", e);
-                        // Возвращаем ошибку, чтобы вызывающий код знал о проблеме
-                        return Err(format!("Failed to save state after pause: {}", e));
-                    }
-                }
-
-                Ok(())
-            }
-            TimerState::Paused => {
-                // Недопустимый переход: Paused → Paused
-                warn!("[FSM] Invalid transition: Paused → Paused (already paused)");
-                Err("Timer is already paused".to_string())
-            }
-            TimerState::Stopped => {
-                // Недопустимый переход: Stopped → Paused
-                warn!("[FSM] Invalid transition: Stopped → Paused (cannot pause stopped timer)");
-                Err("Cannot pause stopped timer".to_string())
-            }
-        }
-    }
-
-    /// Переход: Paused → Running
-    /// Начинает новую сессию (accumulated сохраняется)
-    fn resume(&self) -> Result<(), String> {
-        // Проверяем смену дня перед любыми операциями
-        self.ensure_correct_day()?;
-
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|e| format!("Mutex poisoned: {}", e))?;
-
-        match &*state {
-            TimerState::Paused => {
-                // Допустимый переход: Paused → Running
-                let now_instant = Instant::now();
-                let now_timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_err(|e| format!("Failed to get timestamp: {}", e))?
-                    .as_secs();
-
-                // Переход в Running (accumulated сохраняется)
-                *state = TimerState::Running {
-                    started_at: now_timestamp,
-                    started_at_instant: now_instant,
-                };
-                drop(state); // Освобождаем lock перед сохранением
-
-                // FIX: Сохраняем состояние в БД (как в start(), pause(), stop())
-                if let Err(e) = self.save_state() {
-                    eprintln!("[TIMER] Failed to save state after resume: {}", e);
-                }
-
-                Ok(())
-            }
-            TimerState::Running { .. } => {
-                // Недопустимый переход: Running → Running
-                warn!("[FSM] Invalid transition: Running → Running (already running)");
-                Err("Timer is already running".to_string())
-            }
-            TimerState::Stopped => {
-                // Недопустимый переход: Stopped → Running (нужно использовать start)
-                warn!("[FSM] Invalid transition: Stopped → Running (use start() instead)");
-                Err("Cannot resume stopped timer. Use start() instead".to_string())
-            }
-        }
-    }
-
-    /// Переход: Running → Stopped или Paused → Stopped
-    /// Сохраняет время сессии в accumulated (если Running)
-    fn stop(&self) -> Result<(), String> {
-        // Проверяем смену дня перед любыми операциями
-        self.ensure_correct_day()?;
-
-        self.stop_internal()
-    }
-
-    /// Внутренний метод остановки без проверки дня (для использования в rollover)
-    fn stop_internal(&self) -> Result<(), String> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|e| format!("Mutex poisoned: {}", e))?;
-
-        match &*state {
-            TimerState::Running {
-                started_at_instant, ..
-            } => {
-                // Допустимый переход: Running → Stopped
-                let now = Instant::now();
-                let session_elapsed = now.duration_since(*started_at_instant).as_secs();
-
-                // CRITICAL FIX: Вычисляем новый accumulated БЕЗ обновления в памяти
-                let new_accumulated = {
-                    let accumulated = self
-                        .accumulated_seconds
-                        .lock()
-                        .map_err(|e| format!("Mutex poisoned: {}", e))?;
-                    let old_value = *accumulated;
-                    let new = accumulated.saturating_add(session_elapsed);
-                    if old_value > new {
-                        warn!(
-                            "[TIMER] Accumulated seconds overflow prevented: {} + {} = {} (saturated at u64::MAX)",
-                            old_value, session_elapsed, new
-                        );
-                    }
-                    new
-                };
-
-                // Переход в Stopped
-                *state = TimerState::Stopped;
-                drop(state); // Освобождаем lock перед сохранением
-
-                // CRITICAL FIX: Сохраняем состояние с новым accumulated в одной транзакции
-                match self.save_state_with_accumulated_override(Some(new_accumulated)) {
-                    Ok(_) => {
-                        // ДОКАЗАНО: Сохранение успешно - обновляем accumulated в памяти
-                        let mut accumulated = self
-                            .accumulated_seconds
-                            .lock()
-                            .map_err(|e| format!("Mutex poisoned: {}", e))?;
-                        *accumulated = new_accumulated;
-                    }
-                    Err(e) => {
-                        // ДОКАЗАНО: Сохранение не удалось - accumulated НЕ обновлен
-                        eprintln!("[TIMER] Failed to save state after stop: {}", e);
-                        return Err(format!("Failed to save state after stop: {}", e));
-                    }
-                }
-
-                Ok(())
-            }
-            TimerState::Paused => {
-                // Допустимый переход: Paused → Stopped (accumulated уже сохранен)
-                *state = TimerState::Stopped;
-                drop(state); // Освобождаем lock перед сохранением
-
-                // Сохраняем состояние в БД
-                if let Err(e) = self.save_state() {
-                    eprintln!("[TIMER] Failed to save state after stop: {}", e);
-                }
-
-                Ok(())
-            }
-            TimerState::Stopped => {
-                // Недопустимый переход: Stopped → Stopped
-                warn!("[FSM] Invalid transition: Stopped → Stopped (already stopped)");
-                Err("Timer is already stopped".to_string())
-            }
-        }
-    }
-
-    /// Получить текущее состояние таймера
-    /// ВАЖНО: Этот метод может мутировать состояние при обнаружении sleep
-    /// Sleep detection: большие пропуски времени (> 5 мин) автоматически паузируют таймер
-    fn get_state(&self) -> Result<TimerStateResponse, String> {
-        // Используем внутренний метод с depth tracking для защиты от рекурсии
-        self.get_state_internal(0)
-    }
-
-    /// Внутренний метод get_state с защитой от рекурсии
-    fn get_state_internal(&self, depth: u8) -> Result<TimerStateResponse, String> {
-        // GUARD: Ограничение глубины рекурсии
-        const MAX_RECURSION_DEPTH: u8 = 3;
-        if depth > MAX_RECURSION_DEPTH {
-            error!(
-                "[RECURSION] Max recursion depth ({}) exceeded in get_state(). \
-                Possible infinite loop or cascading state changes.",
-                MAX_RECURSION_DEPTH
-            );
-            return Err(format!(
-                "Max recursion depth exceeded in get_state() (depth: {})",
-                depth
-            ));
-        }
-
-        // Проверяем смену дня перед любыми операциями
-        self.ensure_correct_day()?;
-
-        // Проверяем состояние для sleep detection
-        let state = self
-            .state
-            .lock()
-            .map_err(|e| format!("Mutex poisoned: {}", e))?;
-        let accumulated = *self
-            .accumulated_seconds
-            .lock()
-            .map_err(|e| format!("Mutex poisoned: {}", e))?;
-        let day_start = *self
-            .day_start_timestamp
-            .lock()
-            .map_err(|e| format!("Mutex poisoned: {}", e))?;
-
-        // Расчет elapsed только для RUNNING состояния
-        // Формула: accumulated + (now - started_at_instant)
-        // Дополнительно: проверка на sleep (большой пропуск времени)
-        let (elapsed_seconds, session_start, needs_sleep_handling) = match &*state {
-            TimerState::Running {
-                started_at,
-                started_at_instant,
-            } => {
-                let now = Instant::now();
-                let session_elapsed = now.duration_since(*started_at_instant).as_secs();
-
-                // Проверка на sleep: если пропуск > 15 минут, это вероятно sleep
-                // FIX: Увеличен порог с 5 до 15 минут, чтобы избежать ложных срабатываний
-                const SLEEP_DETECTION_THRESHOLD_SECONDS: u64 = 15 * 60; // 15 минут
-                let is_sleep = session_elapsed > SLEEP_DETECTION_THRESHOLD_SECONDS;
-
-                // FIX: Защита от переполнения при вычислении elapsed_seconds
-                let elapsed = accumulated.saturating_add(session_elapsed);
-                (elapsed, Some(*started_at), is_sleep)
-            }
-            TimerState::Paused | TimerState::Stopped => {
-                // В PAUSED и STOPPED показываем только accumulated
-                (accumulated, None, false)
-            }
-        };
-
-        // Если обнаружен sleep, логируем предупреждение (но НЕ ставим на паузу автоматически)
-        if needs_sleep_handling {
-            // Получаем session_elapsed перед drop(state)
-            let session_elapsed = match &*state {
-                TimerState::Running {
-                    started_at_instant, ..
-                } => Instant::now().duration_since(*started_at_instant).as_secs(),
-                _ => 0,
-            };
-            warn!(
-                "[SLEEP_DETECTION] Large time gap detected ({}s), but NOT auto-pausing to prevent false positives (depth: {})",
-                session_elapsed, depth
-            );
-            // FIX: НЕ ставим на паузу автоматически - это может быть просто долгая работа без активности
-            // Пользователь может поставить на паузу вручную, если нужно
-            // Только логируем предупреждение для диагностики
-            // Автоматическая пауза отключена, чтобы избежать ложных срабатываний
-            // Продолжаем выполнение без изменения состояния
-        }
-
-        // Создаем упрощенную версию state для API (без Instant)
-        let state_for_response = match &*state {
-            TimerState::Stopped => TimerStateForAPI::Stopped,
-            TimerState::Running { started_at, .. } => TimerStateForAPI::Running {
-                started_at: *started_at,
-            },
-            TimerState::Paused => TimerStateForAPI::Paused,
-        };
-
-        Ok(TimerStateResponse {
-            state: state_for_response,
-            elapsed_seconds,
-            accumulated_seconds: accumulated,
-            session_start,
-            day_start,
-        })
-    }
-
-    /// Проверить и обработать смену календарного дня
-    /// Вызывается в начале всех публичных методов для автоматического rollover
-    /// GUARD: Использует UTC для определения дня (не зависит от timezone)
-    fn ensure_correct_day(&self) -> Result<(), String> {
-        let day_start = *self
-            .day_start_timestamp
-            .lock()
-            .map_err(|e| format!("Mutex poisoned: {}", e))?;
-
-        // FIX: Используем UTC для определения дня (не зависит от timezone)
-        let today_utc = Utc::now().date_naive();
-
-        // Если day_start не установлен, устанавливаем текущий день
-        let saved_day_utc = if let Some(day_start_ts) = day_start {
-            // FIX: Конвертируем timestamp в UTC дату (не Local!)
-            let dt = chrono::DateTime::<Utc>::from_timestamp(day_start_ts as i64, 0)
-                .ok_or_else(|| "Invalid day_start timestamp".to_string())?;
-            dt.date_naive()
-        } else {
-            // Если day_start не установлен, устанавливаем текущий день
-            let now_timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|e| format!("Failed to get timestamp: {}", e))?
-                .as_secs();
-            let mut day_start_mutex = self
-                .day_start_timestamp
-                .lock()
-                .map_err(|e| format!("Mutex poisoned: {}", e))?;
-            *day_start_mutex = Some(now_timestamp);
-            return Ok(()); // Первый запуск - день установлен
-        };
-
-        // Если день не изменился, ничего не делаем
-        if saved_day_utc == today_utc {
-            return Ok(());
-        }
-
-        // GUARD: Проверка на разумность смены дня (не более 1 дня назад/вперед)
-        let days_diff = (today_utc - saved_day_utc).num_days().abs();
-        if days_diff > 1 {
-            warn!(
-                "[DAY_ROLLOVER] Suspicious day change: {} → {} ({} days). \
-                Possible timezone change or system clock manipulation.",
-                saved_day_utc.format("%Y-%m-%d"),
-                today_utc.format("%Y-%m-%d"),
-                days_diff
-            );
-            // Все равно выполняем rollover, но логируем предупреждение
-        }
-
-        // День изменился - выполняем rollover
-        info!(
-            "[DAY_ROLLOVER] Day changed: {} → {}",
-            saved_day_utc.format("%Y-%m-%d"),
-            today_utc.format("%Y-%m-%d")
-        );
-        self.rollover_day(saved_day_utc, today_utc)
-    }
-
-    /// Обработать смену дня (rollover)
-    /// Вызывается автоматически при обнаружении смены календарного дня
-    fn rollover_day(
-        &self,
-        old_day: chrono::NaiveDate,
-        new_day: chrono::NaiveDate,
-    ) -> Result<(), String> {
-        info!(
-            "[DAY_ROLLOVER] Rolling over from {} to {}",
-            old_day.format("%Y-%m-%d"),
-            new_day.format("%Y-%m-%d")
-        );
-
-        // Проверяем состояние FSM
-        let state = self
-            .state
-            .lock()
-            .map_err(|e| format!("Mutex poisoned: {}", e))?;
-
-        let was_running = matches!(&*state, TimerState::Running { .. });
-        drop(state); // Освобождаем lock перед дальнейшими операциями
-
-        // Если таймер был RUNNING, нужно корректно зафиксировать время до полуночи
-        if was_running {
-            // Получаем timestamp полуночи старого дня (00:00:00 следующего дня = конец старого дня)
-            // FIX: Используем UTC вместо Local
-            let old_day_end = new_day
-                .and_hms_opt(0, 0, 0)
-                .and_then(|dt| dt.and_local_timezone(Utc).earliest())
-                .ok_or_else(|| "Failed to create old day end timestamp".to_string())?
-                .timestamp() as u64;
-
-            // Получаем started_at и started_at_instant из состояния
-            // GUARD: Проверка расхождения между SystemTime и Instant (clock skew detection)
-            let (started_at, started_at_instant) = {
-                let state = self
-                    .state
-                    .lock()
-                    .map_err(|e| format!("Mutex poisoned: {}", e))?;
-                match &*state {
-                    TimerState::Running {
-                        started_at,
-                        started_at_instant,
-                    } => (*started_at, *started_at_instant),
-                    _ => {
-                        drop(state);
-                        return Err("Timer state changed during rollover".to_string());
-                    }
-                }
-            };
-
-            // GUARD: Clock skew detection - сравниваем SystemTime и Instant
-            let now_system = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|e| format!("Failed to get system timestamp: {}", e))?
-                .as_secs();
-            let now_instant = Instant::now();
-
-            let system_time_elapsed = now_system.saturating_sub(started_at);
-            let instant_elapsed = now_instant.duration_since(started_at_instant).as_secs();
-
-            // Вычисляем расхождение (clock skew)
-            let clock_skew = if system_time_elapsed > instant_elapsed {
-                system_time_elapsed - instant_elapsed
-            } else {
-                instant_elapsed - system_time_elapsed
-            };
-
-            // Если расхождение > 60 секунд, это clock skew
-            if clock_skew > 60 {
-                warn!(
-                    "[CLOCK_SKEW] System time changed during timer run. \
-                    System elapsed: {}s, Instant elapsed: {}s, Skew: {}s. \
-                    Using Instant as source of truth for elapsed time.",
-                    system_time_elapsed, instant_elapsed, clock_skew
-                );
-            }
-
-            // Вычисляем время до полуночи (если started_at был до полуночи)
-            // ВАЖНО: Для расчета времени до полуночи используем SystemTime (started_at),
-            // так как Instant не имеет связи с календарным временем.
-            // Но при наличии clock skew мы ограничиваем результат Instant elapsed.
-            if started_at < old_day_end {
-                let time_until_midnight = old_day_end - started_at;
-
-                // GUARD: Проверка на разумность времени до полуночи (не более 24 часов)
-                // Дополнительно: если есть clock skew, ограничиваем Instant elapsed
-                let time_until_midnight = if time_until_midnight > 24 * 3600 {
-                    warn!(
-                        "[DAY_ROLLOVER] Suspicious time until midnight: {}s (> 24h). \
-                        Possible clock manipulation. Using 24h as maximum.",
-                        time_until_midnight
-                    );
-                    // Ограничиваем максимум 24 часами
-                    24 * 3600
-                } else if clock_skew > 60 && time_until_midnight > instant_elapsed + clock_skew {
-                    // Если есть clock skew и time_until_midnight подозрительно большой,
-                    // ограничиваем его instant_elapsed (используем Instant как source of truth)
-                    warn!(
-                        "[CLOCK_SKEW] Time until midnight ({}) exceeds Instant elapsed ({}) + skew ({}). \
-                        Limiting to Instant elapsed to prevent time loss.",
-                        time_until_midnight, instant_elapsed, clock_skew
-                    );
-                    instant_elapsed
-                } else {
-                    time_until_midnight
-                };
-
-                // Обновляем accumulated_seconds (время за старый день)
-                // FIX: Защита от переполнения - используем saturating_add
-                let mut accumulated = self
-                    .accumulated_seconds
-                    .lock()
-                    .map_err(|e| format!("Mutex poisoned: {}", e))?;
-                let old_value = *accumulated;
-                *accumulated = accumulated.saturating_add(time_until_midnight);
-                if old_value > *accumulated {
-                    // Произошло насыщение (переполнение предотвращено)
-                    warn!(
-                        "[DAY_ROLLOVER] Accumulated seconds overflow prevented: {} + {} = {} (saturated at u64::MAX)",
-                        old_value, time_until_midnight, *accumulated
-                    );
-                }
-                drop(accumulated);
-
-                info!(
-                    "[DAY_ROLLOVER] Added {} seconds from old day (before midnight)",
-                    time_until_midnight
-                );
-            }
-
-            // Переводим таймер в STOPPED вручную (без вызова stop_internal, чтобы избежать двойного добавления времени)
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|e| format!("Mutex poisoned: {}", e))?;
-            *state = TimerState::Stopped;
-            drop(state);
-        }
-
-        // Обнуляем accumulated_seconds для нового дня
-        // ВАЖНО: Это делается ПОСЛЕ обработки RUNNING состояния
-        // Время за старый день уже зафиксировано выше (если был RUNNING)
-        let mut accumulated = self
-            .accumulated_seconds
-            .lock()
-            .map_err(|e| format!("Mutex poisoned: {}", e))?;
-        *accumulated = 0;
-        drop(accumulated);
-
-        // Обновляем day_start_timestamp на новый день (полночь нового дня в UTC)
-        // FIX: Используем UTC вместо Local для независимости от timezone
-        let new_day_start = new_day
-            .and_hms_opt(0, 0, 0)
-            .and_then(|dt| dt.and_local_timezone(Utc).earliest())
-            .ok_or_else(|| "Failed to create new day start timestamp".to_string())?
-            .timestamp() as u64;
-
-        // GUARD: Проверка, что rollover не выполняется дважды
-        let current_day_start = *self
-            .day_start_timestamp
-            .lock()
-            .map_err(|e| format!("Mutex poisoned: {}", e))?;
-        if let Some(current_ts) = current_day_start {
-            let current_day = chrono::DateTime::<Utc>::from_timestamp(current_ts as i64, 0)
-                .ok_or_else(|| "Invalid day_start timestamp".to_string())?
-                .date_naive();
-
-            // Если день уже обновлен, это двойной вызов
-            if current_day == new_day {
-                warn!(
-                    "[DAY_ROLLOVER] Day already rolled over to {}, skipping duplicate rollover",
-                    new_day.format("%Y-%m-%d")
-                );
-                return Ok(());
-            }
-        }
-
-        let mut day_start = self
-            .day_start_timestamp
-            .lock()
-            .map_err(|e| format!("Mutex poisoned: {}", e))?;
-        *day_start = Some(new_day_start);
-        drop(day_start);
-
-        // Сохраняем новое состояние в БД
-        if let Err(e) = self.save_state() {
-            warn!("[DAY_ROLLOVER] Failed to save state after rollover: {}", e);
-            // Не возвращаем ошибку - rollover выполнен, сохранение можно повторить
-        }
-
-        info!(
-            "[DAY_ROLLOVER] Rollover completed. New day: {}",
-            new_day.format("%Y-%m-%d")
-        );
-        Ok(())
-    }
-
-    fn reset_day(&self) -> Result<(), String> {
-        // Проверяем состояние - нельзя сбрасывать день если таймер RUNNING
-        let is_running = {
-            let state_lock = self
-                .state
-                .lock()
-                .map_err(|e| format!("Mutex poisoned: {}", e))?;
-            matches!(&*state_lock, TimerState::Running { .. })
-        };
-
-        if is_running {
-            // Если таймер работает, сначала останавливаем его
-            // Это предотвращает потерю времени
-            self.stop()?;
-        }
-
-        // Теперь безопасно сбрасываем (таймер Stopped или Paused)
-
-        // Теперь безопасно сбрасываем
-        let mut accumulated = self
-            .accumulated_seconds
-            .lock()
-            .map_err(|e| format!("Mutex poisoned: {}", e))?;
-        let mut day_start = self
-            .day_start_timestamp
-            .lock()
-            .map_err(|e| format!("Mutex poisoned: {}", e))?;
-
-        *accumulated = 0;
-        *day_start = Some(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|e| format!("Failed to get timestamp: {}", e))?
-                .as_secs(),
-        );
-
-        Ok(())
-    }
-}
-
 pub struct ActivityMonitor {
     is_monitoring: Arc<Mutex<bool>>,
     last_activity: Arc<Mutex<Instant>>,
@@ -4845,6 +3823,7 @@ impl ActivityMonitor {
     }
 }
 
+
 #[derive(serde::Serialize)]
 struct ActiveWindowInfo {
     app_name: Option<String>,
@@ -4852,6 +3831,7 @@ struct ActiveWindowInfo {
     url: Option<String>,
     domain: Option<String>,
 }
+
 
 #[cfg(target_os = "macos")]
 pub fn extract_url_from_title(title: &str) -> (Option<String>, Option<String>) {
@@ -4918,6 +3898,7 @@ fn extract_domain(url: &str) -> Option<String> {
     None
 }
 
+
 /// Проверка online статуса через легковесный HTTP запрос
 pub async fn check_online_status() -> bool {
     // Используем быстрый GET запрос к надежному серверу
@@ -4960,6 +3941,7 @@ struct SyncStatusResponse {
     failed_count: i32,
     is_online: bool,
 }
+
 
 // ============================================
 // SYSTEM SLEEP / WAKE HANDLING
