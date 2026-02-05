@@ -1,8 +1,10 @@
 use crate::engine::{TimerEngine, TimerStateResponse};
+use crate::models::ActiveWindowInfo;
+use crate::models::{FailedTaskInfo, QueueStats};
+use crate::monitor::ActivityMonitor;
+use crate::sync::SyncManager;
+use crate::SyncStatusResponse;
 use crate::{check_online_status, extract_url_from_title};
-use crate::{
-    ActiveWindowInfo, ActivityMonitor, FailedTaskInfo, QueueStats, SyncManager, SyncStatusResponse,
-};
 use std::sync::Arc;
 use std::time::Instant;
 use tauri::{AppHandle, State};

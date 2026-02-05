@@ -65,3 +65,23 @@ impl TimerEngine {
         }
     }
 }
+
+// Сериализация для API (без Instant)
+impl Serialize for TimerState {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            TimerState::Stopped => serializer.serialize_unit_variant("TimerState", 0, "STOPPED"),
+            TimerState::Running { started_at, .. } => {
+                use serde::ser::SerializeStruct;
+                let mut state = serializer.serialize_struct("Running", 2)?;
+                state.serialize_field("state", "RUNNING")?;
+                state.serialize_field("started_at", started_at)?;
+                state.end()
+            }
+            TimerState::Paused => serializer.serialize_unit_variant("TimerState", 2, "PAUSED"),
+        }
+    }
+}
