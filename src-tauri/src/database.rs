@@ -2,15 +2,18 @@ use rusqlite::{params, Connection, Result as SqliteResult};
 use std::sync::{Arc, Mutex};
 use tracing::{error, warn};
 
+use crate::auth::TokenEncryption;
 use crate::models::{FailedTaskInfo, QueueStats};
 use crate::TaskPriority;
 use chrono::Utc;
+use rusqlite::Error::InvalidParameterName;
 use std::collections::hash_map::DefaultHasher;
 
 use std::hash::{Hash, Hasher};
 /// Менеджер базы данных
 pub struct Database {
     pub(crate) conn: Arc<Mutex<Connection>>,
+    pub(crate) encryption: Arc<TokenEncryption>,
 }
 
 impl Database {
@@ -49,8 +52,11 @@ impl Database {
             })
             .ok();
 
+        let encryption = TokenEncryption::new().map_err(|e| InvalidParameterName(e))?;
+
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
+            encryption: Arc::new(encryption),
         };
         db.init_schema()?;
         Ok(db)
@@ -213,6 +219,11 @@ impl Database {
         payload.hash(&mut hasher);
         let idempotency_key = format!("{}-{:x}", entity_type, hasher.finish());
 
+        let encrypted_payload = self.encryption.encrypt(payload).map_err(|e| {
+            error!("[DB] Encryption failed for payload: {}", e);
+            InvalidParameterName(format!("Encryption error: {}", e))
+        })?;
+
         // CRITICAL FIX: Начинаем явную транзакцию для атомарности
         // BEGIN IMMEDIATE гарантирует, что транзакция начнется немедленно
         conn.execute("BEGIN IMMEDIATE TRANSACTION", [])
@@ -224,11 +235,10 @@ impl Database {
         // Проверяем, есть ли такая же задача в очереди (pending) за последние 5 секунд
         let duplicate_check: i32 = match conn.query_row(
             "SELECT COUNT(*) FROM sync_queue 
-             WHERE entity_type = ?1 
-             AND payload = ?2 
+             WHERE idempotency_key = ?1 
              AND status = 'pending' 
-             AND created_at > ?3",
-            params![entity_type, payload, now - duplicate_window],
+             AND created_at > ?2",
+            params![idempotency_key, now - duplicate_window],
             |row| row.get(0),
         ) {
             Ok(count) => count,
@@ -330,7 +340,7 @@ impl Database {
         let result = conn.execute(
             "INSERT INTO sync_queue (entity_type, payload, status, created_at, priority, idempotency_key)
      VALUES (?1, ?2, 'pending', ?3, ?4, ?5)",
-            params![entity_type, payload, now, priority_value, idempotency_key],
+            params![entity_type, encrypted_payload, now, priority_value, idempotency_key],
         );
 
         // CRITICAL FIX: Коммитим или откатываем транзакцию
@@ -597,13 +607,18 @@ impl Database {
         )?;
 
         let rows = stmt.query_map(params![max_retries, now, batch_size], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i32>(3)?,
-                row.get::<_, Option<String>>(4)?,
-            ))
+            let id = row.get::<_, i64>(0)?;
+            let entity_type = row.get::<_, String>(1)?;
+            let encrypted_payload = row.get::<_, String>(2)?;
+            let retry_count = row.get::<_, i32>(3)?;
+            let idempotency_key = row.get::<_, Option<String>>(4)?;
+
+            let payload = self
+                .encryption
+                .decrypt(&encrypted_payload)
+                .map_err(|e| InvalidParameterName(format!("Decryption error: {}", e)))?;
+
+            Ok((id, entity_type, payload, retry_count, idempotency_key))
         })?;
 
         let mut result = Vec::new();

@@ -116,11 +116,10 @@ impl AuthManager {
 
 /// Шифрование токенов перед сохранением в SQLite
 /// Использует AES-256-GCM для шифрования
-#[allow(dead_code)]
 pub struct TokenEncryption {
     cipher: Aes256Gcm,
 }
-#[allow(dead_code)]
+
 impl TokenEncryption {
     /// Создать новый экземпляр с ключом из переменной окружения или дефолтным
     /// В production должен использовать Keychain (macOS) или другой secure storage

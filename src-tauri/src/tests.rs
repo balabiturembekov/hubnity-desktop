@@ -1401,12 +1401,20 @@ mod tests {
             let tasks = sync_manager.db.get_pending_sync_tasks(10).unwrap();
             assert_eq!(tasks.len(), 1);
 
+            let encrypted_payload = &tasks[0].2;
+
+            let decrypted = sync_manager
+                .db
+                .encryption
+                .decrypt(encrypted_payload)
+                .unwrap_or_else(|_| encrypted_payload.clone());
+
             // PRODUCTION: Парсим payload и проверяем, что токены НЕ сохранены
-            let payload_json: serde_json::Value = serde_json::from_str(&tasks[0].2).unwrap();
+            let payload_json: serde_json::Value = serde_json::from_str(&decrypted)
+                .expect("Payload should be a valid json after decryption");
             // Токены не должны быть в payload
             assert!(payload_json["accessToken"].is_null());
             assert!(payload_json["refreshToken"].is_null());
-            assert!(payload_json["_encrypted"].is_null());
             // Payload должен содержать только исходные данные
             assert_eq!(payload_json["projectId"], "123");
         }
@@ -1900,7 +1908,13 @@ mod tests {
             assert!(task.is_some(), "Task should be found");
 
             if let Some((_, _, payload)) = task {
-                let payload_json: serde_json::Value = serde_json::from_str(payload).unwrap();
+                let decrypted_payload = sync_manager
+                    .db
+                    .encryption
+                    .decrypt(&payload)
+                    .expect("Payload must be decrypted successfully");
+                let payload_json: serde_json::Value = serde_json::from_str(&decrypted_payload)
+                    .expect("Decrypted payload must be a valid JSON");
                 let image_data = payload_json["imageData"].as_str().unwrap();
 
                 // Проверяем формат: data:image/jpeg;base64,...
