@@ -1,4 +1,4 @@
-import { useCallback, useEffect } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useAuthStore } from './store/useAuthStore';
 import { useTrackerStore } from './store/useTrackerStore';
 import { Login } from './components/Login';
@@ -18,6 +18,8 @@ import './App.css';
 function App() {
   const { isAuthenticated } = useAuthStore();
   const { loadActiveTimeEntry } = useTrackerStore();
+  const [updateAvailable, setUpdateAvailable] = useState<{ version: string; body?: string } | null>(null);
+  const pendingUpdateRef = useRef<Awaited<ReturnType<typeof import('@tauri-apps/plugin-updater').check>>(null);
 
   // Восстанавливаем токены в Rust AuthManager — иначе фоновая синхронизация всегда получает "token not set" и Синхронизировано = 0
   const restoreTokens = useCallback(async () => {
@@ -268,6 +270,46 @@ function App() {
     return () => {
       window.removeEventListener('auth:logout', handleLogout);
     };
+  }, []);
+
+  // Проверка обновлений (раз в 15 с после загрузки, затем не спамим)
+  useEffect(() => {
+    let cancelled = false;
+    const timeout = setTimeout(async () => {
+      try {
+        const { check } = await import('@tauri-apps/plugin-updater');
+        const update = await check();
+        if (cancelled || !update) return;
+        pendingUpdateRef.current = update;
+        setUpdateAvailable({ version: update.version, body: update.body ?? undefined });
+        await invoke('show_notification', {
+          title: 'Hubnity',
+          body: `Доступна новая версия ${update.version}. Откройте приложение и нажмите «Установить».`,
+        }).catch(() => {});
+      } catch (e) {
+        logger.debug('APP', 'Update check failed (non-critical)', e);
+      }
+    }, 15000);
+    return () => {
+      cancelled = true;
+      clearTimeout(timeout);
+    };
+  }, []);
+
+  const installUpdate = useCallback(async () => {
+    const update = pendingUpdateRef.current;
+    if (!update) return;
+    try {
+      const { relaunch } = await import('@tauri-apps/plugin-process');
+      await update.downloadAndInstall();
+      await relaunch();
+    } catch (e) {
+      logger.error('APP', 'Update install failed', e);
+      await invoke('show_notification', {
+        title: 'Hubnity',
+        body: 'Не удалось установить обновление. Попробуйте скачать с сайта.',
+      }).catch(() => {});
+    }
   }, []);
 
   // Setup activity monitoring listeners and heartbeat
@@ -1088,6 +1130,20 @@ function App() {
   return (
     <ErrorBoundary>
       <div className="h-screen bg-background overflow-hidden flex flex-col">
+        {updateAvailable && (
+          <div className="px-4 py-2 bg-primary text-primary-foreground flex items-center justify-between gap-3 shrink-0">
+            <span className="text-sm">
+              Доступна новая версия {updateAvailable.version}. {updateAvailable.body ?? ''}
+            </span>
+            <button
+              type="button"
+              onClick={installUpdate}
+              className="shrink-0 px-3 py-1 rounded bg-primary-foreground text-primary text-sm font-medium hover:opacity-90"
+            >
+              Установить
+            </button>
+          </div>
+        )}
         <Tabs defaultValue="tracker" className="flex flex-col h-full">
           {/* Header - macOS-style segmented control */}
           <div className="px-6 pt-3 pb-2.5 border-b">

@@ -44,6 +44,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -58,6 +59,14 @@
       "signingIdentity": null,
       "entitlements": null,
       "infoPlist": "Info.plist"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IHJzaWduIGVuY3J5cHRlZCBzZWNyZXQga2V5ClJXUlRZMEl5R1N6SFFUNmlRNU02ZHg3bzgxaW5hbmZQbTRqOHZxbzZyenBRRVZmTE5IRUFBQkFBQUFBQUFBQUFBQUlBQUFBQWhDN3BCMG9CN0Q4ODlqQjJuNDI2UzFRWGxPR21XQjJ1SFFoakNBb3NYSUNXSEh5dGc2Y013SFdWYTFSUUZKd3VRTTlSa3dRbnI5dWVPa0lwd3NvaGFXRmVBSmVjVCtYMFJqbk5tdjFMWE8wK0RWWG9SQXd1VCtvVDIzd1VGWE1vWUhpRzdxRVVLKzg9Cg==",
+      "endpoints": [
+        "https://github.com/balabiturembekov/hubnity-desktop/releases/latest/download/latest.json"
+      ]
     }
   }
 }

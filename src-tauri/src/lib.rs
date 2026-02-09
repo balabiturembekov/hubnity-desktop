@@ -59,10 +59,20 @@ pub fn run() {
         )
         .init();
 
-    tauri::Builder::default()
+    #[cfg(desktop)]
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_process::init());
+    #[cfg(not(desktop))]
+    let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init());
+
+    builder
         .setup(|app| {
+            #[cfg(desktop)]
+            let _ = app.handle().plugin(tauri_plugin_updater::Builder::new().build());
             // Инициализация базы данных в setup hook
             let app_data_dir = app.path().app_data_dir().map_err(|e| {
                 std::io::Error::new(

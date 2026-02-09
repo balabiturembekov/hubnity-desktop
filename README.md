@@ -50,6 +50,22 @@ CFLAGS= cargo build --target x86_64-pc-windows-msvc
 
 В настройках репозитория: **Settings → Actions → General → Workflow permissions** выберите «Read and write permissions», чтобы действие могло создавать релизы.
 
+## Уведомления об обновлениях
+
+Приложение проверяет обновления с GitHub Releases и показывает уведомление и баннер «Установить», если доступна новая версия.
+
+**Чтобы обновления работали (подпись артефактов):**
+
+1. Сгенерируйте ключи подписи (один раз):
+   ```bash
+   pnpm tauri signer generate -w ~/.tauri/hubnity.key
+   ```
+2. В `src-tauri/tauri.conf.json` в `plugins.updater.pubkey` вставьте **содержимое** файла `~/.tauri/hubnity.key.pub` (не путь к файлу).
+3. В GitHub: **Settings → Secrets and variables → Actions** добавьте секрет `TAURI_SIGNING_PRIVATE_KEY` — содержимое файла `~/.tauri/hubnity.key` (приватный ключ).
+4. При сборке в CI Tauri подпишет артефакты; в релиз нужно загрузить файл `latest.json` (его генерирует сборка) вместе с установщиками. Если используете tauri-action, проверьте, что в релиз попадают артефакты обновления и `latest.json`.
+
+Без подписи клиент не примет обновление (проверка подписи обязательна).
+
 ## Recommended IDE Setup
 
 - [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)

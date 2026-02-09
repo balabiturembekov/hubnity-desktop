@@ -64,6 +64,7 @@ jobs:
         uses: tauri-apps/tauri-action@action-v0.6.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         with:
           tagName: ${{ github.event_name == 'push' && 'app-v__VERSION__' || '' }}
           releaseName: ${{ github.event_name == 'push' && 'Hubnity v__VERSION__' || '' }}
