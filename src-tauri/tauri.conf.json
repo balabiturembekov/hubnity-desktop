@@ -63,7 +63,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IHJzaWduIGVuY3J5cHRlZCBzZWNyZXQga2V5ClJXUlRZMEl5R1N6SFFUNmlRNU02ZHg3bzgxaW5hbmZQbTRqOHZxbzZyenBRRVZmTE5IRUFBQkFBQUFBQUFBQUFBQUlBQUFBQWhDN3BCMG9CN0Q4ODlqQjJuNDI2UzFRWGxPR21XQjJ1SFFoakNBb3NYSUNXSEh5dGc2Y013SFdWYTFSUUZKd3VRTTlSa3dRbnI5dWVPa0lwd3NvaGFXRmVBSmVjVCtYMFJqbk5tdjFMWE8wK0RWWG9SQXd1VCtvVDIzd1VGWE1vWUhpRzdxRVVLKzg9Cg==",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDI3MzZFMDhGNDFDOTJCMEUKUldRT0s4bEJqK0EySitTbEpITmk1Ri9SZTJTWUMrcEpRUXFua3EvdVZLUy9Qc3RnbGNOeDVpcEgK",
       "endpoints": [
         "https://github.com/balabiturembekov/hubnity-desktop/releases/latest/download/latest.json"
       ]
