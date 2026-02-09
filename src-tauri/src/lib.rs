@@ -148,13 +148,9 @@ pub fn run() {
 
             // Инициализируем SyncManager
             let sync_manager = SyncManager::new(db.clone());
-            app.manage(sync_manager.clone());
-
-            // Запускаем фоновую синхронизацию в отдельном потоке с собственным Tokio runtime
-            // Запускаем фоновую синхронизацию после полной инициализации приложения
-            // Используем std::thread::spawn с блокирующим runtime для фоновой задачи
-            // Это безопасно, так как задача выполняется в отдельном потоке
+            // CRITICAL FIX: Сохраняем ссылку на sync_manager ДО manage(), чтобы фоновая задача использовала тот же экземпляр
             let sync_manager_bg = sync_manager.clone();
+            app.manage(sync_manager);
 
             // CRITICAL FIX: Background sync с restart mechanism
             // ДОКАЗАНО: Thread автоматически перезапускается при панике или ошибке
@@ -184,10 +180,13 @@ pub fn run() {
                         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60)); // Каждую минуту
                         loop {
                             interval.tick().await;
+                            info!("[SYNC] Background sync tick, attempting sync...");
                             match sync_manager_bg.sync_queue(5).await {
                                 Ok(count) => {
                                     if count > 0 {
-                                        info!("[SYNC] Synced {} tasks", count);
+                                        info!("[SYNC] Background sync: synced {} tasks", count);
+                                    } else {
+                                        debug!("[SYNC] Background sync: no tasks to sync");
                                     }
                                 }
                                 Err(e) => {

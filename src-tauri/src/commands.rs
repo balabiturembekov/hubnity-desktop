@@ -755,8 +755,14 @@ pub async fn set_auth_tokens(
     }
     sync_manager
         .auth_manager
-        .set_tokens(access_token, refresh_token)
+        .set_tokens(access_token.clone(), refresh_token.clone())
         .await;
+    // Логируем для диагностики
+    if let Some(token) = &access_token {
+        info!("[SYNC] Tokens set in AuthManager, token length: {}", token.len());
+    } else {
+        info!("[SYNC] Tokens cleared in AuthManager");
+    }
     Ok(())
 }
 
@@ -773,7 +779,13 @@ pub async fn get_current_user_id(
 
 #[tauri::command]
 pub async fn sync_queue_now(sync_manager: State<'_, SyncManager>) -> Result<usize, String> {
-    sync_manager.sync_queue(5).await
+    let pending = sync_manager.db.get_pending_count()
+        .map_err(|e| format!("Failed to get pending count: {}", e))?;
+    info!("[SYNC] sync_queue_now: {} pending tasks", pending);
+    let result = sync_manager.sync_queue(5).await
+        .map_err(|e| e.to_string())?;
+    info!("[SYNC] sync_queue_now: synced {} tasks", result);
+    Ok(result)
 }
 
 /// Получить статус синхронизации (количество pending/failed задач)

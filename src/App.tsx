@@ -186,6 +186,73 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isAuthenticated]); // loadActiveTimeEntry is stable from zustand, but we don't want to re-run on every render
 
+  // Периодическая синхронизация состояния таймера с сервера (для мультиустройств)
+  // Проверяем каждые 10 секунд, чтобы синхронизировать паузу/возобновление с других устройств
+  useEffect(() => {
+    if (!isAuthenticated) return;
+
+    const syncTimerState = async () => {
+      try {
+        const { api } = await import('./lib/api');
+        const activeEntries = await api.getActiveTimeEntries();
+        
+        if (activeEntries.length > 0) {
+          const activeEntry = activeEntries[0];
+          const { getTimerState } = useTrackerStore.getState();
+          const timerState = await getTimerState();
+          
+          // Синхронизируем состояние таймера с сервером
+          if (activeEntry.status === 'RUNNING' && timerState.state !== 'RUNNING') {
+            // На сервере RUNNING, но локально не RUNNING - запускаем
+            logger.info('APP', 'Syncing timer: server is RUNNING, starting local timer');
+            const { resumeTracking } = useTrackerStore.getState();
+            await resumeTracking().catch((e) => {
+              logger.warn('APP', 'Failed to resume timer on sync', e);
+            });
+          } else if (activeEntry.status === 'PAUSED' && timerState.state === 'RUNNING') {
+            // На сервере PAUSED, но локально RUNNING - ставим на паузу
+            logger.info('APP', 'Syncing timer: server is PAUSED, pausing local timer');
+            const { pauseTracking } = useTrackerStore.getState();
+            await pauseTracking().catch((e) => {
+              logger.warn('APP', 'Failed to pause timer on sync', e);
+            });
+          } else if (activeEntry.status === 'STOPPED' && timerState.state !== 'STOPPED') {
+            // На сервере STOPPED, но локально не STOPPED - останавливаем
+            logger.info('APP', 'Syncing timer: server is STOPPED, stopping local timer');
+            const { stopTracking } = useTrackerStore.getState();
+            await stopTracking().catch((e) => {
+              logger.warn('APP', 'Failed to stop timer on sync', e);
+            });
+          }
+        } else {
+          // Нет активных записей на сервере, но локально таймер работает - останавливаем
+          const { getTimerState } = useTrackerStore.getState();
+          const timerState = await getTimerState();
+          if (timerState.state !== 'STOPPED') {
+            logger.info('APP', 'Syncing timer: no active entries on server, stopping local timer');
+            const { stopTracking } = useTrackerStore.getState();
+            await stopTracking().catch((e) => {
+              logger.warn('APP', 'Failed to stop timer on sync', e);
+            });
+          }
+        }
+      } catch (error) {
+        logger.debug('APP', 'Failed to sync timer state from server', error);
+        // Не логируем как ошибку - это нормально если сервер недоступен
+      }
+    };
+
+    // Первая проверка через 5 секунд после монтирования
+    const initialTimeout = setTimeout(syncTimerState, 5000);
+    // Затем каждые 10 секунд
+    const interval = setInterval(syncTimerState, 10000);
+
+    return () => {
+      clearTimeout(initialTimeout);
+      clearInterval(interval);
+    };
+  }, [isAuthenticated]);
+
   // Listen for auth logout events (from refresh token failure)
   useEffect(() => {
     const handleLogout = async () => {

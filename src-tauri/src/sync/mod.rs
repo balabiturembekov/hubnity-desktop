@@ -431,11 +431,16 @@ impl SyncManager {
     /// Внутренний метод синхронизации (single-flight)
     /// PRODUCTION: Все точки входа сходятся здесь
     async fn run_sync_internal(&self, max_retries: i32) -> Result<usize, SyncError> {
-        if let Err(e) = self.auth_manager.get_access_token().await {
-            let msg = format!("[SYNC] Skipping sync (no token): {}", e);
-            warn!("{}", msg);
-            eprintln!("{}", msg);
-            return Ok(0);
+        match self.auth_manager.get_access_token().await {
+            Ok(token) => {
+                debug!("[SYNC] Token available, length: {}", token.len());
+            }
+            Err(e) => {
+                let msg = format!("[SYNC] Skipping sync (no token): {}", e);
+                warn!("{}", msg);
+                eprintln!("{}", msg);
+                return Ok(0);
+            }
         }
 
         let pending_count = self
@@ -443,6 +448,7 @@ impl SyncManager {
             .get_pending_count_for_batch()
             .map_err(|e| SyncError::Db(format!("get pending count: {}", e)))?;
 
+        info!("[SYNC] run_sync_internal: {} pending tasks", pending_count);
         if pending_count == 0 {
             debug!("[SYNC] No pending tasks, skipping sync");
             return Ok(0);
