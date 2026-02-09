@@ -8,6 +8,7 @@ import { Settings } from './components/Settings';
 import { SyncIndicator } from './components/SyncIndicator';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { invoke } from '@tauri-apps/api/core';
+import type { Update } from '@tauri-apps/plugin-updater';
 import { listen } from '@tauri-apps/api/event';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from './components/ui/tabs';
 import { logger } from './lib/logger';
@@ -19,7 +20,7 @@ function App() {
   const { isAuthenticated } = useAuthStore();
   const { loadActiveTimeEntry } = useTrackerStore();
   const [updateAvailable, setUpdateAvailable] = useState<{ version: string; body?: string } | null>(null);
-  const pendingUpdateRef = useRef<Awaited<ReturnType<typeof import('@tauri-apps/plugin-updater').check>>(null);
+  const pendingUpdateRef = useRef<Update | null>(null);
 
   // Восстанавливаем токены в Rust AuthManager — иначе фоновая синхронизация всегда получает "token not set" и Синхронизировано = 0
   const restoreTokens = useCallback(async () => {
