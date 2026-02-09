@@ -4,7 +4,7 @@ use tracing::{error, warn};
 
 use crate::auth::TokenEncryption;
 use crate::models::{FailedTaskInfo, QueueStats};
-use crate::TaskPriority;
+use crate::sync::TaskPriority;
 use chrono::Utc;
 use rusqlite::Error::InvalidParameterName;
 use std::collections::hash_map::DefaultHasher;

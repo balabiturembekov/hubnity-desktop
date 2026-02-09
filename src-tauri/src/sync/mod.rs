@@ -1,10 +1,53 @@
 use crate::auth::AuthManager;
+#[cfg(test)]
 use crate::models::TokenRefreshResult;
 use crate::Database;
+use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
-/// Приоритет задачи синхронизации
+/// Ошибки синхронизации (для разбора и логирования)
+#[derive(Debug)]
+pub enum SyncError {
+    ParsePayload(String),
+    Auth(String),
+    Network(String),
+    Http { status: u16, message: String },
+    UnknownOperation(String),
+    Db(String),
+}
+
+impl fmt::Display for SyncError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SyncError::ParsePayload(s) => write!(f, "Parse payload: {}", s),
+            SyncError::Auth(s) => write!(f, "Auth: {}", s),
+            SyncError::Network(s) => write!(f, "Network: {}", s),
+            SyncError::Http { status, message } => write!(f, "HTTP {}: {}", status, message),
+            SyncError::UnknownOperation(s) => write!(f, "Unknown operation: {}", s),
+            SyncError::Db(s) => write!(f, "DB: {}", s),
+        }
+    }
+}
+
+/// Конфигурация синхронизации (api_base_url, таймауты)
+#[derive(Clone)]
+pub struct SyncConfig {
+    pub api_base_url: String,
+    pub http_timeout_secs: u64,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            api_base_url: "https://app.automatonsoft.de/api".to_string(),
+            http_timeout_secs: 120,
+        }
+    }
+}
+
+/// Приоритет задачи синхронизации (используется sync и database)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TaskPriority {
     Critical = 0, // start, stop
@@ -31,18 +74,26 @@ pub struct SyncManager {
     pub(crate) db: Arc<Database>,
     pub(crate) api_base_url: String,
     pub(crate) auth_manager: Arc<AuthManager>,
-    // GUARD: Single-flight sync lock (только tokio::Mutex, без AtomicBool)
     pub(crate) sync_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) client: reqwest::Client,
 }
 
 impl SyncManager {
     pub fn new(db: Arc<Database>) -> Self {
-        let api_base_url = "https://app.automatonsoft.de/api".to_string();
+        Self::new_with_config(db, SyncConfig::default())
+    }
+
+    pub fn new_with_config(db: Arc<Database>, config: SyncConfig) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(config.http_timeout_secs))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             db,
-            api_base_url: api_base_url.clone(),
-            auth_manager: Arc::new(AuthManager::new(api_base_url)),
+            api_base_url: config.api_base_url.clone(),
+            auth_manager: Arc::new(AuthManager::new(config.api_base_url)),
             sync_lock: Arc::new(tokio::sync::Mutex::new(())),
+            client,
         }
     }
 
@@ -57,17 +108,12 @@ impl SyncManager {
         }
     }
 
-    /// Обновить токен через refresh token
-    /// Используется в тестах и через auth_manager.refresh_token() в sync_task
-    #[allow(dead_code)] // Используется в тестах
+    /// Обновить токен через refresh (используется в тестах; в sync_task вызывается auth_manager.refresh_token)
+    #[cfg(test)]
     pub async fn refresh_token(&self, refresh_token: &str) -> Result<TokenRefreshResult, String> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
-
         let url = format!("{}/auth/refresh", self.api_base_url);
-        let response = client
+        let response = self
+            .client
             .post(&url)
             .header("Content-Type", "application/json")
             .json(&serde_json::json!({
@@ -150,6 +196,98 @@ impl SyncManager {
             .map_err(|e| format!("Failed to enqueue screenshot: {}", e))
     }
 
+    /// Построить и отправить HTTP-запрос для time_entry операции
+    fn send_time_entry_request(
+        &self,
+        operation: &str,
+        payload_json: &serde_json::Value,
+        access_token: &str,
+        idempotency_key: Option<&str>,
+    ) -> Result<reqwest::RequestBuilder, SyncError> {
+        let url = match operation {
+            "start" => format!("{}/time-entries", self.api_base_url),
+            "pause" => {
+                let id = payload_json["id"].as_str().ok_or_else(|| {
+                    SyncError::UnknownOperation("Missing id for pause operation".into())
+                })?;
+                format!("{}/time-entries/{}/pause", self.api_base_url, id)
+            }
+            "resume" => {
+                let id = payload_json["id"].as_str().ok_or_else(|| {
+                    SyncError::UnknownOperation("Missing id for resume operation".into())
+                })?;
+                format!("{}/time-entries/{}/resume", self.api_base_url, id)
+            }
+            "stop" => {
+                let id = payload_json["id"].as_str().ok_or_else(|| {
+                    SyncError::UnknownOperation("Missing id for stop operation".into())
+                })?;
+                format!("{}/time-entries/{}/stop", self.api_base_url, id)
+            }
+            _ => {
+                return Err(SyncError::UnknownOperation(format!(
+                    "Unknown time entry operation: {}",
+                    operation
+                )))
+            }
+        };
+
+        let method = match operation {
+            "start" => self.client.post(&url),
+            "pause" | "resume" | "stop" => self.client.put(&url),
+            _ => {
+                return Err(SyncError::UnknownOperation(format!(
+                    "Unknown operation: {}",
+                    operation
+                )))
+            }
+        };
+
+        let mut request = method
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {}", access_token));
+        if let Some(key) = idempotency_key {
+            request = request.header("X-Idempotency-Key", key);
+        }
+        // start: body = payload (projectId, userId, description). pause/resume/stop: id в URL, тело пустое (API часто не ожидает body)
+        let body = match operation {
+            "start" => payload_json.clone(),
+            _ => serde_json::json!({}),
+        };
+        Ok(request.json(&body))
+    }
+
+    /// Построить и отправить HTTP-запрос для screenshot
+    fn send_screenshot_request(
+        &self,
+        payload_json: &serde_json::Value,
+        access_token: &str,
+        idempotency_key: Option<&str>,
+    ) -> Result<reqwest::RequestBuilder, SyncError> {
+        let image_data = payload_json["imageData"]
+            .as_str()
+            .ok_or_else(|| SyncError::UnknownOperation("Missing imageData in payload".into()))?;
+        let time_entry_id = payload_json["timeEntryId"]
+            .as_str()
+            .ok_or_else(|| SyncError::UnknownOperation("Missing timeEntryId in payload".into()))?;
+
+        let payload = serde_json::json!({
+            "imageData": image_data,
+            "timeEntryId": time_entry_id,
+        });
+
+        let url = format!("{}/screenshots", self.api_base_url);
+        let mut request = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {}", access_token));
+        if let Some(key) = idempotency_key {
+            request = request.header("X-Idempotency-Key", key);
+        }
+        Ok(request.json(&payload))
+    }
+
     /// Синхронизировать одну задачу из очереди
     /// PRODUCTION: Получает токены через AuthManager (не из payload)
     /// Автоматически обновляет токен при 401 ошибке
@@ -160,106 +298,47 @@ impl SyncManager {
         entity_type: String,
         payload: String,
         idempotency_key: Option<String>,
-    ) -> Result<bool, String> {
-        let payload_json: serde_json::Value = serde_json::from_str(&payload)
-            .map_err(|e| format!("Failed to parse payload: {}", e))?;
+    ) -> Result<bool, SyncError> {
+        let payload_json: serde_json::Value =
+            serde_json::from_str(&payload).map_err(|e| SyncError::ParsePayload(e.to_string()))?;
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
-            .build()
-            .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
-
-        // PRODUCTION: Получаем токены через AuthManager (не из payload)
-        let mut access_token = self.auth_manager.get_access_token().await.map_err(|e| {
-            format!(
-                "Failed to get access token: {}. Call set_auth_tokens first.",
-                e
-            )
-        })?;
+        let mut access_token = self
+            .auth_manager
+            .get_access_token()
+            .await
+            .map_err(|e| SyncError::Auth(e.to_string()))?;
 
         let mut refresh_token = self
             .auth_manager
             .get_refresh_token()
             .await
-            .map_err(|e| format!("Failed to get refresh token: {}", e))?;
+            .map_err(|e| SyncError::Auth(e.to_string()))?;
 
-        // Выполняем запрос с возможностью обновления токена при 401
         let mut retry_with_refresh = true;
+        let idempotency_key_ref = idempotency_key.as_deref();
+
         loop {
-            // Выполняем HTTP запрос
             let response_result = if entity_type.starts_with("time_entry_") {
                 let operation = entity_type.strip_prefix("time_entry_").unwrap();
-
-                // PRODUCTION: Payload уже не содержит токенов
-                let request_payload = payload_json.clone();
-
-                let url = match operation {
-                    "start" => format!("{}/time-entries", self.api_base_url),
-                    "pause" => {
-                        let id = payload_json["id"]
-                            .as_str()
-                            .ok_or_else(|| "Missing id for pause operation".to_string())?;
-                        format!("{}/time-entries/{}/pause", self.api_base_url, id)
-                    }
-                    "resume" => {
-                        let id = payload_json["id"]
-                            .as_str()
-                            .ok_or_else(|| "Missing id for resume operation".to_string())?;
-                        format!("{}/time-entries/{}/resume", self.api_base_url, id)
-                    }
-                    "stop" => {
-                        let id = payload_json["id"]
-                            .as_str()
-                            .ok_or_else(|| "Missing id for stop operation".to_string())?;
-                        format!("{}/time-entries/{}/stop", self.api_base_url, id)
-                    }
-                    _ => return Err(format!("Unknown time entry operation: {}", operation)),
-                };
-
-                let method = match operation {
-                    "start" => client.post(&url),
-                    "pause" | "resume" | "stop" => client.put(&url),
-                    _ => return Err(format!("Unknown operation: {}", operation)),
-                };
-
-                let mut request = method
-                    .header("Content-Type", "application/json")
-                    .header("Authorization", format!("Bearer {}", access_token));
-
-                // CRITICAL FIX: Добавляем idempotency key в заголовок
-                // ДОКАЗАНО: Сервер может использовать этот ключ для дедупликации
-                if let Some(ref key) = idempotency_key {
-                    request = request.header("X-Idempotency-Key", key);
-                }
-
-                request.json(&request_payload).send().await
+                let builder = self.send_time_entry_request(
+                    operation,
+                    &payload_json,
+                    &access_token,
+                    idempotency_key_ref,
+                )?;
+                builder.send().await
             } else if entity_type == "screenshot" {
-                let image_data = payload_json["imageData"]
-                    .as_str()
-                    .ok_or_else(|| "Missing imageData in payload".to_string())?;
-                let time_entry_id = payload_json["timeEntryId"]
-                    .as_str()
-                    .ok_or_else(|| "Missing timeEntryId in payload".to_string())?;
-
-                let screenshot_payload = serde_json::json!({
-                    "imageData": image_data,
-                    "timeEntryId": time_entry_id,
-                });
-
-                let url = format!("{}/screenshots", self.api_base_url);
-                let mut request = client
-                    .post(&url)
-                    .header("Content-Type", "application/json")
-                    .header("Authorization", format!("Bearer {}", access_token));
-
-                // CRITICAL FIX: Добавляем idempotency key в заголовок
-                if let Some(ref key) = idempotency_key {
-                    request = request.header("X-Idempotency-Key", key);
-                }
-
-                request.json(&screenshot_payload).send().await
+                let builder = self.send_screenshot_request(
+                    &payload_json,
+                    &access_token,
+                    idempotency_key_ref,
+                )?;
+                builder.send().await
             } else {
-                return Err(format!("Unknown entity type: {}", entity_type));
+                return Err(SyncError::UnknownOperation(format!(
+                    "Unknown entity type: {}",
+                    entity_type
+                )));
             };
 
             match response_result {
@@ -294,39 +373,56 @@ impl SyncManager {
                                     continue; // Повторяем запрос с новым токеном
                                 }
                                 Err(e) => {
-                                    let error_msg = format!("Token refresh failed: {}", e);
+                                    let err = SyncError::Auth(e.to_string());
                                     warn!(
                                         "[SYNC] Failed to refresh token for task {}: {}",
-                                        task_id, error_msg
+                                        task_id, err
                                     );
-                                    return Err(error_msg); // Возвращаем ошибку для сохранения в БД
+                                    return Err(err);
                                 }
                             }
                         } else {
-                            let error_msg =
-                                "Token expired (401) but no refresh token available".to_string();
-                            warn!("[SYNC] {} for task {}", error_msg, task_id);
-                            return Err(error_msg); // Возвращаем ошибку для сохранения в БД
+                            let err = SyncError::Auth(
+                                "Token expired (401) but no refresh token available".into(),
+                            );
+                            warn!("[SYNC] {} for task {}", err, task_id);
+                            return Err(err);
                         }
                     }
 
-                    // Возвращаем результат
                     let status_code = status.as_u16();
                     if status.is_success() {
                         return Ok(true);
-                    } else {
-                        // Сохраняем статус код в ошибке
-                        let error_msg = format!(
-                            "HTTP {}: {}",
-                            status_code,
-                            status.canonical_reason().unwrap_or("Unknown")
-                        );
-                        return Err(error_msg);
                     }
+                    let body = response.text().await.unwrap_or_default();
+                    // State-already-achieved: server says desired state is already there, drop task to stop retries
+                    if status_code == 400
+                        && (body.contains("Only running entries can be paused")
+                            || body.contains("Only paused entries can be resumed")
+                            || body.contains("Time entry is already stopped")
+                            || body.contains("User already has an active time entry"))
+                    {
+                        info!(
+                            "[SYNC] Task {} HTTP 400 state-already-achieved, dropping task",
+                            task_id
+                        );
+                        return Ok(true);
+                    }
+                    if status_code == 400 && !body.is_empty() {
+                        warn!("[SYNC] Task {} HTTP 400 response body: {}", task_id, body);
+                    }
+                    let message = if body.is_empty() {
+                        status.canonical_reason().unwrap_or("Unknown").into()
+                    } else {
+                        body
+                    };
+                    return Err(SyncError::Http {
+                        status: status_code,
+                        message,
+                    });
                 }
                 Err(e) => {
-                    // Ошибка сети - возвращаем ошибку для retry
-                    return Err(format!("Network error: {}", e));
+                    return Err(SyncError::Network(e.to_string()));
                 }
             }
         }
@@ -334,19 +430,18 @@ impl SyncManager {
 
     /// Внутренний метод синхронизации (single-flight)
     /// PRODUCTION: Все точки входа сходятся здесь
-    async fn run_sync_internal(&self, max_retries: i32) -> Result<usize, String> {
-        // PRODUCTION: Проверяем наличие токенов перед синхронизацией
-        // Если токенов нет, пропускаем синхронизацию (токены могут быть еще не установлены при старте)
-        if self.auth_manager.get_access_token().await.is_err() {
-            warn!("[SYNC] Skipping sync: access token not set. Tokens may not be restored yet.");
-            return Ok(0); // Возвращаем 0, не ошибку - это нормальная ситуация при старте
+    async fn run_sync_internal(&self, max_retries: i32) -> Result<usize, SyncError> {
+        if let Err(e) = self.auth_manager.get_access_token().await {
+            let msg = format!("[SYNC] Skipping sync (no token): {}", e);
+            warn!("{}", msg);
+            eprintln!("{}", msg);
+            return Ok(0);
         }
 
-        // Получаем количество pending задач для адаптивного batch
         let pending_count = self
             .db
             .get_pending_count_for_batch()
-            .map_err(|e| format!("Failed to get pending count: {}", e))?;
+            .map_err(|e| SyncError::Db(format!("get pending count: {}", e)))?;
 
         if pending_count == 0 {
             debug!("[SYNC] No pending tasks, skipping sync");
@@ -377,17 +472,15 @@ impl SyncManager {
             "[SYNC] Starting sync: {} pending tasks{}, batch size: {}",
             pending_count, stats_info, batch_size
         );
+        eprintln!("[SYNC] Starting sync: {} pending tasks", pending_count);
 
-        // Получаем задачи с приоритетами и exponential backoff
         let tasks = self
             .db
             .get_retry_tasks(max_retries, batch_size)
-            .map_err(|e| format!("Failed to get retry tasks: {}", e))?;
+            .map_err(|e| SyncError::Db(format!("get retry tasks: {}", e)))?;
 
         if tasks.is_empty() {
-            debug!(
-                "[SYNC] No tasks ready for retry (exponential backoff or all tasks processed), skipping batch"
-            );
+            eprintln!("[SYNC] No tasks ready for retry (backoff or empty), skipping");
             return Ok(0);
         }
 
@@ -484,17 +577,15 @@ impl SyncManager {
                                 new_retry_count,
                                 Some(&error_msg),
                             )
-                            .map_err(|e| format!("Failed to update status: {}", e))?;
+                            .map_err(|e| SyncError::Db(format!("update status: {}", e)))?;
                         warn!(
                             "[SYNC] Task {} failed after {} retries: {}",
                             id, new_retry_count, error_msg
                         );
                     } else {
-                        // Обновляем статус на pending с новым retry_count
-                        // next_retry_at будет вычислен при следующем get_retry_tasks
                         self.db
                             .update_sync_status(id, "pending", new_retry_count)
-                            .map_err(|e| format!("Failed to update status: {}", e))?;
+                            .map_err(|e| SyncError::Db(format!("update status: {}", e)))?;
                         info!(
                             "[SYNC] Task {} will retry later (attempt {})",
                             id, new_retry_count
@@ -502,11 +593,10 @@ impl SyncManager {
                     }
                 }
                 Err(e) => {
-                    // Ошибка сети или другая ошибка
                     failed_in_batch += 1;
                     *by_type_failed.entry(entity_type.clone()).or_insert(0) += 1;
                     let new_retry_count = retry_count + 1;
-                    let error_msg = format!("{}", e);
+                    let error_msg = e.to_string();
                     if new_retry_count >= max_retries {
                         self.db
                             .update_sync_status_with_error(
@@ -515,16 +605,15 @@ impl SyncManager {
                                 new_retry_count,
                                 Some(&error_msg),
                             )
-                            .map_err(|e| format!("Failed to update status: {}", e))?;
+                            .map_err(|err| SyncError::Db(format!("update status: {}", err)))?;
                         warn!(
                             "[SYNC] Task {} failed after {} retries: {}",
                             id, new_retry_count, error_msg
                         );
                     } else {
-                        // Обновляем статус на pending с новым retry_count
                         self.db
                             .update_sync_status(id, "pending", new_retry_count)
-                            .map_err(|e| format!("Failed to update status: {}", e))?;
+                            .map_err(|err| SyncError::Db(format!("update status: {}", err)))?;
                         info!(
                             "[SYNC] Task {} will retry later (attempt {}): {}",
                             id, new_retry_count, error_msg
@@ -564,6 +653,10 @@ impl SyncManager {
             }
             info!("[SYNC] Sync completed: {}", log_parts.join(", "));
         }
+        eprintln!(
+            "[SYNC] Sync completed: {} sent, {} failed",
+            synced_count, failed_in_batch
+        );
 
         Ok(synced_count)
     }
@@ -571,14 +664,14 @@ impl SyncManager {
     /// Синхронизировать очередь (обработать pending задачи)
     /// PRODUCTION: Single-flight через sync_lock с таймаутом
     pub async fn sync_queue(&self, max_retries: i32) -> Result<usize, String> {
-        // GUARD: Single-flight - только один sync может выполняться одновременно
-        // GUARD: Таймаут для lock (300 сек) - защита от зависания предыдущего sync
         match tokio::time::timeout(tokio::time::Duration::from_secs(300), self.sync_lock.lock())
             .await
         {
             Ok(lock) => {
                 let _lock = lock;
-                self.run_sync_internal(max_retries).await
+                self.run_sync_internal(max_retries)
+                    .await
+                    .map_err(|e| e.to_string())
             }
             Err(_) => {
                 error!("[SYNC] CRITICAL: Sync lock timeout (300s) - previous sync may be stuck");

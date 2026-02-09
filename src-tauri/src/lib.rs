@@ -16,7 +16,7 @@ pub use network::{extract_domain, extract_url_from_title};
 use commands::*;
 use crate::engine::{TimerEngine};
 use crate::sync::SyncManager;
-pub use crate::models::TaskPriority;
+pub use crate::sync::TaskPriority;
 use crate::monitor::ActivityMonitor;
 use std::sync::{Arc};
 
