@@ -4,11 +4,15 @@ use crate::models::{FailedTaskInfo, QueueStats};
 use crate::monitor::ActivityMonitor;
 use crate::sync::SyncManager;
 use crate::SyncStatusResponse;
-use crate::{check_online_status, extract_url_from_title};
+use crate::check_online_status;
+#[cfg(target_os = "macos")]
+use crate::extract_url_from_title;
 use std::sync::Arc;
 use std::time::Instant;
-use tauri::{AppHandle, State};
-use tracing::{info, warn};
+#[allow(unused_imports)] // Emitter used in #[cfg(not(target_os = "macos"))] activity branch
+use tauri::{AppHandle, Emitter, State};
+#[allow(unused_imports)]
+use tracing::{debug, info, warn};
 
 #[tauri::command]
 pub async fn start_activity_monitoring(
@@ -228,8 +232,20 @@ pub async fn upload_screenshot(
         sync_manager.enqueue_screenshot(png_data, time_entry_id, access_token, refresh_token)?;
     info!("[RUST] Screenshot enqueued with ID: {}", queue_id);
 
-    // Фоновая синхронизация уже запущена в setup, просто возвращаем успех
-    // Данные будут синхронизированы автоматически
+    // Сразу запускаем синхронизацию, чтобы скриншот ушёл на сервер (иначе GET /screenshots/time-entry/... будет пуст до следующего тика раз в 60 с)
+    match sync_manager.sync_queue(5).await {
+        Ok(count) => {
+            if count > 0 {
+                info!("[RUST] Sync after screenshot: {} task(s) sent", count);
+            }
+        }
+        Err(e) => {
+            warn!(
+                "[RUST] Sync after screenshot failed (screenshot stays in queue): {}",
+                e
+            );
+        }
+    }
     Ok(())
 }
 
@@ -506,21 +522,15 @@ pub async fn update_idle_state(
 ) -> Result<(), String> {
     use tauri::{Emitter, Manager};
 
-    println!(
-        "[RUST] update_idle_state called: idle_pause_start_time={:?}, is_loading={}",
+    debug!(
+        "update_idle_state: idle_pause_start_time={:?}, is_loading={}",
         idle_pause_start_time, is_loading
     );
 
     // Convert Option<u64> to number or null for JSON
     let pause_time_json = match idle_pause_start_time {
-        Some(t) => {
-            println!("[RUST] Converting pause time: {} (u64) to JSON number", t);
-            serde_json::Value::Number(serde_json::Number::from(t))
-        }
-        None => {
-            println!("[RUST] Pause time is None, using null");
-            serde_json::Value::Null
-        }
+        Some(t) => serde_json::Value::Number(serde_json::Number::from(t)),
+        None => serde_json::Value::Null,
     };
 
     let payload = serde_json::json!({
@@ -528,24 +538,11 @@ pub async fn update_idle_state(
         "isLoading": is_loading,
     });
 
-    println!(
-        "[RUST] Emitting idle-state-update with payload: {:?}",
-        payload
-    );
-
     // Emit to idle window if it exists
     if let Some(idle_window) = app.get_webview_window("idle") {
         idle_window
             .emit("idle-state-update", &payload)
-            .map_err(|e| {
-                let err_msg = format!("Failed to emit idle state update: {}", e);
-                println!("[RUST] Error: {}", err_msg);
-                err_msg
-            })?;
-        println!("[RUST] Event emitted to idle window successfully");
-    } else {
-        println!("[RUST] Idle window not found - window may not be ready yet");
-        // Don't fail - window might not be ready, state will be sent when window requests it
+            .map_err(|e| format!("Failed to emit idle state update: {}", e))?;
     }
 
     Ok(())
@@ -555,16 +552,12 @@ pub async fn update_idle_state(
 pub async fn request_idle_state(app: AppHandle) -> Result<(), String> {
     use tauri::{Emitter, Manager};
 
-    println!("[RUST] request_idle_state called - requesting state from main window");
+    debug!("request_idle_state: requesting state from main window");
 
-    // Emit a request event to main window to send current state
     if let Some(main_window) = app.get_webview_window("main") {
         main_window
             .emit("request-idle-state-for-idle-window", ())
             .map_err(|e| format!("Failed to emit request: {}", e))?;
-        println!("[RUST] Request event sent to main window");
-    } else {
-        println!("[RUST] Main window not found");
     }
 
     Ok(())
@@ -691,6 +684,19 @@ pub async fn set_auth_tokens(
     access_token: Option<String>,
     refresh_token: Option<String>,
 ) -> Result<(), String> {
+    let has_access = access_token
+        .as_ref()
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    let has_refresh = refresh_token
+        .as_ref()
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    info!(
+        "[AUTH] set_auth_tokens called: access_token present={}, refresh_token present={}",
+        has_access, has_refresh
+    );
+    eprintln!("[AUTH] set_auth_tokens: token present={}", has_access);
     sync_manager
         .auth_manager
         .set_tokens(access_token, refresh_token)
