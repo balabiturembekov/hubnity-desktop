@@ -18,7 +18,7 @@ use crate::engine::{TimerEngine};
 use crate::sync::SyncManager;
 pub use crate::sync::TaskPriority;
 use crate::monitor::ActivityMonitor;
-use std::sync::{Arc};
+use std::sync::Arc;
 
 #[cfg(test)]
 mod tests;

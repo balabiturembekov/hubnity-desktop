@@ -8,7 +8,39 @@ on:
     branches: [main, release]
 
 jobs:
+  create-release:
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    outputs:
+      release_id: ${{ steps.create_release.outputs.id }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "lts/*"
+          cache: "pnpm"
+      - run: pnpm install
+      - id: read_version
+        run: echo "version=$(node -p "require('./src-tauri/tauri.conf.json').version")" >> $GITHUB_OUTPUT
+      - id: create_release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: app-v${{ steps.read_version.outputs.version }}
+          name: Hubnity v${{ steps.read_version.outputs.version }}
+          body: See the assets to download this version and install.
+          draft: true
+          skip_duplicate: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   build:
+    needs: [create-release]
+    if: always() && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped')
     permissions:
       contents: write
     strategy:
@@ -67,6 +99,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
+          releaseId: ${{ needs.create-release.outputs.release_id }}
           tagName: ${{ github.event_name == 'push' && 'app-v__VERSION__' || '' }}
           releaseName: ${{ github.event_name == 'push' && 'Hubnity v__VERSION__' || '' }}
           releaseBody: ${{ github.event_name == 'push' && 'See the assets to download this version and install.' || '' }}

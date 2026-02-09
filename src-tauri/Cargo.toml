@@ -51,3 +51,7 @@ objc = "0.2"
 # Suppress warning from objc crate's internal cfg(cargo-clippy) usage
 unexpected_cfgs = "allow"
 
+[package.metadata.rust-analyzer]
+# Tauri sets cfg(desktop) at build time; rust-analyzer needs it for desktop-only code (updater, process)
+rustc-flags = ["--cfg", "desktop"]
+
