@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from 'react';
-import { api, Screenshot } from '../lib/api';
+import { useTrackerStore, type Screenshot } from '../store/useTrackerStore';
 import { Loader2, Eye, ChevronDown, ChevronUp, Camera } from 'lucide-react';
 import { Button } from './ui/button';
 import {
@@ -38,7 +38,8 @@ export function ScreenshotsView({ timeEntryId }: ScreenshotsViewProps) {
     setIsLoading(true);
     setError(null);
     try {
-      const data = await api.getScreenshots(timeEntryId);
+      const data = await useTrackerStore.getState().getScreenshots(timeEntryId);
+      console.log('[Screenshots] loadScreenshots', timeEntryId, '→', data.length, 'items', data);
       setScreenshots(data);
       // Автоматически разворачиваем, если есть скриншоты
       if (data.length > 0) {
@@ -52,12 +53,16 @@ export function ScreenshotsView({ timeEntryId }: ScreenshotsViewProps) {
     }
   }, [timeEntryId]);
 
-  const refreshScreenshots = useCallback(async () => {
+  const refreshScreenshots = useCallback(async (expandIfNew = false) => {
     if (!timeEntryId) return;
     setIsRefreshing(true);
     try {
-      const data = await api.getScreenshots(timeEntryId);
+      const data = await useTrackerStore.getState().getScreenshots(timeEntryId);
+      console.log('[Screenshots] refreshScreenshots', timeEntryId, '→', data.length, 'items');
       setScreenshots(data);
+      if (expandIfNew && data.length > 0) {
+        setIsExpanded(true);
+      }
     } catch (err: any) {
       logger.error('SCREENSHOTS_VIEW', 'Failed to refresh screenshots', err);
     } finally {
@@ -67,11 +72,16 @@ export function ScreenshotsView({ timeEntryId }: ScreenshotsViewProps) {
 
   useEffect(() => {
     if (!timeEntryId) return;
-    
+
     const handleScreenshotUploaded = () => {
-      setTimeout(() => {
-        refreshScreenshots();
-      }, 1000);
+      console.log('[Screenshots] screenshot:uploaded received, scheduling refetch');
+      // Сразу один запрос (если отправка была напрямую на сервер); затем — после sync (Rust кладёт в очередь).
+      const delays = [500, 2000, 5000, 12000];
+      delays.forEach((delayMs) => {
+        setTimeout(() => {
+          refreshScreenshots(true);
+        }, delayMs);
+      });
     };
 
     window.addEventListener('screenshot:uploaded', handleScreenshotUploaded);
@@ -142,6 +152,9 @@ export function ScreenshotsView({ timeEntryId }: ScreenshotsViewProps) {
         {/* Контент скриншотов - lazy render только при expanded */}
         {isExpanded && (
           <div className="mt-2 px-1 pb-2">
+            <p className="text-[10px] text-muted-foreground/60 font-mono mb-2 truncate" title={timeEntryId}>
+              timeEntryId: {timeEntryId}
+            </p>
             {isLoading ? (
               <div className="flex items-center justify-center py-6">
                 <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />

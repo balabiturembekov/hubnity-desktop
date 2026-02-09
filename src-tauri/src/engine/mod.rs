@@ -55,7 +55,7 @@ pub enum TimerStateForAPI {
 
 impl TimerEngine {
     /// Создать новый TimerEngine без БД (для тестов или fallback)
-    #[allow(dead_code)] // Может использоваться в тестах или как fallback
+    #[cfg(test)]
     pub fn new() -> Self {
         Self {
             state: Arc::new(Mutex::new(TimerState::Stopped)),

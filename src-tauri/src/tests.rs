@@ -3,7 +3,7 @@ use crate::database::*;
 use crate::engine::*;
 use crate::sync::*;
 use crate::*;
-use chrono::Utc;
+use chrono::{Local, Utc};
 use rusqlite::params;
 use std::time::Instant;
 #[cfg(test)]
@@ -742,31 +742,33 @@ mod tests {
 
         #[test]
         fn test_sleep_detection_threshold() {
-            // Тест обнаружения большого пропуска времени (sleep detection)
+            // Тест обнаружения сна: разрыв между wall-clock и monotonic (реальный сон)
             let engine = TimerEngine::new();
 
             engine.start().unwrap();
 
-            // Симулируем большой пропуск времени: устанавливаем started_at_instant в прошлое
+            // Симулируем сон: wall-clock ушёл на 25 мин вперёд, monotonic только на 5 мин (20 мин "сна")
             {
                 let mut state = engine.state.lock().unwrap();
-                if let TimerState::Running { started_at, .. } = &*state {
-                    let old_started_at = *started_at;
-                    // Устанавливаем started_at_instant на 20 минут назад (больше порога 15 минут)
-                    let old_instant = Instant::now() - Duration::from_secs(20 * 60);
+                if let TimerState::Running { started_at: _, .. } = &*state {
+                    let now_wall = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    let started_at_wall = now_wall.saturating_sub(25 * 60); // 25 мин назад по wall
+                    let started_at_instant = Instant::now() - Duration::from_secs(5 * 60); // 5 мин по monotonic
                     *state = TimerState::Running {
-                        started_at: old_started_at,
-                        started_at_instant: old_instant,
+                        started_at: started_at_wall,
+                        started_at_instant,
                     };
                 }
             }
 
-            // get_state должен обнаружить sleep, но НЕ ставить на паузу автоматически
+            // get_state обнаруживает sleep (gap >= 5 мин) и вызывает handle_system_sleep → Paused
             let state = engine.get_state().unwrap();
-            // Таймер должен остаться в состоянии RUNNING (sleep detection только логирует)
             assert!(matches!(
                 state.state,
-                engine::TimerStateForAPI::Running { .. }
+                engine::TimerStateForAPI::Paused { .. }
             ));
         }
 
@@ -816,36 +818,36 @@ mod tests {
 
         #[test]
         fn test_timezone_utc_fix() {
-            // Тест, что day rollover использует UTC для сравнения дат
+            // Тест, что day rollover использует локальную полуночь для сравнения дат
             let engine = TimerEngine::new();
 
             engine.start().unwrap();
 
-            // Симулируем смену дня: устанавливаем day_start_timestamp на вчера (в UTC)
-            let yesterday_utc = Utc::now().date_naive() - chrono::Duration::days(1);
-            let yesterday_start_utc = yesterday_utc
+            // Симулируем смену дня: day_start_timestamp = вчера по местному времени
+            let yesterday_local = Local::now().date_naive() - chrono::Duration::days(1);
+            let yesterday_start = yesterday_local
                 .and_hms_opt(0, 0, 0)
-                .and_then(|dt| dt.and_local_timezone(Utc).earliest())
+                .and_then(|ndt| ndt.and_local_timezone(Local).earliest())
                 .unwrap()
                 .timestamp() as u64;
 
             {
                 let mut day_start = engine.day_start_timestamp.lock().unwrap();
-                *day_start = Some(yesterday_start_utc);
+                *day_start = Some(yesterday_start);
             }
 
-            // Вызываем ensure_correct_day() - должен произойти rollover
             engine.ensure_correct_day().unwrap();
 
-            // Проверяем, что день обновлен на сегодня (UTC)
-            let today_utc = Utc::now().date_naive();
+            // День обновлён на сегодня (локальная дата)
+            let today_local = Local::now().date_naive();
             let day_start = *engine.day_start_timestamp.lock().unwrap();
             assert!(day_start.is_some());
             let day_start_date =
                 chrono::DateTime::<Utc>::from_timestamp(day_start.unwrap() as i64, 0)
                     .unwrap()
+                    .with_timezone(&Local)
                     .date_naive();
-            assert_eq!(day_start_date, today_utc);
+            assert_eq!(day_start_date, today_local);
         }
 
         #[test]
@@ -853,11 +855,11 @@ mod tests {
             // Тест идемпотентности rollover при множественных вызовах
             let engine = TimerEngine::new();
 
-            // Симулируем смену дня
-            let yesterday = Utc::now().date_naive() - chrono::Duration::days(1);
+            // Симулируем смену дня (вчера по местному времени)
+            let yesterday = Local::now().date_naive() - chrono::Duration::days(1);
             let yesterday_start = yesterday
                 .and_hms_opt(0, 0, 0)
-                .and_then(|dt| dt.and_local_timezone(Utc).earliest())
+                .and_then(|ndt| ndt.and_local_timezone(Local).earliest())
                 .unwrap()
                 .timestamp() as u64;
 
@@ -882,28 +884,29 @@ mod tests {
             let state = engine.get_state().unwrap();
             assert_eq!(state.accumulated_seconds, accumulated_after_first);
 
-            // Проверяем, что день обновлен на сегодня
-            let today_utc = Utc::now().date_naive();
+            // Проверяем, что день обновлен на сегодня (локальная дата)
+            let today_local = Local::now().date_naive();
             let day_start = *engine.day_start_timestamp.lock().unwrap();
             assert!(day_start.is_some());
             let day_start_date =
                 chrono::DateTime::<Utc>::from_timestamp(day_start.unwrap() as i64, 0)
                     .unwrap()
+                    .with_timezone(&Local)
                     .date_naive();
-            assert_eq!(day_start_date, today_utc);
+            assert_eq!(day_start_date, today_local);
         }
 
         #[test]
         fn test_ensure_correct_day_called_in_all_methods() {
             // Тест, что ensure_correct_day() вызывается во всех публичных методах
             let engine = TimerEngine::new();
-            let today_utc = Utc::now().date_naive();
+            let today_local = Local::now().date_naive();
 
-            // Симулируем смену дня
-            let yesterday = today_utc - chrono::Duration::days(1);
+            // Симулируем смену дня (вчера по местному времени)
+            let yesterday = today_local - chrono::Duration::days(1);
             let yesterday_start = yesterday
                 .and_hms_opt(0, 0, 0)
-                .and_then(|dt| dt.and_local_timezone(Utc).earliest())
+                .and_then(|ndt| ndt.and_local_timezone(Local).earliest())
                 .unwrap()
                 .timestamp() as u64;
 
@@ -913,14 +916,15 @@ mod tests {
                 *day_start = Some(yesterday_start);
             }
             engine.start().unwrap();
-            // После start() день должен быть обновлен на сегодня
+            // После start() день должен быть обновлен на сегодня (локальная дата)
             let day_start = *engine.day_start_timestamp.lock().unwrap();
             assert!(day_start.is_some());
             let day_start_date =
                 chrono::DateTime::<Utc>::from_timestamp(day_start.unwrap() as i64, 0)
                     .unwrap()
+                    .with_timezone(&Local)
                     .date_naive();
-            assert_eq!(day_start_date, today_utc);
+            assert_eq!(day_start_date, today_local);
 
             // pause() должен вызвать ensure_correct_day()
             // Но сначала нужно убедиться, что таймер все еще запущен после rollover
@@ -939,8 +943,9 @@ mod tests {
             let day_start_date =
                 chrono::DateTime::<Utc>::from_timestamp(day_start.unwrap() as i64, 0)
                     .unwrap()
+                    .with_timezone(&Local)
                     .date_naive();
-            assert_eq!(day_start_date, today_utc);
+            assert_eq!(day_start_date, today_local);
 
             // resume() должен вызвать ensure_correct_day()
             {
@@ -952,8 +957,9 @@ mod tests {
             let day_start_date =
                 chrono::DateTime::<Utc>::from_timestamp(day_start.unwrap() as i64, 0)
                     .unwrap()
+                    .with_timezone(&Local)
                     .date_naive();
-            assert_eq!(day_start_date, today_utc);
+            assert_eq!(day_start_date, today_local);
 
             // stop() должен вызвать ensure_correct_day()
             // Но сначала нужно убедиться, что таймер запущен (не остановлен rollover'ом)
@@ -972,8 +978,9 @@ mod tests {
             let day_start_date =
                 chrono::DateTime::<Utc>::from_timestamp(day_start.unwrap() as i64, 0)
                     .unwrap()
+                    .with_timezone(&Local)
                     .date_naive();
-            assert_eq!(day_start_date, today_utc);
+            assert_eq!(day_start_date, today_local);
 
             // get_state() должен вызвать ensure_correct_day()
             {
@@ -985,8 +992,9 @@ mod tests {
             let day_start_date =
                 chrono::DateTime::<Utc>::from_timestamp(day_start.unwrap() as i64, 0)
                     .unwrap()
+                    .with_timezone(&Local)
                     .date_naive();
-            assert_eq!(day_start_date, today_utc);
+            assert_eq!(day_start_date, today_local);
         }
     }
 
@@ -1699,7 +1707,7 @@ mod tests {
 
             assert!(result.is_err(), "Should return error for invalid payload");
             assert!(
-                result.unwrap_err().contains("Failed to parse payload"),
+                result.unwrap_err().to_string().contains("Parse payload"),
                 "Error should mention payload parsing"
             );
         }
@@ -1722,9 +1730,13 @@ mod tests {
                 result.is_err(),
                 "Should return error when access token not set in AuthManager"
             );
+            let err = result.unwrap_err().to_string();
             assert!(
-                result.unwrap_err().contains("Failed to get access token"),
-                "Error should mention missing access token in AuthManager"
+                err.contains("Token not set")
+                    || err.contains("Auth")
+                    || err.contains("set_auth_tokens"),
+                "Error should mention missing access token in AuthManager. Got: {}",
+                err
             );
         }
 
@@ -1745,7 +1757,10 @@ mod tests {
 
             assert!(result.is_err(), "Should return error for unknown operation");
             assert!(
-                result.unwrap_err().contains("Unknown time entry operation"),
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Unknown time entry operation"),
                 "Error should mention unknown operation"
             );
         }
@@ -1767,7 +1782,7 @@ mod tests {
 
             assert!(result.is_err(), "Should return error for missing id");
             assert!(
-                result.unwrap_err().contains("Missing id"),
+                result.unwrap_err().to_string().contains("Missing id"),
                 "Error should mention missing id"
             );
         }
@@ -1790,7 +1805,10 @@ mod tests {
 
             assert!(result.is_err(), "Should return error for missing imageData");
             assert!(
-                result.unwrap_err().contains("Missing imageData"),
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Missing imageData"),
                 "Error should mention missing imageData"
             );
         }
@@ -1813,7 +1831,10 @@ mod tests {
                 "Should return error for unknown entity type"
             );
             assert!(
-                result.unwrap_err().contains("Unknown entity type"),
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Unknown entity type"),
                 "Error should mention unknown entity type"
             );
         }
@@ -1972,9 +1993,11 @@ mod tests {
                 result.is_err(),
                 "Should return error when token not set in AuthManager"
             );
-            let error_msg = result.unwrap_err();
+            let error_msg = result.unwrap_err().to_string();
             assert!(
-                error_msg.contains("Failed to get access token"),
+                error_msg.contains("Token not set")
+                    || error_msg.contains("Auth")
+                    || error_msg.contains("set_auth_tokens"),
                 "Error should mention missing token in AuthManager. Got: {}",
                 error_msg
             );
@@ -1995,11 +2018,10 @@ mod tests {
                 .sync_task(1, "time_entry_resume".to_string(), payload_str, None)
                 .await;
 
-            // Может быть ошибка сети (ожидаема), но не ошибка парсинга или валидации
             if let Err(e) = result {
-                // Ошибка должна быть сетевой, а не связанной с валидацией
+                let s = e.to_string();
                 assert!(
-                    !e.contains("Missing id") && !e.contains("Unknown operation"),
+                    !s.contains("Missing id") && !s.contains("Unknown operation"),
                     "Should not have validation errors for resume operation"
                 );
             }
@@ -2020,11 +2042,10 @@ mod tests {
                 .sync_task(1, "time_entry_stop".to_string(), payload_str, None)
                 .await;
 
-            // Может быть ошибка сети (ожидаема), но не ошибка парсинга или валидации
             if let Err(e) = result {
-                // Ошибка должна быть сетевой, а не связанной с валидацией
+                let s = e.to_string();
                 assert!(
-                    !e.contains("Missing id") && !e.contains("Unknown operation"),
+                    !s.contains("Missing id") && !s.contains("Unknown operation"),
                     "Should not have validation errors for stop operation"
                 );
             }

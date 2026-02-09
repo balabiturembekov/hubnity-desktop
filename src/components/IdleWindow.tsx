@@ -95,8 +95,7 @@ export function IdleWindow() {
         
         logger.debug('IDLE_WINDOW', 'State listener set up successfully');
         
-        // Request current state from main window immediately and then with delays
-        // Multiple attempts to ensure we get the state even if window opens before main window is ready
+        // Запрашиваем состояние у главного окна: несколько раз при открытии, затем редко
         const requestState = async () => {
           try {
             await invoke('request_idle_state');
@@ -104,43 +103,11 @@ export function IdleWindow() {
             logger.error('IDLE_WINDOW', 'Failed to request state', error);
           }
         };
-        
-        // Request immediately
         requestState();
-        
-        // Request after short delay (React might not be ready)
-        setTimeout(requestState, 100);
-        
-        // Request after medium delay (main window might not be ready)
         setTimeout(requestState, 500);
-        
-        // Request after longer delay (ensure main window is ready)
-        setTimeout(requestState, 1000);
-        
-        // Request after even longer delay (fallback)
-        setTimeout(requestState, 2000);
-        
-        // Also poll state periodically as fallback (every 2 seconds initially, then every 10 seconds)
-        let pollCount = 0;
-        pollInterval = setInterval(async () => {
-          pollCount++;
-          try {
-            await invoke('request_idle_state');
-            // After 5 polls (10 seconds), reduce frequency to every 10 seconds
-            if (pollCount >= 5) {
-              clearInterval(pollInterval!);
-              pollInterval = setInterval(async () => {
-                try {
-                  await invoke('request_idle_state');
-                } catch (error) {
-                  // Ignore errors
-                }
-              }, 10000);
-            }
-          } catch (error) {
-            // Ignore errors
-          }
-        }, 2000); // Poll every 2 seconds initially
+        setTimeout(requestState, 1500);
+        // Дальше — раз в 10 с, без спама
+        pollInterval = setInterval(requestState, 10000);
       } catch (error) {
         logger.error('IDLE_WINDOW', 'Failed to setup listener', error);
       }

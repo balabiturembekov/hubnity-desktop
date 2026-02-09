@@ -7,6 +7,7 @@ import { Button } from './ui/button';
 import { LogOut, Check, RefreshCw, Database } from 'lucide-react';
 import { useAuthStore } from '../store/useAuthStore';
 import { logger } from '../lib/logger';
+import { api } from '../lib/api';
 import { invoke } from '@tauri-apps/api/core';
 
 interface QueueStats {
@@ -30,10 +31,33 @@ export function Settings() {
     setThreshold(idleThreshold);
   }, [idleThreshold]);
 
-  // Load sync queue stats
-  const loadQueueStats = async () => {
+  // Загрузить статистику очереди; при нажатии «Обновить» — восстановить токены и запустить синхронизацию
+  const loadQueueStats = async (runSync = false) => {
     setIsLoadingStats(true);
     try {
+      // Токен: сначала из API (in-memory), потом из localStorage — иначе Rust sync не видит токен
+      const accessToken = api.getAccessToken() || localStorage.getItem('access_token');
+      const refreshToken = localStorage.getItem('refresh_token');
+      if (accessToken) {
+        const user = useAuthStore.getState().user;
+        await invoke('set_auth_tokens', {
+          accessToken,
+          refreshToken,
+          userId: user ? String(user.id) : null,
+        });
+      } else {
+        logger.warn('SETTINGS', 'No access_token in api or localStorage — sync will skip until you log in again');
+      }
+      if (runSync) {
+        try {
+          const synced = await invoke<number>('sync_queue_now');
+          if (synced > 0) {
+            logger.info('SETTINGS', `Synced ${synced} task(s)`);
+          }
+        } catch (e) {
+          logger.warn('SETTINGS', 'sync_queue_now failed', e);
+        }
+      }
       const stats = await invoke<QueueStats>('get_sync_queue_stats');
       setQueueStats(stats);
     } catch (error) {
@@ -162,9 +186,12 @@ export function Settings() {
               </div>
             </div>
           )}
-          <Button 
-            onClick={logout} 
-            variant="destructive" 
+          <Button
+            onClick={async () => {
+              await logout();
+              await useTrackerStore.getState().reset();
+            }}
+            variant="destructive"
             className="gap-2 w-full h-9 mt-2"
           >
             <LogOut className="h-3.5 w-3.5" />
@@ -181,7 +208,7 @@ export function Settings() {
               Синхронизация
             </CardTitle>
             <Button
-              onClick={loadQueueStats}
+              onClick={() => loadQueueStats(true)}
               disabled={isLoadingStats}
               size="sm"
               variant="ghost"
@@ -219,6 +246,16 @@ export function Settings() {
                       </div>
                     ))}
                   </div>
+                </div>
+              )}
+              {queueStats.pending_count > 0 && queueStats.sent_count === 0 && (
+                <div className="pt-2 border-t space-y-1">
+                  <p className="text-xs font-medium text-amber-600 dark:text-amber-500">
+                    Для синхронизации нужен вход в аккаунт.
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    Если в логах «access_token present=false» — выйдите из аккаунта и войдите снова (вкладка «Трекер» → выход, затем логин). После входа счётчик начнёт расти.
+                  </p>
                 </div>
               )}
             </div>

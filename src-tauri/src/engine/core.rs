@@ -1,15 +1,13 @@
 use crate::engine::TimerEngine;
 use crate::engine::TimerState;
 use crate::engine::{TimerStateForAPI, TimerStateResponse};
-use chrono::Utc;
-use std::time::Instant;
+use chrono::{Local, Utc};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
 
 impl TimerEngine {
-    /// Обработка системного sleep
+    /// Обработка системного sleep (вызывается при обнаружении большого пропуска времени в get_state)
     /// Если RUNNING → pause и сохранить состояние
-    /// Примечание: Метод может использоваться в будущем для прямых системных событий sleep/wake
-    #[allow(dead_code)]
     fn handle_system_sleep(&self) -> Result<(), String> {
         let state = self
             .state
@@ -37,10 +35,8 @@ impl TimerEngine {
         }
     }
 
-    /// Обработка системного wake
+    /// Обработка системного wake (вызывается из setup_sleep_wake_handlers при старте приложения)
     /// НЕ возобновляем автоматически - оставляем PAUSED
-    /// Идемпотентно: повторные вызовы не меняют состояние
-    #[allow(dead_code)] // Используется в sleep/wake handling (может вызываться через системные события)
     pub fn handle_system_wake(&self) -> Result<(), String> {
         eprintln!("[WAKE] System wake detected");
 
@@ -410,12 +406,19 @@ impl TimerEngine {
                 let now = Instant::now();
                 let session_elapsed = now.duration_since(*started_at_instant).as_secs();
 
-                // Проверка на sleep: если пропуск > 15 минут, это вероятно sleep
-                // FIX: Увеличен порог с 5 до 15 минут, чтобы избежать ложных срабатываний
-                const SLEEP_DETECTION_THRESHOLD_SECONDS: u64 = 15 * 60; // 15 минут
-                let is_sleep = session_elapsed > SLEEP_DETECTION_THRESHOLD_SECONDS;
+                // Sleep detection: реальный сон = разрыв между wall-clock и monotonic.
+                // При сне системы monotonic почти не растёт, wall-clock прыгает вперёд.
+                // Раньше ошибочно паузили при session_elapsed > 15 мин (просто долгая сессия).
+                let now_wall = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let wall_elapsed = now_wall.saturating_sub(*started_at);
+                const SLEEP_GAP_THRESHOLD_SECONDS: u64 = 5 * 60; // 5 минут разрыва = сон
+                let is_sleep = wall_elapsed > session_elapsed
+                    && (wall_elapsed - session_elapsed) >= SLEEP_GAP_THRESHOLD_SECONDS;
 
-                // FIX: Защита от переполнения при вычислении elapsed_seconds
+                // Защита от переполнения при вычислении elapsed_seconds
                 let elapsed = accumulated.saturating_add(session_elapsed);
                 (elapsed, Some(*started_at), is_sleep)
             }
@@ -425,24 +428,13 @@ impl TimerEngine {
             }
         };
 
-        // Если обнаружен sleep, логируем предупреждение (но НЕ ставим на паузу автоматически)
+        // Если обнаружен sleep (большой пропуск времени), вызываем handle_system_sleep для паузы
         if needs_sleep_handling {
-            // Получаем session_elapsed перед drop(state)
-            let session_elapsed = match &*state {
-                TimerState::Running {
-                    started_at_instant, ..
-                } => Instant::now().duration_since(*started_at_instant).as_secs(),
-                _ => 0,
-            };
-            warn!(
-                "[SLEEP_DETECTION] Large time gap detected ({}s), but NOT auto-pausing to prevent false positives (depth: {})",
-                session_elapsed, depth
-            );
-            // FIX: НЕ ставим на паузу автоматически - это может быть просто долгая работа без активности
-            // Пользователь может поставить на паузу вручную, если нужно
-            // Только логируем предупреждение для диагностики
-            // Автоматическая пауза отключена, чтобы избежать ложных срабатываний
-            // Продолжаем выполнение без изменения состояния
+            drop(state);
+            if let Err(e) = self.handle_system_sleep() {
+                warn!("[SLEEP_DETECTION] handle_system_sleep failed: {}", e);
+            }
+            return self.get_state_internal(depth + 1);
         }
 
         // Создаем упрощенную версию state для API (без Instant)
@@ -465,22 +457,21 @@ impl TimerEngine {
 
     /// Проверить и обработать смену календарного дня
     /// Вызывается в начале всех публичных методов для автоматического rollover
-    /// GUARD: Использует UTC для определения дня (не зависит от timezone)
+    /// Rollover срабатывает в локальную полуночь (00:00 по местному времени).
     pub fn ensure_correct_day(&self) -> Result<(), String> {
         let day_start = *self
             .day_start_timestamp
             .lock()
             .map_err(|e| format!("Mutex poisoned: {}", e))?;
 
-        // FIX: Используем UTC для определения дня (не зависит от timezone)
-        let today_utc = Utc::now().date_naive();
+        // Локальная дата «сегодня» — rollover в 00:00 по местному времени
+        let today_local = Local::now().date_naive();
 
         // Если day_start не установлен, устанавливаем текущий день
-        let saved_day_utc = if let Some(day_start_ts) = day_start {
-            // FIX: Конвертируем timestamp в UTC дату (не Local!)
-            let dt = chrono::DateTime::<Utc>::from_timestamp(day_start_ts as i64, 0)
+        let saved_day_local = if let Some(day_start_ts) = day_start {
+            let utc_dt = chrono::DateTime::<Utc>::from_timestamp(day_start_ts as i64, 0)
                 .ok_or_else(|| "Invalid day_start timestamp".to_string())?;
-            dt.date_naive()
+            utc_dt.with_timezone(&Local).date_naive()
         } else {
             // Если day_start не установлен, устанавливаем текущий день
             let now_timestamp = std::time::SystemTime::now()
@@ -496,30 +487,30 @@ impl TimerEngine {
         };
 
         // Если день не изменился, ничего не делаем
-        if saved_day_utc == today_utc {
+        if saved_day_local == today_local {
             return Ok(());
         }
 
         // GUARD: Проверка на разумность смены дня (не более 1 дня назад/вперед)
-        let days_diff = (today_utc - saved_day_utc).num_days().abs();
+        let days_diff = (today_local - saved_day_local).num_days().abs();
         if days_diff > 1 {
             warn!(
                 "[DAY_ROLLOVER] Suspicious day change: {} → {} ({} days). \
                 Possible timezone change or system clock manipulation.",
-                saved_day_utc.format("%Y-%m-%d"),
-                today_utc.format("%Y-%m-%d"),
+                saved_day_local.format("%Y-%m-%d"),
+                today_local.format("%Y-%m-%d"),
                 days_diff
             );
             // Все равно выполняем rollover, но логируем предупреждение
         }
 
-        // День изменился - выполняем rollover
+        // День изменился (локальная полуночь) — выполняем rollover
         info!(
-            "[DAY_ROLLOVER] Day changed: {} → {}",
-            saved_day_utc.format("%Y-%m-%d"),
-            today_utc.format("%Y-%m-%d")
+            "[DAY_ROLLOVER] Day changed: {} → {} (local midnight)",
+            saved_day_local.format("%Y-%m-%d"),
+            today_local.format("%Y-%m-%d")
         );
-        self.rollover_day(saved_day_utc, today_utc)
+        self.rollover_day(saved_day_local, today_local)
     }
 
     /// Обработать смену дня (rollover)
@@ -546,11 +537,10 @@ impl TimerEngine {
 
         // Если таймер был RUNNING, нужно корректно зафиксировать время до полуночи
         if was_running {
-            // Получаем timestamp полуночи старого дня (00:00:00 следующего дня = конец старого дня)
-            // FIX: Используем UTC вместо Local
+            // Получаем timestamp полуночи (локальная 00:00 нового дня = конец старого дня)
             let old_day_end = new_day
                 .and_hms_opt(0, 0, 0)
-                .and_then(|dt| dt.and_local_timezone(Utc).earliest())
+                .and_then(|ndt| ndt.and_local_timezone(Local).earliest())
                 .ok_or_else(|| "Failed to create old day end timestamp".to_string())?
                 .timestamp() as u64;
 
@@ -660,11 +650,19 @@ impl TimerEngine {
                 .map_err(|e| format!("Mutex poisoned: {}", e))?;
             *state = TimerState::Stopped;
             drop(state);
+
+            // CRITICAL: Сохраняем состояние старого дня (accumulated = итог за старый день) ДО обнуления.
+            // Иначе при следующем save_state() сохранится уже 0 и итог за старый день будет потерян.
+            if let Err(e) = self.save_state() {
+                warn!(
+                    "[DAY_ROLLOVER] Failed to save old day state before zeroing: {}",
+                    e
+                );
+            }
         }
 
         // Обнуляем accumulated_seconds для нового дня
-        // ВАЖНО: Это делается ПОСЛЕ обработки RUNNING состояния
-        // Время за старый день уже зафиксировано выше (если был RUNNING)
+        // ВАЖНО: Это делается ПОСЛЕ обработки RUNNING состояния и сохранения старого дня
         let mut accumulated = self
             .accumulated_seconds
             .lock()
@@ -672,11 +670,10 @@ impl TimerEngine {
         *accumulated = 0;
         drop(accumulated);
 
-        // Обновляем day_start_timestamp на новый день (полночь нового дня в UTC)
-        // FIX: Используем UTC вместо Local для независимости от timezone
+        // Обновляем day_start_timestamp на новый день (локальная полночь)
         let new_day_start = new_day
             .and_hms_opt(0, 0, 0)
-            .and_then(|dt| dt.and_local_timezone(Utc).earliest())
+            .and_then(|ndt| ndt.and_local_timezone(Local).earliest())
             .ok_or_else(|| "Failed to create new day start timestamp".to_string())?
             .timestamp() as u64;
 

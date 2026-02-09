@@ -1,0 +1,47 @@
+---
+description: Строгое соблюдение Clean Architecture (слои и правило зависимостей)
+alwaysApply: true
+---
+
+# Clean Architecture — обязательно
+
+## Правило зависимостей
+
+Зависимости направлены **только внутрь**. Внутренние слои не знают о внешних (нет импортов из UI, HTTP, Tauri, БД в домене).
+
+---
+
+## Frontend (src/)
+
+| Слой | Папка/файлы | Может зависеть от |
+|------|-------------|-------------------|
+| **Frameworks & UI** | `components/`, `App.tsx`, `main.tsx` | store, lib/utils, lib/logger |
+| **Interface Adapters** | `store/*.ts`, `lib/timer-engine.ts` (обёртка invoke) | `lib/api.ts`, invoke, типы из api |
+| **Adapters (внешний мир)** | `lib/api.ts` | axios, типы запросов/ответов |
+
+- **Компоненты** не импортируют `lib/api.ts` или вызывают `invoke` напрямую для бизнес-потоков — только через store (или явно выделенные хуки/сервисы приложения).
+- **Store** — оркестратор: вызывает api и Tauri (timer-engine), хранит состояние. В store не зашивать детали реализации HTTP (axios) или Tauri, только вызовы абстракций (api, TimerEngineAPI).
+- **Новый код**: если добавляется сценарий — слой приложения (store/use case) вызывается из UI; UI не обращается к api/invoke сам.
+
+---
+
+## Backend (src-tauri/src/)
+
+| Слой | Модуль | Может зависеть от |
+|------|--------|-------------------|
+| **Entities / Domain** | `engine/core.rs`, доменные типы в `engine/` | только std, serde, chrono — без tauri, reqwest, rusqlite |
+| **Use Cases** | `engine/mod.rs`, `sync/mod.rs` (оркестрация) | engine, models, абстракции БД/сети (traits), не commands |
+| **Interface Adapters** | `commands.rs`, `auth.rs` | engine, sync, database, models; вызывают use cases |
+| **Frameworks & Drivers** | `lib.rs`, `main.rs`, `database.rs`, HTTP в sync | Tauri, rusqlite, reqwest |
+
+- **engine/** не импортирует `commands`, `sync` (как модули), не использует `tauri::`, `reqwest::`, `rusqlite::` — только доменная логика и абстракции (traits для персистенции/сети, если есть).
+- **commands.rs** — точка входа Tauri: только вызывает engine/sync/database, маппит в/из API; не содержит бизнес-правил.
+- **sync/** — use case «синхронизация»: может зависеть от engine, database, auth; сетевая отправка — через абстракцию или выделенный модуль-адаптер, не наоборот (engine не зависит от sync).
+- **database.rs** — адаптер персистенции; его вызывают commands/sync/engine, не наоборот.
+
+---
+
+## Проверка при изменениях
+
+- Добавляя импорт: внутренний слой не должен импортировать внешний.
+- Добавляя фичу: определить слой (entity / use case / adapter / UI) и проводить зависимость только внутрь.

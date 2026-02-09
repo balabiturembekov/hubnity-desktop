@@ -221,8 +221,8 @@ class ApiClient {
             // PRODUCTION: Обновляем токены в Rust AuthManager после refresh
             const { invoke } = await import('@tauri-apps/api/core');
             await invoke('set_auth_tokens', {
-              access_token: access_token,
-              refresh_token: newRefreshToken || localStorage.getItem('refresh_token'),
+              accessToken: access_token,
+              refreshToken: newRefreshToken || localStorage.getItem('refresh_token'),
             }).catch((e) => {
               logger.error('API', 'Failed to update tokens in Rust AuthManager after refresh', e);
               // Не блокируем refresh, но логируем ошибку
@@ -289,6 +289,15 @@ class ApiClient {
     const response = await this.client.post<LoginResponse>('/auth/login', credentials);
     // FIX: Не сохраняем токены здесь - они будут сохранены в useAuthStore.login()
     // после успешного обновления состояния, чтобы избежать рассинхронизации
+    return response.data;
+  }
+
+  /** POST /auth/logout — отзывает refresh токен(ы). Authorization: Bearer <access_token>. Body: { refreshToken } — отзывает только его; без body — все токены пользователя. */
+  async logout(refreshToken?: string | null): Promise<{ message: string }> {
+    const response = await this.client.post<{ message: string }>(
+      '/auth/logout',
+      refreshToken != null ? { refreshToken } : {}
+    );
     return response.data;
   }
 

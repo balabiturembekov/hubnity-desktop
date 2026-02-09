@@ -1,10 +1,9 @@
 import { useEffect, useState } from 'react';
 import { Button } from './ui/button';
-import { useTrackerStore } from '../store/useTrackerStore';
+import { useTrackerStore, type TimerStateResponse } from '../store/useTrackerStore';
 import { Play, Pause, Square, RotateCcw, Camera } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { ScreenshotsView } from './ScreenshotsView';
-import { TimerEngineAPI, TimerStateResponse } from '../lib/timer-engine';
 import { logger } from '../lib/logger';
 import { cn } from '../lib/utils';
 
@@ -38,7 +37,7 @@ export function Timer() {
   useEffect(() => {
     const updateTimerState = async () => {
       try {
-        const state = await TimerEngineAPI.getState();
+        const state = await useTrackerStore.getState().getTimerState();
         setTimerState(state);
         
         const isRunning = state.state === 'RUNNING';
@@ -91,8 +90,7 @@ export function Timer() {
       
       if (isDifferentDay) {
         try {
-          await TimerEngineAPI.resetDay();
-          const newState = await TimerEngineAPI.getState();
+          const newState = await useTrackerStore.getState().resetDay();
           setTimerState(newState);
         } catch (error) {
           logger.error('TIMER', 'Failed to reset day', error);

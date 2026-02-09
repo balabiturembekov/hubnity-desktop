@@ -12,40 +12,59 @@ import { render, screen, waitFor, act } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { Timer } from '../Timer';
 
-// Mock stores and APIs
-const mockStartTracking = vi.fn();
-const mockStopTracking = vi.fn();
-const mockPauseTracking = vi.fn();
-const mockResumeTracking = vi.fn();
-const mockGetState = vi.fn();
-const mockSetState = vi.fn();
+// Hoist mocks so they exist when vi.mock factories run
+const hoisted = vi.hoisted(() => {
+  const defaultTimerState = {
+    state: 'STOPPED' as const,
+    elapsed_seconds: 0,
+    accumulated_seconds: 0,
+    session_start: null,
+    day_start: Math.floor(Date.now() / 1000),
+  };
+  const defaultProject = { id: '1', name: 'Test Project', color: '#000000', description: '', clientName: '', budget: 0, status: 'ACTIVE' as const, companyId: '', createdAt: '', updatedAt: '' };
+  return {
+    mockStartTracking: vi.fn(),
+    mockStopTracking: vi.fn(),
+    mockPauseTracking: vi.fn(),
+    mockResumeTracking: vi.fn(),
+    mockGetState: vi.fn(),
+    mockSetState: vi.fn(),
+    mockInvoke: vi.fn(),
+    defaultTimerState,
+    defaultProject,
+    getTimerStateImpl: { current: () => Promise.resolve(defaultTimerState) as Promise<typeof defaultTimerState> },
+  };
+});
 
-// Mock Zustand store
-vi.mock('../../store/useTrackerStore', () => ({
-  useTrackerStore: vi.fn((selector: any) => {
-    const state = {
-      selectedProject: null,
-      isTracking: false,
-      isPaused: false,
-      currentTimeEntry: null,
-      isLoading: false,
-      error: null,
-      isTakingScreenshot: false,
-      idlePauseStartTime: null,
-      startTracking: mockStartTracking,
-      stopTracking: mockStopTracking,
-      pauseTracking: mockPauseTracking,
-      resumeTracking: mockResumeTracking,
-      getState: () => state,
-      setState: mockSetState,
-    };
-    return selector ? selector(state) : state;
-  }),
-}));
+vi.mock('../../store/useTrackerStore', () => {
+  const state = {
+    selectedProject: hoisted.defaultProject,
+    isTracking: false,
+    isPaused: false,
+    currentTimeEntry: null,
+    isLoading: false,
+    error: null,
+    isTakingScreenshot: false,
+    idlePauseStartTime: null,
+    startTracking: hoisted.mockStartTracking,
+    stopTracking: hoisted.mockStopTracking,
+    pauseTracking: hoisted.mockPauseTracking,
+    resumeTracking: hoisted.mockResumeTracking,
+    getTimerState: () => hoisted.getTimerStateImpl.current(),
+    resetDay: () => hoisted.getTimerStateImpl.current(),
+    setState: hoisted.mockSetState,
+  };
+  return {
+    useTrackerStore: Object.assign(
+      vi.fn((selector: any) => (selector ? selector(state) : state)),
+      { getState: () => state }
+    ),
+  };
+});
 
 vi.mock('../../lib/timer-engine', () => ({
   TimerEngineAPI: {
-    getState: vi.fn((...args: any[]) => mockGetState(...args)),
+    getState: (...args: any[]) => hoisted.mockGetState(...args),
     resetDay: vi.fn().mockResolvedValue(undefined),
   },
 }));
@@ -59,20 +78,17 @@ vi.mock('../../lib/logger', () => ({
   },
 }));
 
-// Mock Tauri
-const mockInvoke = vi.fn();
 vi.mock('@tauri-apps/api/core', () => ({
-  invoke: (...args: any[]) => mockInvoke(...args),
+  invoke: (...args: any[]) => hoisted.mockInvoke(...args),
 }));
 
 describe('Timer', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mockInvoke.mockResolvedValue(undefined);
-    mockSetState.mockImplementation(() => {});
-    
-    // Default mock state
-    mockGetState.mockResolvedValue({
+    hoisted.mockInvoke.mockResolvedValue(undefined);
+    hoisted.mockSetState.mockImplementation(() => {});
+    hoisted.getTimerStateImpl.current = () => hoisted.mockGetState();
+    hoisted.mockGetState.mockResolvedValue({
       state: 'STOPPED',
       elapsed_seconds: 0,
       accumulated_seconds: 0,
@@ -92,7 +108,7 @@ describe('Timer', () => {
     };
     
     // Ensure mock is set before render
-    mockGetState.mockResolvedValue(stoppedState);
+    hoisted.mockGetState.mockResolvedValue(stoppedState);
     
     render(<Timer />);
     
@@ -120,7 +136,7 @@ describe('Timer', () => {
     };
     
     // Ensure mock is set before render
-    mockGetState.mockResolvedValue(runningState);
+    hoisted.mockGetState.mockResolvedValue(runningState);
     
     render(<Timer />);
     
@@ -147,10 +163,10 @@ describe('Timer', () => {
         error: null,
         isTakingScreenshot: false,
         idlePauseStartTime: null,
-        startTracking: mockStartTracking,
-        stopTracking: mockStopTracking,
-        pauseTracking: mockPauseTracking,
-        resumeTracking: mockResumeTracking,
+        startTracking: hoisted.mockStartTracking,
+        stopTracking: hoisted.mockStopTracking,
+        pauseTracking: hoisted.mockPauseTracking,
+        resumeTracking: hoisted.mockResumeTracking,
       };
       return selector ? selector(state) : state;
     });
@@ -176,15 +192,15 @@ describe('Timer', () => {
         error: null,
         isTakingScreenshot: false,
         idlePauseStartTime: null,
-        startTracking: mockStartTracking,
-        stopTracking: mockStopTracking,
-        pauseTracking: mockPauseTracking,
-        resumeTracking: mockResumeTracking,
+        startTracking: hoisted.mockStartTracking,
+        stopTracking: hoisted.mockStopTracking,
+        pauseTracking: hoisted.mockPauseTracking,
+        resumeTracking: hoisted.mockResumeTracking,
       };
       return selector ? selector(state) : state;
     });
     
-    mockGetState.mockResolvedValue({
+    hoisted.mockGetState.mockResolvedValue({
       state: 'RUNNING',
       started_at: Date.now() / 1000,
       elapsed_seconds: 0,
@@ -215,15 +231,15 @@ describe('Timer', () => {
         error: null,
         isTakingScreenshot: false,
         idlePauseStartTime: null,
-        startTracking: mockStartTracking,
-        stopTracking: mockStopTracking,
-        pauseTracking: mockPauseTracking,
-        resumeTracking: mockResumeTracking,
+        startTracking: hoisted.mockStartTracking,
+        stopTracking: hoisted.mockStopTracking,
+        pauseTracking: hoisted.mockPauseTracking,
+        resumeTracking: hoisted.mockResumeTracking,
       };
       return selector ? selector(state) : state;
     });
     
-    mockGetState.mockResolvedValue({
+    hoisted.mockGetState.mockResolvedValue({
       state: 'PAUSED',
       elapsed_seconds: 0,
       accumulated_seconds: 0,
@@ -255,15 +271,15 @@ describe('Timer', () => {
         error: null,
         isTakingScreenshot: false,
         idlePauseStartTime: null,
-        startTracking: mockStartTracking,
-        stopTracking: mockStopTracking,
-        pauseTracking: mockPauseTracking,
-        resumeTracking: mockResumeTracking,
+        startTracking: hoisted.mockStartTracking,
+        stopTracking: hoisted.mockStopTracking,
+        pauseTracking: hoisted.mockPauseTracking,
+        resumeTracking: hoisted.mockResumeTracking,
       };
       return selector ? selector(state) : state;
     });
     
-    mockStartTracking.mockResolvedValue(undefined);
+    hoisted.mockStartTracking.mockResolvedValue(undefined);
     
     await act(async () => {
       render(<Timer />);
@@ -275,7 +291,7 @@ describe('Timer', () => {
     });
     
     await waitFor(() => {
-      expect(mockStartTracking).toHaveBeenCalled();
+      expect(hoisted.mockStartTracking).toHaveBeenCalled();
     });
   });
 
@@ -293,12 +309,12 @@ describe('Timer', () => {
         error: null,
         isTakingScreenshot: false,
         idlePauseStartTime: null,
-        startTracking: mockStartTracking,
-        stopTracking: mockStopTracking,
-        pauseTracking: mockPauseTracking,
-        resumeTracking: mockResumeTracking,
+        startTracking: hoisted.mockStartTracking,
+        stopTracking: hoisted.mockStopTracking,
+        pauseTracking: hoisted.mockPauseTracking,
+        resumeTracking: hoisted.mockResumeTracking,
         getState: () => state,
-        setState: mockSetState,
+        setState: hoisted.mockSetState,
       };
       return selector ? selector(state) : state;
     });
@@ -312,8 +328,8 @@ describe('Timer', () => {
       day_start: Math.floor(Date.now() / 1000),
     };
     
-    mockGetState.mockResolvedValue(runningState);
-    mockPauseTracking.mockResolvedValue(undefined);
+    hoisted.mockGetState.mockResolvedValue(runningState);
+    hoisted.mockPauseTracking.mockResolvedValue(undefined);
     
     await act(async () => {
       render(<Timer />);
@@ -330,7 +346,7 @@ describe('Timer', () => {
     });
     
     await waitFor(() => {
-      expect(mockPauseTracking).toHaveBeenCalled();
+      expect(hoisted.mockPauseTracking).toHaveBeenCalled();
     });
   });
 
@@ -348,15 +364,15 @@ describe('Timer', () => {
         error: null,
         isTakingScreenshot: false,
         idlePauseStartTime: null,
-        startTracking: mockStartTracking,
-        stopTracking: mockStopTracking,
-        pauseTracking: mockPauseTracking,
-        resumeTracking: mockResumeTracking,
+        startTracking: hoisted.mockStartTracking,
+        stopTracking: hoisted.mockStopTracking,
+        pauseTracking: hoisted.mockPauseTracking,
+        resumeTracking: hoisted.mockResumeTracking,
       };
       return selector ? selector(state) : state;
     });
     
-    mockGetState.mockResolvedValue({
+    hoisted.mockGetState.mockResolvedValue({
       state: 'PAUSED',
       elapsed_seconds: 0,
       accumulated_seconds: 0,
@@ -364,7 +380,7 @@ describe('Timer', () => {
       day_start: Math.floor(Date.now() / 1000),
     });
     
-    mockResumeTracking.mockResolvedValue(undefined);
+    hoisted.mockResumeTracking.mockResolvedValue(undefined);
     
     await act(async () => {
       render(<Timer />);
@@ -379,7 +395,7 @@ describe('Timer', () => {
     await user.click(resumeButton);
     
     await waitFor(() => {
-      expect(mockResumeTracking).toHaveBeenCalled();
+      expect(hoisted.mockResumeTracking).toHaveBeenCalled();
     });
   });
 
@@ -397,15 +413,15 @@ describe('Timer', () => {
         error: null,
         isTakingScreenshot: false,
         idlePauseStartTime: null,
-        startTracking: mockStartTracking,
-        stopTracking: mockStopTracking,
-        pauseTracking: mockPauseTracking,
-        resumeTracking: mockResumeTracking,
+        startTracking: hoisted.mockStartTracking,
+        stopTracking: hoisted.mockStopTracking,
+        pauseTracking: hoisted.mockPauseTracking,
+        resumeTracking: hoisted.mockResumeTracking,
       };
       return selector ? selector(state) : state;
     });
     
-    mockGetState.mockResolvedValue({
+    hoisted.mockGetState.mockResolvedValue({
       state: 'RUNNING',
       started_at: Date.now() / 1000,
       elapsed_seconds: 0,
@@ -414,7 +430,7 @@ describe('Timer', () => {
       day_start: Math.floor(Date.now() / 1000),
     });
     
-    mockStopTracking.mockResolvedValue(undefined);
+    hoisted.mockStopTracking.mockResolvedValue(undefined);
     
     await act(async () => {
       render(<Timer />);
@@ -429,7 +445,7 @@ describe('Timer', () => {
     await user.click(stopButton);
     
     await waitFor(() => {
-      expect(mockStopTracking).toHaveBeenCalled();
+      expect(hoisted.mockStopTracking).toHaveBeenCalled();
     });
   });
 });
