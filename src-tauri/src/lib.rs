@@ -9,118 +9,19 @@ mod auth;
 mod database;
 mod monitor;
 mod models;
+mod network;
 pub use database::Database;
+pub use network::check_online_status;
+pub use network::{extract_domain, extract_url_from_title};
 use commands::*;
 use crate::engine::{TimerEngine};
 use crate::sync::SyncManager;
-use crate::sync::TaskPriority;
+pub use crate::models::TaskPriority;
 use crate::monitor::ActivityMonitor;
 use std::sync::{Arc};
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(target_os = "macos")]
-pub fn extract_url_from_title(title: &str) -> (Option<String>, Option<String>) {
-    // Try to find URL patterns in title
-    // Browsers often show URLs in window titles
-
-    // Pattern 1: Direct URL (http:// or https://)
-    if let Some(url_start) = title.find("http://") {
-        if let Some(url_end) = title[url_start..].find(' ') {
-            let url = title[url_start..url_start + url_end].to_string();
-            let domain = extract_domain(&url);
-            return (Some(url), domain);
-        } else {
-            let url = title[url_start..].to_string();
-            let domain = extract_domain(&url);
-            return (Some(url), domain);
-        }
-    }
-
-    if let Some(url_start) = title.find("https://") {
-        if let Some(url_end) = title[url_start..].find(' ') {
-            let url = title[url_start..url_start + url_end].to_string();
-            let domain = extract_domain(&url);
-            return (Some(url), domain);
-        } else {
-            let url = title[url_start..].to_string();
-            let domain = extract_domain(&url);
-            return (Some(url), domain);
-        }
-    }
-
-    // Pattern 2: Title might be just the domain (e.g., "github.com")
-    // Check if it looks like a domain
-    if title.contains('.') && !title.contains(' ') {
-        // Might be a domain, but we can't be sure it's a URL
-        // Return None for URL, but return as domain
-        return (None, Some(title.to_string()));
-    }
-
-    (None, None)
-}
-
-#[cfg(target_os = "macos")]
-fn extract_domain(url: &str) -> Option<String> {
-    // Extract domain from URL
-    // Example: https://github.com/user/repo -> github.com
-
-    if url.starts_with("http://") {
-        let without_protocol = &url[7..];
-        if let Some(slash_pos) = without_protocol.find('/') {
-            return Some(without_protocol[..slash_pos].to_string());
-        }
-        return Some(without_protocol.to_string());
-    }
-
-    if url.starts_with("https://") {
-        let without_protocol = &url[8..];
-        if let Some(slash_pos) = without_protocol.find('/') {
-            return Some(without_protocol[..slash_pos].to_string());
-        }
-        return Some(without_protocol.to_string());
-    }
-
-    None
-}
-
-
-/// Проверка online статуса через легковесный HTTP запрос
-pub async fn check_online_status() -> bool {
-    // Используем быстрый GET запрос к надежному серверу
-    // Используем Cloudflare или Google для проверки подключения
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
-        .build()
-    {
-        Ok(client) => client,
-        Err(_) => return false,
-    };
-
-    // Пробуем подключиться к надежному серверу (Cloudflare)
-    // Используем минимальный запрос для проверки подключения
-    match client
-        .get("https://www.cloudflare.com/cdn-cgi/trace")
-        .timeout(std::time::Duration::from_secs(2))
-        .send()
-        .await
-    {
-        Ok(response) => response.status().is_success(),
-        Err(_) => {
-            // Если Cloudflare недоступен, пробуем Google
-            match client
-                .get("https://www.google.com/generate_204")
-                .timeout(std::time::Duration::from_secs(2))
-                .send()
-                .await
-            {
-                Ok(response) => response.status().is_success() || response.status().as_u16() == 204,
-                Err(_) => false,
-            }
-        }
-    }
-}
 
 #[derive(serde::Serialize)]
 struct SyncStatusResponse {
@@ -135,29 +36,27 @@ struct SyncStatusResponse {
 // ============================================
 
 #[cfg(target_os = "macos")]
-fn setup_sleep_wake_handlers(_app: AppHandle, _engine: Arc<TimerEngine>) -> Result<(), String> {
-    // Для macOS используем проверку времени в get_state() для обнаружения sleep
-    // Это более простой и надежный подход, чем работа с NSWorkspace notifications через FFI
-    // Большие пропуски времени (> 5 минут) будут автоматически обнаруживаться и обрабатываться
-
-    eprintln!("[SLEEP/WAKE] Sleep/wake detection enabled via time gap checking in get_state()");
-    eprintln!("[SLEEP/WAKE] Large time gaps (> 5 min) will trigger automatic pause");
-
+fn setup_sleep_wake_handlers(_app: AppHandle, engine: Arc<TimerEngine>) -> Result<(), String> {
+    eprintln!("[SLEEP/WAKE] Sleep/wake detection via time gap in get_state(); wake on startup");
+    engine.handle_system_wake()?;
     Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
-fn setup_sleep_wake_handlers(_app: AppHandle, _engine: Arc<TimerEngine>) -> Result<(), String> {
-    // Для других платформ можно использовать platform-specific API
-    eprintln!("[SLEEP/WAKE] Sleep/wake handlers not implemented for this platform");
+fn setup_sleep_wake_handlers(_app: AppHandle, engine: Arc<TimerEngine>) -> Result<(), String> {
+    eprintln!("[SLEEP/WAKE] Wake handler on startup");
+    engine.handle_system_wake()?;
     Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Инициализация структурированного логирования
+    // Инициализация логирования: по умолчанию info (если RUST_LOG не задан), чтобы [AUTH]/[SYNC] были видны
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .init();
 
     tauri::Builder::default()
