@@ -1,11 +1,12 @@
 import { create } from 'zustand';
 import { api, Project, TimeEntry, UrlActivity } from '../lib/api';
+import type { Screenshot } from '../lib/api';
 import { invoke } from '@tauri-apps/api/core';
-import { useAuthStore } from './useAuthStore';
-import { TimerEngineAPI } from '../lib/timer-engine';
+import { getCurrentUser } from '../lib/current-user';
+import { TimerEngineAPI, type TimerStateResponse } from '../lib/timer-engine';
 import { logger } from '../lib/logger';
 
-interface TrackerState {
+export interface TrackerState {
   projects: Project[];
   selectedProject: Project | null;
   currentTimeEntry: TimeEntry | null;
@@ -33,6 +34,13 @@ interface TrackerState {
   addUrlActivity: (activity: UrlActivity) => void;
   sendUrlActivities: () => Promise<void>;
   reset: () => Promise<void>;
+  saveTimerState: () => Promise<void>;
+  getTimerState: () => Promise<TimerStateResponse>;
+  sendHeartbeat: (active: boolean) => Promise<void>;
+  uploadScreenshot: (file: File, timeEntryId: string) => Promise<void>;
+  getAccessToken: () => string | null;
+  getScreenshots: (timeEntryId: string) => Promise<Screenshot[]>;
+  resetDay: () => Promise<TimerStateResponse>;
 }
 
 export const useTrackerStore = create<TrackerState>((set, get) => ({
@@ -233,8 +241,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       throw new Error('No project selected');
     }
 
-    // Get user ID from auth store
-    const user = useAuthStore.getState().user;
+    const user = getCurrentUser();
     if (!user) {
       throw new Error('User not authenticated');
     }
@@ -1001,13 +1008,17 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       // This prevents the "Already loading" check from blocking the pause
       
       try {
+        // Сразу помечаем паузу в сторе, чтобы скриншоты не делались в момент между решением о паузе и ответом API
+        const now = Date.now();
+        set({ isPaused: true, idlePauseStartTime: now });
+        await logger.safeLogToRust(`[IDLE CHECK] Set store to paused/idle before API call`).catch(() => {});
+
         // Get pauseTracking function directly from store
         const pauseFn = get().pauseTracking;
         await logger.safeLogToRust(`[IDLE CHECK] Calling pauseTracking function...`).catch((e) => {
           logger.debug('IDLE_CHECK', 'Failed to log (non-critical)', e);
         });
-        
-        // Auto pause - pass isIdlePause=true so pauseTracking sets idlePauseStartTime
+        // Auto pause - pass isIdlePause=true so pauseTracking keeps idlePauseStartTime
         await pauseFn(true);
         
         // Wait a bit for state to update
@@ -1226,5 +1237,25 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       urlActivities: [],
     });
   },
+
+  saveTimerState: async () => {
+    await TimerEngineAPI.saveState();
+  },
+  getTimerState: async () => TimerEngineAPI.getState(),
+  sendHeartbeat: async (active: boolean) => {
+    await api.sendHeartbeat(active);
+  },
+  uploadScreenshot: async (file: File, timeEntryId: string) => {
+    await api.uploadScreenshot(file, timeEntryId);
+  },
+  getAccessToken: () => api.getAccessToken(),
+  getScreenshots: async (timeEntryId: string) => api.getScreenshots(timeEntryId),
+  resetDay: async () => {
+    await TimerEngineAPI.resetDay();
+    return TimerEngineAPI.getState();
+  },
 }));
+
+export type { TimerStateResponse } from '../lib/timer-engine';
+export type { Screenshot } from '../lib/api';
 
