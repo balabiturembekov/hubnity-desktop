@@ -718,7 +718,7 @@ pub async fn get_active_window_info() -> Result<ActiveWindowInfo, String> {
 #[tauri::command]
 pub async fn set_auth_tokens(
     sync_manager: State<'_, SyncManager>,
-    engine: State<'_, crate::engine::TimerEngine>,
+    engine: State<'_, Arc<crate::engine::TimerEngine>>,
     access_token: Option<String>,
     refresh_token: Option<String>,
     user_id: Option<String>,
