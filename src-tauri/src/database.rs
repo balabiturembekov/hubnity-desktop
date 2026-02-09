@@ -108,6 +108,12 @@ impl Database {
         // CRITICAL FIX: Миграция для idempotency keys
         let _ = conn.execute("ALTER TABLE sync_queue ADD COLUMN idempotency_key TEXT", []);
 
+        // Метаданные приложения (например current_user_id для изоляции данных при смене пользователя)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT)",
+            [],
+        )?;
+
         // Индексы для быстрого поиска
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_sync_queue_status ON sync_queue(status)",
@@ -202,6 +208,35 @@ impl Database {
         }
 
         Ok(None)
+    }
+
+    /// Получить значение из app_meta (для изоляции данных по пользователю)
+    pub fn get_app_meta(&self, key: &str) -> SqliteResult<Option<String>> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare("SELECT value FROM app_meta WHERE key = ?1")?;
+        let mut rows = stmt.query(params![key])?;
+        if let Some(row) = rows.next()? {
+            return Ok(Some(row.get(0)?));
+        }
+        Ok(None)
+    }
+
+    /// Записать значение в app_meta
+    pub fn set_app_meta(&self, key: &str, value: &str) -> SqliteResult<()> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT INTO app_meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Очистить локальные данные пользователя (таймер, очередь синхронизации) при смене аккаунта
+    pub fn clear_user_data(&self) -> SqliteResult<()> {
+        let conn = self.lock_conn()?;
+        conn.execute("DELETE FROM time_entries", [])?;
+        conn.execute("DELETE FROM sync_queue", [])?;
+        Ok(())
     }
 
     /// Добавить задачу в очередь синхронизации

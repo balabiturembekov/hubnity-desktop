@@ -98,8 +98,6 @@ pub fn run() {
                 )
             })?);
 
-            eprintln!("[DB] Database initialized at: {}", db_path.display());
-
             // Инициализируем TimerEngine с БД
             let engine = TimerEngine::with_db(db.clone());
             let engine_arc = Arc::new(engine);
@@ -221,6 +219,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             // Sync commands
             set_auth_tokens,
+            get_current_user_id,
             sync_queue_now,
             get_sync_status,
             get_sync_queue_stats,

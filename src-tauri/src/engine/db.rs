@@ -1,7 +1,7 @@
 use crate::engine::TimerEngine;
 use crate::engine::TimerState;
 use crate::Database;
-use chrono::Utc;
+use chrono::{Local, Utc};
 use std::sync::{Arc, Mutex};
 use tracing::{error, info, warn};
 
@@ -42,15 +42,13 @@ impl TimerEngine {
             .lock()
             .map_err(|e| format!("Mutex poisoned: {}", e))?;
 
-        // Определяем день
+        // Определяем день (локальная дата — согласовано с ensure_correct_day / rollover по местной полуночи)
         let day = if let Some(day_start_ts) = day_start {
-            // Используем сохраненный день
-            let dt = chrono::DateTime::<Utc>::from_timestamp(day_start_ts as i64, 0)
+            let utc_dt = chrono::DateTime::<Utc>::from_timestamp(day_start_ts as i64, 0)
                 .ok_or_else(|| "Invalid day_start timestamp".to_string())?;
-            dt.format("%Y-%m-%d").to_string()
+            utc_dt.with_timezone(&Local).format("%Y-%m-%d").to_string()
         } else {
-            // Используем текущий день
-            Utc::now().format("%Y-%m-%d").to_string()
+            Local::now().format("%Y-%m-%d").to_string()
         };
 
         // Определяем строковое представление состояния и started_at
@@ -97,9 +95,9 @@ impl TimerEngine {
         // GUARD: Обработка всех возможных ошибок
         match db.load_timer_state() {
             Ok(Some((day_str, accumulated, state_str, saved_started_at))) => {
-                let today_utc = Utc::now().format("%Y-%m-%d").to_string();
+                let today_local = Local::now().format("%Y-%m-%d").to_string();
 
-                if day_str == today_utc {
+                if day_str == today_local {
                     // CRITICAL FIX: Если было running, добавляем elapsed time к accumulated
                     // С защитой от clock skew
                     let final_accumulated = if state_str == "running" && saved_started_at.is_some()
@@ -195,7 +193,7 @@ impl TimerEngine {
                     // День изменился - сбрасываем
                     info!(
                         "[RECOVERY] Day changed ({} → {}), resetting state",
-                        day_str, today_utc
+                        day_str, today_local
                     );
                     // Не восстанавливаем состояние
                 }
@@ -214,6 +212,39 @@ impl TimerEngine {
             }
         }
 
+        Ok(())
+    }
+
+    /// Сбросить состояние таймера (при смене пользователя)
+    pub fn reset_state(&self) -> Result<(), String> {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|e| format!("Mutex poisoned: {}", e))?;
+            *state = TimerState::Stopped;
+        }
+        {
+            let mut acc = self
+                .accumulated_seconds
+                .lock()
+                .map_err(|e| format!("Mutex poisoned: {}", e))?;
+            *acc = 0;
+        }
+        {
+            let mut day = self
+                .day_start_timestamp
+                .lock()
+                .map_err(|e| format!("Mutex poisoned: {}", e))?;
+            *day = None;
+        }
+        let db = match &self.db {
+            Some(db) => db,
+            None => return Ok(()),
+        };
+        let day = Local::now().format("%Y-%m-%d").to_string();
+        db.save_timer_state(&day, 0, "stopped", None)
+            .map_err(|e| format!("Failed to save reset state: {}", e))?;
         Ok(())
     }
 }

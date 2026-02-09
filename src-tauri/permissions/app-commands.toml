@@ -1,0 +1,40 @@
+# Разрешения для кастомных команд приложения (main window)
+# Без этого capability фронт не может вызывать invoke(...) — окно пустое или ошибки
+
+[[permission]]
+identifier = "app-commands"
+description = "Allow all application commands for main window"
+commands.allow = [
+  "set_auth_tokens",
+  "get_current_user_id",
+  "sync_queue_now",
+  "get_sync_status",
+  "get_sync_queue_stats",
+  "get_failed_tasks",
+  "retry_failed_tasks",
+  "start_timer",
+  "pause_timer",
+  "resume_timer",
+  "stop_timer",
+  "get_timer_state",
+  "reset_timer_day",
+  "save_timer_state",
+  "get_active_window_info",
+  "start_activity_monitoring",
+  "stop_activity_monitoring",
+  "listen_activity",
+  "request_screenshot_permission",
+  "take_screenshot",
+  "upload_screenshot",
+  "enqueue_time_entry",
+  "show_notification",
+  "update_tray_time",
+  "log_message",
+  "show_idle_window",
+  "hide_idle_window",
+  "update_idle_time",
+  "resume_tracking_from_idle",
+  "stop_tracking_from_idle",
+  "update_idle_state",
+  "request_idle_state"
+]

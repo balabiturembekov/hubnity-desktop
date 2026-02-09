@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useCallback, useEffect } from 'react';
 import { useAuthStore } from './store/useAuthStore';
 import { useTrackerStore } from './store/useTrackerStore';
 import { Login } from './components/Login';
@@ -10,60 +10,83 @@ import { ErrorBoundary } from './components/ErrorBoundary';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from './components/ui/tabs';
-import { api } from './lib/api';
-import { TimerEngineAPI } from './lib/timer-engine';
 import { logger } from './lib/logger';
 import { setSentryUser } from './lib/sentry';
+import { setCurrentUser } from './lib/current-user';
 import './App.css';
 
 function App() {
   const { isAuthenticated } = useAuthStore();
   const { loadActiveTimeEntry } = useTrackerStore();
 
-  // PRODUCTION: Восстанавливаем токены в Rust AuthManager при старте приложения
-  // Проверяем localStorage напрямую, независимо от isAuthenticated (Zustand persist может загружаться позже)
+  // Восстанавливаем токены в Rust AuthManager — иначе фоновая синхронизация всегда получает "token not set" и Синхронизировано = 0
+  const restoreTokens = useCallback(async () => {
+    const { api } = await import('./lib/api');
+    const accessToken = api.getAccessToken() || localStorage.getItem('access_token');
+    const refreshToken = localStorage.getItem('refresh_token');
+
+    if (accessToken) {
+      try {
+        const { user } = useAuthStore.getState();
+        await invoke('set_auth_tokens', {
+          accessToken,
+          refreshToken,
+          userId: user ? String(user.id) : null,
+        });
+        logger.info('APP', 'Tokens restored in Rust AuthManager');
+        const { user } = useAuthStore.getState();
+        setCurrentUser(user ?? null);
+        if (user) {
+          setSentryUser({ id: user.id, email: user.email });
+        }
+      } catch (e) {
+        logger.error('APP', 'Failed to restore tokens in Rust AuthManager', e);
+      }
+    } else {
+      setCurrentUser(null);
+      // Не вызываем set_auth_tokens(null) здесь — иначе спам в логах. Очистка только при logout().
+    }
+  }, [isAuthenticated]);
+
+  // Восстанавливаем токены при монтировании и при смене isAuthenticated
   useEffect(() => {
-    const restoreTokens = async () => {
-      const accessToken = localStorage.getItem('access_token');
-      const refreshToken = localStorage.getItem('refresh_token');
-      
-      if (accessToken) {
-        // Есть токены - восстанавливаем в Rust AuthManager для синхронизации
-        // Не зависим от isAuthenticated, так как Zustand persist может загружаться асинхронно
-        try {
-          await invoke('set_auth_tokens', {
-            access_token: accessToken,
-            refresh_token: refreshToken,
-          });
-          logger.info('APP', 'Tokens restored in Rust AuthManager');
-          
-          // Восстанавливаем пользователя в Sentry, если есть
-          const { user: currentUser } = useAuthStore.getState();
-          if (currentUser) {
-            setSentryUser({
-              id: currentUser.id,
-              email: currentUser.email,
-            });
-          }
-        } catch (e) {
-          logger.error('APP', 'Failed to restore tokens in Rust AuthManager', e);
-        }
-      } else if (!accessToken && !isAuthenticated) {
-        // Нет токенов и не авторизован - очищаем в Rust на всякий случай
-        try {
-          await invoke('set_auth_tokens', {
-            access_token: null,
-            refresh_token: null,
-          });
-        } catch (e) {
-          logger.error('APP', 'Failed to clear tokens in Rust AuthManager', e);
-        }
+    restoreTokens();
+    const t = setTimeout(restoreTokens, 2000);
+    return () => clearTimeout(t);
+  }, [restoreTokens]);
+
+  // Критично: каждые 30 с передаём токены в Rust (если есть) и запускаем синхронизацию.
+  // Не полагаемся на isAuthenticated — токен может быть в localStorage до регидрации Zustand.
+  useEffect(() => {
+    const pushTokensAndSync = async () => {
+      try {
+        const { api } = await import('./lib/api');
+        const accessToken = api.getAccessToken() || localStorage.getItem('access_token');
+        const refreshToken = localStorage.getItem('refresh_token');
+        await logger.safeLogToRust(`[SYNC-FRONT] pushTokensAndSync: hasToken=${!!accessToken}`).catch(() => {});
+        if (!accessToken) return;
+        const { user } = useAuthStore.getState();
+        await invoke('set_auth_tokens', {
+          accessToken,
+          refreshToken,
+          userId: user ? String(user.id) : null,
+        });
+        const synced = await invoke<number>('sync_queue_now');
+        await logger.safeLogToRust(`[SYNC-FRONT] sync_queue_now returned: ${synced}`).catch(() => {});
+        if (synced > 0) logger.info('APP', `Sync: ${synced} task(s) sent`);
+      } catch (e) {
+        logger.warn('APP', 'pushTokensAndSync failed', e);
+        await logger.safeLogToRust(`[SYNC-FRONT] pushTokensAndSync error: ${String(e)}`).catch(() => {});
       }
     };
-    
-    // Запускаем сразу при монтировании и при изменении isAuthenticated
-    restoreTokens();
-  }, [isAuthenticated]); // Запускаем при изменении isAuthenticated
+    pushTokensAndSync();
+    const early = setTimeout(pushTokensAndSync, 3000);
+    const interval = setInterval(pushTokensAndSync, 30_000);
+    return () => {
+      clearTimeout(early);
+      clearInterval(interval);
+    };
+  }, []);
 
   // CRITICAL FIX: Сохраняем состояние таймера при закрытии приложения
   // ДОКАЗАНО: Tauri window close event обрабатывается в Rust (синхронно)
@@ -73,7 +96,7 @@ function App() {
       try {
         // Дополнительная защита: пытаемся сохранить состояние
         // ДОКАЗАНО: Основное сохранение происходит через Tauri window close event в Rust
-        await TimerEngineAPI.saveState();
+        await useTrackerStore.getState().saveTimerState();
       } catch (error) {
         logger.error('APP', 'Failed to save timer state on close (fallback)', error);
         // ДОКАЗАНО: Ошибка не критична, так как Rust handler уже сохранил состояние
@@ -139,9 +162,11 @@ function App() {
         const hasPermission = await invoke<boolean>('request_screenshot_permission');
         if (!hasPermission) {
           // Show notification to grant permission
+          // Message is platform-agnostic - Windows usually doesn't require explicit permission,
+          // but if screenshots fail, user may need to run as admin or check system settings
           await invoke('show_notification', {
-            title: 'Требуется разрешение',
-            body: 'Пожалуйста, предоставьте разрешение на запись экрана в настройках системы для работы скриншотов',
+            title: 'Проверка разрешений',
+            body: 'Не удалось получить доступ к скриншотам. Убедитесь, что приложение имеет необходимые права доступа.',
           });
         }
       } catch (error) {
@@ -165,16 +190,14 @@ function App() {
   // Listen for auth logout events (from refresh token failure)
   useEffect(() => {
     const handleLogout = async () => {
-      // Ensure tokens are cleared and state is reset
       try {
         await useAuthStore.getState().logout();
+        await useTrackerStore.getState().reset();
       } catch (error) {
-        // Even if logout fails, ensure tokens are cleared
-        api.clearToken();
-        useAuthStore.setState({ user: null, isAuthenticated: false });
+        await useAuthStore.getState().clearTokens();
       }
     };
-    
+
     window.addEventListener('auth:logout', handleLogout);
     return () => {
       window.removeEventListener('auth:logout', handleLogout);
@@ -216,21 +239,18 @@ function App() {
         }
       }, 30000);
 
-      // Send heartbeat every minute when tracking
-      // FIX: Используем TimerEngineAPI.getState() вместо store (единственный source of truth)
       heartbeatInterval = setInterval(async () => {
         if (!isCleanedUp) {
           try {
-            const timerState = await TimerEngineAPI.getState();
-            // Отправляем heartbeat только если таймер RUNNING в Rust
+            const timerState = await useTrackerStore.getState().getTimerState();
             if (timerState.state === 'RUNNING') {
-              await api.sendHeartbeat(true);
+              await useTrackerStore.getState().sendHeartbeat(true);
             }
           } catch (error) {
             logger.error('APP', 'Failed to send heartbeat', error);
           }
         }
-      }, 60000); // 1 minute
+      }, 60000);
     };
 
     setupActivityListeners();
@@ -310,17 +330,15 @@ function App() {
     const trackUrlActivity = async () => {
       if (isCleanedUp) return;
       
-      // FIX: Используем TimerEngineAPI.getState() вместо store (единственный source of truth)
       const { currentTimeEntry } = useTrackerStore.getState();
       let isTracking = false;
       let isPaused = false;
-      
+
       try {
-        const timerState = await TimerEngineAPI.getState();
+        const timerState = await useTrackerStore.getState().getTimerState();
         isTracking = timerState.state === 'RUNNING' || timerState.state === 'PAUSED';
         isPaused = timerState.state === 'PAUSED';
       } catch (error) {
-        // Fallback to store if TimerEngineAPI fails
         const storeState = useTrackerStore.getState();
         isTracking = storeState.isTracking;
         isPaused = storeState.isPaused;
@@ -427,16 +445,14 @@ function App() {
     const sendUrlActivities = async () => {
       if (isCleanedUp) return;
       
-      // FIX: Используем TimerEngineAPI.getState() вместо store (единственный source of truth)
       let isTracking = false;
       let isPaused = false;
-      
+
       try {
-        const timerState = await TimerEngineAPI.getState();
+        const timerState = await useTrackerStore.getState().getTimerState();
         isTracking = timerState.state === 'RUNNING' || timerState.state === 'PAUSED';
         isPaused = timerState.state === 'PAUSED';
       } catch (error) {
-        // Fallback to store if TimerEngineAPI fails
         const storeState = useTrackerStore.getState();
         isTracking = storeState.isTracking;
         isPaused = storeState.isPaused;
@@ -559,10 +575,7 @@ function App() {
         // Final state check before taking screenshot
         const finalState = useTrackerStore.getState();
         if (!finalState.isTracking || finalState.isPaused || !finalState.currentTimeEntry || finalState.idlePauseStartTime !== null || isCleanedUp) {
-          // Reset flag if we're skipping screenshot
-          if (finalState.idlePauseStartTime !== null) {
-            useTrackerStore.setState({ isTakingScreenshot: false });
-          }
+          useTrackerStore.setState({ isTakingScreenshot: false });
           return; // State changed or idle, skip screenshot
         }
         
@@ -603,7 +616,7 @@ function App() {
         // Try uploading via Rust first (more reliable for large files)
         try {
           const { invoke } = await import('@tauri-apps/api/core');
-          const accessToken = api.getAccessToken();
+          const accessToken = useTrackerStore.getState().getAccessToken();
           
           if (accessToken) {
             await logger.safeLogToRust('[FRONTEND] Uploading via Rust...').catch((e) => {
@@ -633,8 +646,7 @@ function App() {
           });
         }
         
-        // Fallback to JS upload if Rust fails
-        await api.uploadScreenshot(file, finalState.currentTimeEntry.id);
+        await useTrackerStore.getState().uploadScreenshot(file, finalState.currentTimeEntry.id);
         
         // Emit event to refresh screenshots view
         if (!isCleanedUp) {
@@ -692,23 +704,26 @@ function App() {
       
       screenshotTimeout = setTimeout(async () => {
         if (!isCleanedUp) {
+          const state = useTrackerStore.getState();
+          if (!state.isTracking || state.isPaused || !state.currentTimeEntry || state.idlePauseStartTime !== null) {
+            await logger.safeLogToRust(`[SCREENSHOT] Timeout fired but paused/idle — not taking screenshot, not scheduling next`).catch(() => {});
+            screenshotTimeout = null;
+            return;
+          }
           await logger.safeLogToRust('[SCREENSHOT] Timeout triggered, taking screenshot...').catch((e) => {
             logger.debug('SCREENSHOT', 'Failed to log (non-critical)', e);
           });
-          
           try {
             await takeScreenshot();
             await logger.safeLogToRust('[SCREENSHOT] Screenshot completed, scheduling next...').catch((e) => {
               logger.debug('SCREENSHOT', 'Failed to log (non-critical)', e);
             });
-            // Schedule next screenshot after current one completes
             await scheduleNextScreenshot();
           } catch (error: any) {
             logger.error('SCREENSHOT', 'Error taking screenshot, still scheduling next', error);
             await logger.safeLogToRust(`[SCREENSHOT] Error: ${error?.message || error}, still scheduling next...`).catch((e) => {
               logger.debug('SCREENSHOT', 'Failed to log (non-critical)', e);
             });
-            // On error, still schedule next screenshot
             await scheduleNextScreenshot();
           }
         }

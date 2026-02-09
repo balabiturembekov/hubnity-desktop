@@ -4,21 +4,71 @@ use aes_gcm::{
 };
 
 use crate::models::TokenRefreshResult;
+use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Ошибки аутентификации (для разбора и логирования)
+#[derive(Debug)]
+pub enum AuthError {
+    TokenNotSet(String),
+    Network(String),
+    Http { status: u16 },
+    Parse(String),
+}
+
+impl fmt::Display for AuthError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AuthError::TokenNotSet(s) => write!(f, "Token not set: {}", s),
+            AuthError::Network(s) => write!(f, "Network: {}", s),
+            AuthError::Http { status } => write!(f, "HTTP {}", status),
+            AuthError::Parse(s) => write!(f, "Parse: {}", s),
+        }
+    }
+}
+
+/// Конфигурация AuthManager (api_base_url, таймаут HTTP)
+#[derive(Clone)]
+pub struct AuthConfig {
+    pub api_base_url: String,
+    pub http_timeout_secs: u64,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            api_base_url: "https://app.automatonsoft.de/api".to_string(),
+            http_timeout_secs: 10,
+        }
+    }
+}
+
 /// Менеджер аутентификации для получения токенов
 /// Получает токены из localStorage через Tauri команду
 pub struct AuthManager {
     api_base_url: String,
-    // GUARD: Временное хранение токенов для синхронизации
-    // В production должно быть в Keychain
+    client: reqwest::Client,
     pub access_token: Arc<tokio::sync::RwLock<Option<String>>>,
     pub refresh_token: Arc<tokio::sync::RwLock<Option<String>>>,
 }
 
 impl AuthManager {
     pub fn new(api_base_url: String) -> Self {
-        Self {
+        Self::new_with_config(AuthConfig {
             api_base_url,
+            http_timeout_secs: 10,
+        })
+    }
+
+    pub fn new_with_config(config: AuthConfig) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(config.http_timeout_secs))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self {
+            api_base_url: config.api_base_url.clone(),
+            client,
             access_token: Arc::new(tokio::sync::RwLock::new(None)),
             refresh_token: Arc::new(tokio::sync::RwLock::new(None)),
         }
@@ -31,50 +81,23 @@ impl AuthManager {
     }
 
     /// Получить access token
-    pub async fn get_access_token(&self) -> Result<String, String> {
+    pub async fn get_access_token(&self) -> Result<String, AuthError> {
         self.access_token
             .read()
             .await
             .clone()
-            .ok_or_else(|| "Access token not set. Call set_auth_tokens first.".to_string())
+            .ok_or_else(|| AuthError::TokenNotSet("Call set_auth_tokens first.".into()))
     }
 
     /// Получить refresh token
-    pub async fn get_refresh_token(&self) -> Result<Option<String>, String> {
+    pub async fn get_refresh_token(&self) -> Result<Option<String>, AuthError> {
         Ok(self.refresh_token.read().await.clone())
     }
 
-    /// Получить свежий access token (обновить если нужно)
-    /// Проверяет срок действия и обновляет если < 60 секунд до expiry
-    #[allow(dead_code)] // Может использоваться в будущем для автоматического обновления токенов
-    async fn get_fresh_token(
-        &self,
-        current_token: Option<&str>,
-        _refresh_token: Option<&str>,
-    ) -> Result<String, String> {
-        // Если токен не предоставлен, пытаемся получить из storage
-        let token = if let Some(t) = current_token {
-            t.to_string()
-        } else {
-            self.get_access_token().await?
-        };
-
-        // TODO: Проверять expiry токена (JWT decode)
-        // Пока что просто возвращаем токен
-        // В production нужно декодировать JWT и проверять exp claim
-
-        Ok(token)
-    }
-
     /// Обновить токен через refresh token
-    pub async fn refresh_token(&self, refresh_token: &str) -> Result<TokenRefreshResult, String> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
-
+    pub async fn refresh_token(&self, refresh_token: &str) -> Result<TokenRefreshResult, AuthError> {
         let url = format!("{}/auth/refresh", self.api_base_url);
-        let response = client
+        let response = self.client
             .post(&url)
             .header("Content-Type", "application/json")
             .json(&serde_json::json!({
@@ -82,23 +105,23 @@ impl AuthManager {
             }))
             .send()
             .await
-            .map_err(|e| format!("Network error during token refresh: {}", e))?;
+            .map_err(|e| AuthError::Network(e.to_string()))?;
 
-        if !response.status().is_success() {
-            return Err(format!(
-                "Token refresh failed with status: {}",
-                response.status()
-            ));
+        let status = response.status();
+        if !status.is_success() {
+            return Err(AuthError::Http {
+                status: status.as_u16(),
+            });
         }
 
         let json: serde_json::Value = response
             .json()
             .await
-            .map_err(|e| format!("Failed to parse refresh response: {}", e))?;
+            .map_err(|e| AuthError::Parse(e.to_string()))?;
 
         let access_token = json["access_token"]
             .as_str()
-            .ok_or_else(|| "Missing access_token in refresh response".to_string())?
+            .ok_or_else(|| AuthError::Parse("Missing access_token in refresh response".into()))?
             .to_string();
 
         let refresh_token = json["refresh_token"].as_str().map(|s| s.to_string());
@@ -189,10 +212,3 @@ impl TokenEncryption {
     }
 }
 
-// Глобальный экземпляр для шифрования (lazy_static или OnceCell in production)
-// Для упрощения используем функцию, которая создает новый экземпляр каждый раз
-// В production должен быть singleton
-#[allow(dead_code)] // Может использоваться в будущем для миграции старых токенов
-fn get_encryption() -> Result<TokenEncryption, String> {
-    TokenEncryption::new()
-}

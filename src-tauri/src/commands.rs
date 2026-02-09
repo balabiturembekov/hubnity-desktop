@@ -211,9 +211,33 @@ pub async fn request_screenshot_permission() -> Result<bool, String> {
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     {
-        Ok(true)
+        // On Windows, try to get screens to check if screenshot functionality is available
+        // This will trigger any necessary permission prompts if the system requires them
+        match screenshots::Screen::all() {
+            Ok(screens) => {
+                if screens.is_empty() {
+                    Ok(false)
+                } else {
+                    // Try to capture a small test screenshot to ensure permissions are working
+                    match screens[0].capture() {
+                        Ok(_) => Ok(true),
+                        Err(_) => Ok(false),
+                    }
+                }
+            }
+            Err(_) => Ok(false),
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        // Linux and other platforms
+        match screenshots::Screen::all() {
+            Ok(screens) => Ok(!screens.is_empty()),
+            Err(_) => Ok(false),
+        }
     }
 }
 
@@ -272,8 +296,14 @@ pub async fn take_screenshot(_time_entry_id: String) -> Result<Vec<u8>, String> 
 
     // Take screenshot using screenshots crate
     let screens = screenshots::Screen::all().map_err(|e| {
+        #[cfg(target_os = "macos")]
         let err_msg = format!(
             "Failed to get screens: {:?}. Please grant screen recording permission in System Settings -> Privacy & Security -> Screen Recording.",
+            e
+        );
+        #[cfg(not(target_os = "macos"))]
+        let err_msg = format!(
+            "Failed to get screens: {:?}. Please ensure the application has necessary permissions to capture screenshots.",
             e
         );
         eprintln!("[SCREENSHOT ERROR] {}", err_msg);
@@ -291,8 +321,14 @@ pub async fn take_screenshot(_time_entry_id: String) -> Result<Vec<u8>, String> 
 
     // Capture screenshot
     let image = screen.capture().map_err(|e| {
+        #[cfg(target_os = "macos")]
         let err_msg = format!(
-            "Failed to capture screenshot: {:?}. Please check screen recording permissions in System Settings.",
+            "Failed to capture screenshot: {:?}. Please check screen recording permissions in System Settings -> Privacy & Security -> Screen Recording.",
+            e
+        );
+        #[cfg(not(target_os = "macos"))]
+        let err_msg = format!(
+            "Failed to capture screenshot: {:?}. Please ensure the application has necessary permissions to capture screenshots.",
             e
         );
         eprintln!("[SCREENSHOT ERROR] {}", err_msg);
@@ -677,31 +713,62 @@ pub async fn get_active_window_info() -> Result<ActiveWindowInfo, String> {
 // TAURI COMMANDS для синхронизации
 // ============================================
 
-/// Установить токены для синхронизации (вызывается из frontend)
+/// Установить токены для синхронизации (вызывается из frontend).
+/// При смене пользователя (user_id) очищаются локальные данные таймера и очереди синхронизации.
 #[tauri::command]
 pub async fn set_auth_tokens(
     sync_manager: State<'_, SyncManager>,
+    engine: State<'_, crate::engine::TimerEngine>,
     access_token: Option<String>,
     refresh_token: Option<String>,
+    user_id: Option<String>,
 ) -> Result<(), String> {
-    let has_access = access_token
-        .as_ref()
-        .map(|s| !s.is_empty())
-        .unwrap_or(false);
-    let has_refresh = refresh_token
-        .as_ref()
-        .map(|s| !s.is_empty())
-        .unwrap_or(false);
-    info!(
-        "[AUTH] set_auth_tokens called: access_token present={}, refresh_token present={}",
-        has_access, has_refresh
-    );
-    eprintln!("[AUTH] set_auth_tokens: token present={}", has_access);
+    let new_id = user_id.as_deref().unwrap_or("");
+    let current_id = sync_manager
+        .db
+        .get_app_meta("current_user_id")
+        .map_err(|e| format!("Failed to get current user: {}", e))?
+        .unwrap_or_default();
+    let has_tokens = access_token.as_ref().map(|s| !s.is_empty()).unwrap_or(false);
+    if !new_id.is_empty() && new_id != current_id {
+        sync_manager
+            .db
+            .clear_user_data()
+            .map_err(|e| format!("Failed to clear user data: {}", e))?;
+        engine
+            .reset_state()
+            .map_err(|e| format!("Failed to reset timer: {}", e))?;
+        sync_manager
+            .db
+            .set_app_meta("current_user_id", new_id)
+            .map_err(|e| format!("Failed to set current user: {}", e))?;
+    } else if new_id.is_empty() && !current_id.is_empty() && !has_tokens {
+        sync_manager
+            .db
+            .set_app_meta("current_user_id", "")
+            .map_err(|e| format!("Failed to clear current user: {}", e))?;
+    } else if !new_id.is_empty() {
+        sync_manager
+            .db
+            .set_app_meta("current_user_id", new_id)
+            .map_err(|e| format!("Failed to set current user: {}", e))?;
+    }
     sync_manager
         .auth_manager
         .set_tokens(access_token, refresh_token)
         .await;
     Ok(())
+}
+
+/// Получить текущий user_id из БД (для проверки смены пользователя на фронтенде)
+#[tauri::command]
+pub async fn get_current_user_id(
+    sync_manager: State<'_, SyncManager>,
+) -> Result<Option<String>, String> {
+    sync_manager
+        .db
+        .get_app_meta("current_user_id")
+        .map_err(|e| format!("Failed to get current user: {}", e))
 }
 
 #[tauri::command]
