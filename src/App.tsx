@@ -34,7 +34,6 @@ function App() {
           userId: user ? String(user.id) : null,
         });
         logger.info('APP', 'Tokens restored in Rust AuthManager');
-        const { user } = useAuthStore.getState();
         setCurrentUser(user ?? null);
         if (user) {
           setSentryUser({ id: user.id, email: user.email });
