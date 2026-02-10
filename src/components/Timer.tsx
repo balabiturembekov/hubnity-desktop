@@ -207,8 +207,11 @@ export function Timer() {
 
   const timerStateInfo = getTimerState();
   const elapsedSeconds = timerState?.elapsed_seconds ?? 0;
+  const { currentTimeEntry } = useTrackerStore();
 
-  if (!selectedProject) {
+  // FIX: Показываем таймер если есть active time entry, даже если selectedProject не установлен
+  // Это исправляет ситуацию когда таймер работает, но UI показывает "No projects"
+  if (!selectedProject && !currentTimeEntry) {
     return (
       <div className="flex flex-col items-center justify-center py-16 px-4">
         <p className="text-sm text-muted-foreground text-center">

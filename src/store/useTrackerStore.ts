@@ -69,6 +69,17 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
 
   loadActiveTimeEntry: async () => {
     try {
+      // FIX: Загружаем проекты перед восстановлением active entry, чтобы можно было найти проект по projectId
+      const { projects: currentProjects } = get();
+      if (currentProjects.length === 0) {
+        try {
+          const projects = await api.getProjects();
+          set({ projects });
+        } catch (e) {
+          logger.warn('LOAD', 'Failed to load projects before restoring active entry', e);
+        }
+      }
+      
       const activeEntries = await api.getActiveTimeEntries();
       if (activeEntries.length > 0) {
         let activeEntry: TimeEntry;
@@ -192,12 +203,11 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           }
         }
         
-        set({
-          currentTimeEntry: activeEntry,
-          isTracking: activeEntry.status === 'RUNNING' || activeEntry.status === 'PAUSED',
-          isPaused: activeEntry.status === 'PAUSED',
-          lastActivityTime: Date.now(),
-          selectedProject: activeEntry.project ? {
+        // Восстанавливаем selectedProject из activeEntry.project или находим по projectId
+        let restoredProject: Project | null = null;
+        if (activeEntry.project) {
+          // Если project включен в ответ, используем его
+          restoredProject = {
             id: activeEntry.project.id,
             name: activeEntry.project.name,
             color: activeEntry.project.color,
@@ -208,7 +218,25 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
             companyId: '',
             createdAt: '',
             updatedAt: '',
-          } : null,
+          };
+        } else if (activeEntry.projectId) {
+          // Если project не включен, но есть projectId, ищем в списке проектов
+          const { projects } = get();
+          const foundProject = projects.find(p => p.id === activeEntry.projectId);
+          if (foundProject) {
+            restoredProject = foundProject;
+            logger.info('LOAD', `Found project ${foundProject.name} by projectId ${activeEntry.projectId}`);
+          } else {
+            logger.warn('LOAD', `Project ${activeEntry.projectId} not found in projects list`);
+          }
+        }
+        
+        set({
+          currentTimeEntry: activeEntry,
+          isTracking: activeEntry.status === 'RUNNING' || activeEntry.status === 'PAUSED',
+          isPaused: activeEntry.status === 'PAUSED',
+          lastActivityTime: Date.now(),
+          selectedProject: restoredProject,
         });
       }
     } catch (error: any) {
