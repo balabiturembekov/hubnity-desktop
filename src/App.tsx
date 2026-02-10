@@ -295,6 +295,7 @@ function App() {
   }, []);
 
   // Проверка обновлений (раз в 15 с после загрузки, затем не спамим)
+  // Примечание: ошибки updater (например, недоступный endpoint) не критичны и игнорируются
   useEffect(() => {
     let cancelled = false;
     const timeout = setTimeout(async () => {
@@ -308,8 +309,14 @@ function App() {
           title: 'Hubnity',
           body: `Доступна новая версия ${update.version}. Откройте приложение и нажмите «Установить».`,
         }).catch(() => {});
-      } catch (e) {
-        logger.debug('APP', 'Update check failed (non-critical)', e);
+      } catch (e: any) {
+        // Игнорируем ошибки updater - они не критичны (endpoint может быть недоступен или не настроен)
+        // Rust плагин логирует ERROR, но это нормально если updater не настроен
+        if (e?.message?.includes('update endpoint') || e?.message?.includes('status code')) {
+          logger.debug('APP', 'Update endpoint unavailable (non-critical, updater may not be configured)', e);
+        } else {
+          logger.debug('APP', 'Update check failed (non-critical)', e);
+        }
       }
     }, 15000);
     return () => {
