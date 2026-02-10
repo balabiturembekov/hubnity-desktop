@@ -21,7 +21,7 @@ import './App.css';
 
 function App() {
   const { isAuthenticated, user, logout } = useAuthStore();
-  const { loadActiveTimeEntry, reset } = useTrackerStore();
+  const { loadActiveTimeEntry } = useTrackerStore();
   const [updateAvailable, setUpdateAvailable] = useState<{ version: string; body?: string } | null>(null);
   const pendingUpdateRef = useRef<Update | null>(null);
 
@@ -1184,8 +1184,7 @@ function App() {
                   await logout();
                   // Очищаем только локальное UI состояние, не останавливая таймер на сервере
                   const { useTrackerStore } = await import('./store/useTrackerStore');
-                  const store = useTrackerStore.getState();
-                  store.set({
+                  useTrackerStore.setState({
                     projects: [],
                     selectedProject: null,
                     currentTimeEntry: null,
