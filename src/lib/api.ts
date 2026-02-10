@@ -97,6 +97,7 @@ export interface Screenshot {
   thumbnailUrl: string;
   timestamp: string;
   createdAt: string;
+  userId?: string; // ID пользователя, который создал скриншот (для фильтрации)
 }
 
 export interface UrlActivity {

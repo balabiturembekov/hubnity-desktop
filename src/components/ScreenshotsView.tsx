@@ -15,14 +15,23 @@ import { getCurrentUser } from '../lib/current-user';
 /** Скриншот может содержать userId от API — фильтруем по текущему пользователю */
 function filterScreenshotsByCurrentUser(list: Screenshot[]): Screenshot[] {
   const user = getCurrentUser();
-  if (!user) return list;
-  const filtered = list.filter((s) => {
-    const uid = (s as Screenshot & { userId?: string }).userId;
-    return uid === undefined || uid === user.id;
-  });
-  if (filtered.length !== list.length) {
-    logger.warn('SCREENSHOTS_VIEW', `Filtered ${list.length - filtered.length} screenshots from other users`);
+  if (!user) {
+    // Если пользователь не авторизован, не показываем скриншоты (безопасность)
+    logger.warn('SCREENSHOTS_VIEW', 'No current user, filtering all screenshots');
+    return [];
   }
+  
+  const filtered = list.filter((s) => {
+    const uid = s.userId;
+    // FIX: Показываем только скриншоты текущего пользователя
+    // Если userId не определен, НЕ показываем (безопасность - лучше скрыть, чем показать чужой)
+    return uid !== undefined && uid === user.id;
+  });
+  
+  if (filtered.length !== list.length) {
+    logger.warn('SCREENSHOTS_VIEW', `Filtered ${list.length - filtered.length} screenshots from other users (or without userId)`);
+  }
+  
   return filtered;
 }
 
