@@ -241,6 +241,9 @@ pub async fn request_screenshot_permission() -> Result<bool, String> {
     }
 }
 
+/// Максимальный размер тела скриншота (защита от DoS/OOM при вызове из фронта).
+const MAX_SCREENSHOT_BODY_BYTES: usize = 15 * 1024 * 1024; // 15 MB
+
 #[tauri::command]
 pub async fn upload_screenshot(
     png_data: Vec<u8>,
@@ -249,6 +252,13 @@ pub async fn upload_screenshot(
     refresh_token: Option<String>,
     sync_manager: State<'_, SyncManager>,
 ) -> Result<(), String> {
+    if png_data.len() > MAX_SCREENSHOT_BODY_BYTES {
+        return Err(format!(
+            "Screenshot too large ({} bytes, max {} MB)",
+            png_data.len(),
+            MAX_SCREENSHOT_BODY_BYTES / (1024 * 1024)
+        ));
+    }
     info!("[RUST] Enqueueing screenshot: {} bytes", png_data.len());
 
     // Сначала сохраняем в очередь
@@ -714,7 +724,7 @@ pub async fn get_active_window_info() -> Result<ActiveWindowInfo, String> {
 // ============================================
 
 /// Установить токены для синхронизации (вызывается из frontend).
-/// При смене пользователя (user_id) очищаются локальные данные таймера и очереди синхронизации.
+/// Сброс таймера и очереди — только при смене пользователя (A → B); при входе после логаута ("" → A) не сбрасываем.
 #[tauri::command]
 pub async fn set_auth_tokens(
     sync_manager: State<'_, SyncManager>,
@@ -730,7 +740,8 @@ pub async fn set_auth_tokens(
         .map_err(|e| format!("Failed to get current user: {}", e))?
         .unwrap_or_default();
     let has_tokens = access_token.as_ref().map(|s| !s.is_empty()).unwrap_or(false);
-    if !new_id.is_empty() && new_id != current_id {
+    // Сброс таймера и данных только при смене пользователя (A → B), не при входе после логаута ("" → A)
+    if !new_id.is_empty() && !current_id.is_empty() && new_id != current_id {
         sync_manager
             .db
             .clear_user_data()

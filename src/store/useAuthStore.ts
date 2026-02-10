@@ -32,10 +32,12 @@ export const useAuthStore = create<AuthState>()(
           // Rust очистит локальные данные (таймер, очередь) если user_id изменился
           const { invoke } = await import('@tauri-apps/api/core');
           
-          // Проверяем, сменился ли пользователь (до обновления состояния)
+          // Проверяем, сменился ли пользователь (до обновления состояния).
+          // После логаута в Rust хранится "", не null — считаем пустую строку как «нет предыдущего пользователя».
           const currentUserId = await invoke<string | null>('get_current_user_id').catch(() => null);
+          const currentId = (currentUserId ?? '').trim();
           const newUserId = String(response.user.id);
-          const userChanged = currentUserId !== null && currentUserId !== newUserId;
+          const userChanged = currentId.length > 0 && currentId !== newUserId;
           
           await invoke('set_auth_tokens', {
             accessToken: response.access_token,

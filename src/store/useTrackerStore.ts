@@ -1189,12 +1189,16 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           await logger.safeLogToRust(`[IDLE CHECK] WARNING: Pause function returned but isPaused is still false!`).catch((e) => {
             logger.debug('IDLE_CHECK', 'Failed to log (non-critical)', e);
           });
+          // Пауза не удалась — возвращаем store в согласованное состояние с Timer Engine
+          set({ isPaused: false, idlePauseStartTime: null });
         }
       } catch (error: any) {
         logger.error('IDLE_CHECK', 'Error pausing tracker', error);
         await logger.safeLogToRust(`[IDLE CHECK] Error pausing: ${error.message || 'Unknown error'}`).catch((e) => {
           logger.debug('IDLE_CHECK', 'Failed to log (non-critical)', e);
         });
+        // Пауза не удалась — возвращаем store в согласованное состояние с Timer Engine
+        set({ isPaused: false, idlePauseStartTime: null });
       }
     }
   },
