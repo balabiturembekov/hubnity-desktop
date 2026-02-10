@@ -91,8 +91,9 @@ describe('ApiClient', () => {
     it('creates axios instance with correct config', () => {
       // ApiClient создается при импорте модуля
       // Проверяем что axios.create был вызван хотя бы один раз
-      if (hoisted.mockCreate.mock.calls.length > 0) {
-        const callArgs = hoisted.mockCreate.mock.calls[0][0];
+      const calls = hoisted.mockCreate.mock.calls as unknown[][];
+      if (calls.length > 0 && calls[0] && calls[0].length > 0) {
+        const callArgs = calls[0][0] as Record<string, unknown>;
         expect(callArgs).toMatchObject({
           baseURL: 'https://app.automatonsoft.de/api',
           headers: {
@@ -102,11 +103,9 @@ describe('ApiClient', () => {
           maxContentLength: Infinity,
           maxBodyLength: Infinity,
         });
-      } else {
-        // Если мок не был вызван, значит ApiClient использует другой способ создания
-        // Это нормально для тестов - главное что методы работают
-        expect(true).toBe(true);
       }
+      // Если мок не был вызван, это нормально - главное что методы работают
+      expect(hoisted.mockCreate).toBeDefined();
     });
 
     it('sets up request interceptor', () => {
@@ -503,8 +502,6 @@ describe('ApiClient', () => {
       hoisted.mockPost.mockResolvedValue(mockResponse);
 
       // Mock FileReader as a proper constructor
-      let onloadHandler: ((e: any) => void) | null = null;
-      
       class MockFileReader {
         result: string = '';
         onload: ((e: any) => void) | null = null;

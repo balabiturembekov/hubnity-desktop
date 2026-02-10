@@ -96,7 +96,17 @@ describe('useAuthStore', () => {
 
   it('logout clears tokens and state', async () => {
     useAuthStore.setState({
-      user: { id: '1', name: 'U', email: 'u@u.com' },
+      user: { 
+        id: '1', 
+        name: 'U', 
+        email: 'u@u.com',
+        role: 'user',
+        status: 'active',
+        avatar: '',
+        hourlyRate: 0,
+        companyId: 'c1',
+        company: { id: 'c1', name: 'Company' },
+      },
       isAuthenticated: true,
     });
     localStorage.setItem('refresh_token', 'ref');
