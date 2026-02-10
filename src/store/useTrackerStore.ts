@@ -728,6 +728,57 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
     try {
       set({ isLoading: true, error: null });
       
+      // FIX: Проверяем актуальный статус entry на сервере перед попыткой возобновления
+      // Это предотвращает ошибку "Only paused entries can be resumed" если entry уже не на паузе
+      try {
+        const activeEntries = await api.getActiveTimeEntries();
+        const serverEntry = activeEntries.find(e => e.id === currentTimeEntry.id);
+        
+        if (serverEntry) {
+          if (serverEntry.status === 'RUNNING') {
+            // Entry уже запущен на сервере - синхронизируем локальное состояние
+            logger.info('RESUME', 'Entry already RUNNING on server, syncing local state');
+            const timerState = await TimerEngineAPI.getState();
+            if (timerState.state !== 'RUNNING') {
+              try {
+                await TimerEngineAPI.resume();
+              } catch (e: any) {
+                if (!e.message?.includes('already running')) {
+                  logger.warn('RESUME', 'Failed to resume Timer Engine', e);
+                }
+              }
+            }
+            set({
+              currentTimeEntry: serverEntry,
+              isPaused: false,
+              isTracking: true,
+              isLoading: false,
+              error: null,
+              idlePauseStartTime: null,
+            });
+            return;
+          } else if (serverEntry.status === 'STOPPED') {
+            // Entry остановлен на сервере - синхронизируем локальное состояние
+            logger.info('RESUME', 'Entry is STOPPED on server, syncing local state');
+            set({
+              currentTimeEntry: null,
+              isPaused: false,
+              isTracking: false,
+              isLoading: false,
+              error: null,
+              idlePauseStartTime: null,
+            });
+            return;
+          } else if (serverEntry.status !== 'PAUSED') {
+            // Entry в неожиданном статусе
+            throw new Error(`Entry status on server is ${serverEntry.status}, expected PAUSED`);
+          }
+        }
+      } catch (syncError: any) {
+        logger.warn('RESUME', 'Failed to check server entry status, proceeding with resume', syncError);
+        // Продолжаем попытку возобновления - возможно, это временная проблема сети
+      }
+      
       // Сохраняем в очередь синхронизации (offline-first)
       const accessToken = api.getAccessToken();
       const refreshToken = localStorage.getItem('refresh_token');
