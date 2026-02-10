@@ -11,6 +11,8 @@ import { invoke } from '@tauri-apps/api/core';
 import type { Update } from '@tauri-apps/plugin-updater';
 import { listen } from '@tauri-apps/api/event';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from './components/ui/tabs';
+import { Button } from './components/ui/button';
+import { LogOut } from 'lucide-react';
 import { logger } from './lib/logger';
 import { setSentryUser } from './lib/sentry';
 import { setCurrentUser } from './lib/current-user';
@@ -18,8 +20,8 @@ import { USER_ROLES } from './lib/api';
 import './App.css';
 
 function App() {
-  const { isAuthenticated, user } = useAuthStore();
-  const { loadActiveTimeEntry } = useTrackerStore();
+  const { isAuthenticated, user, logout } = useAuthStore();
+  const { loadActiveTimeEntry, reset } = useTrackerStore();
   const [updateAvailable, setUpdateAvailable] = useState<{ version: string; body?: string } | null>(null);
   const pendingUpdateRef = useRef<Update | null>(null);
 
@@ -1166,13 +1168,27 @@ function App() {
         )}
         <Tabs defaultValue="tracker" className="flex flex-col h-full">
           {/* Header - macOS-style segmented control */}
-          <div className="px-6 pt-3 pb-2.5 border-b">
+          <div className="px-6 pt-3 pb-2.5 border-b flex items-center justify-between">
             <TabsList className="w-auto">
               <TabsTrigger value="tracker">Трекер</TabsTrigger>
               {user && (user.role === USER_ROLES.OWNER || user.role === USER_ROLES.ADMIN) && (
                 <TabsTrigger value="settings">Настройки</TabsTrigger>
               )}
             </TabsList>
+            {user && (
+              <Button
+                onClick={async () => {
+                  await logout();
+                  await reset();
+                }}
+                variant="ghost"
+                size="sm"
+                className="gap-2 h-8"
+              >
+                <LogOut className="h-3.5 w-3.5" />
+                Log out
+              </Button>
+            )}
           </div>
           
           {/* Main Content - Таймер как главный элемент */}

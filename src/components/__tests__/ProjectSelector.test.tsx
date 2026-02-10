@@ -59,12 +59,12 @@ describe('ProjectSelector', () => {
     expect(screen.getByText(/Loading/i)).toBeInTheDocument();
   });
 
-  it('shows error and Повторить when error', () => {
+  it('shows error and Retry when error', () => {
     defaultState.error = 'Network error';
     defaultState.projects = [];
     render(<ProjectSelector />);
     expect(screen.getByText('Network error')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /повторить/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /retry/i })).toBeInTheDocument();
   });
 
   it('shows No projects when projects empty', () => {

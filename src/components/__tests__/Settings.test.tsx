@@ -26,13 +26,22 @@ vi.mock('../../store/useTrackerStore', () => ({
   ),
 }));
 
-let mockUserRole = 'owner';
+const hoistedUserRole = vi.hoisted(() => ({
+  mockUserRole: 'OWNER', // Используем строковое значение, так как импорт еще не выполнен
+}));
 
 vi.mock('../../store/useAuthStore', () => ({
   useAuthStore: (selector: (s: unknown) => unknown) => {
+    // Читаем актуальное значение роли из hoisted объекта
     const state = {
       logout: hoisted.mockLogout,
-      user: { id: '1', name: 'U', email: 'u@u.com', role: mockUserRole, company: { name: 'Company' } },
+      user: { 
+        id: '1', 
+        name: 'U', 
+        email: 'u@u.com', 
+        role: hoistedUserRole.mockUserRole, 
+        company: { name: 'Company' } 
+      },
     };
     return selector ? selector(state) : state;
   },
@@ -57,7 +66,7 @@ vi.mock('../../lib/logger', () => ({
 describe('Settings', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mockUserRole = 'owner'; // Сбрасываем роль на owner по умолчанию
+    hoistedUserRole.mockUserRole = 'OWNER'; // Сбрасываем роль на OWNER по умолчанию
     hoisted.mockInvoke.mockImplementation((cmd: string) => {
       if (cmd === 'get_sync_queue_stats') {
         return Promise.resolve({ pending_count: 0, failed_count: 0, sent_count: 0, pending_by_type: {} });
@@ -112,8 +121,8 @@ describe('Settings', () => {
   });
 
   it('shows access denied message for non-admin users', async () => {
-    // Устанавливаем роль 'user' (не owner/admin)
-    mockUserRole = 'user';
+    // Устанавливаем роль 'EMPLOYEE' (не OWNER/ADMIN)
+    hoistedUserRole.mockUserRole = 'EMPLOYEE';
 
     render(<Settings />);
     await waitFor(() => {
