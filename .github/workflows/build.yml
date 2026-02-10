@@ -34,7 +34,7 @@ jobs:
           name: Hubnity v${{ steps.read_version.outputs.version }}
           body: See the assets to download this version and install.
           draft: true
-          skip_duplicate: true
+          # Если release с таким тегом уже существует, action автоматически обновит его
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -105,4 +105,5 @@ jobs:
           releaseBody: ${{ github.event_name == 'push' && 'See the assets to download this version and install.' || '' }}
           releaseDraft: true
           prerelease: false
+          # tauri-action автоматически создаст latest.json для updater при сборке
           args: ${{ matrix.args }}
