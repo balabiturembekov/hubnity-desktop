@@ -90,6 +90,7 @@ export interface HeartbeatResponse {
   timestamp: string;
 }
 
+/** Ответ GET /screenshots/time-entry/{timeEntryId} — бэкенд не возвращает userId */
 export interface Screenshot {
   id: string;
   timeEntryId: string;
@@ -97,7 +98,8 @@ export interface Screenshot {
   thumbnailUrl: string;
   timestamp: string;
   createdAt: string;
-  userId?: string; // ID пользователя, который создал скриншот (для фильтрации)
+  /** Опционально: если бэкенд добавит — фильтруем по текущему пользователю */
+  userId?: string;
 }
 
 export interface UrlActivity {

@@ -10,31 +10,12 @@ import {
   DialogTitle,
 } from './ui/dialog';
 import { logger } from '../lib/logger';
-import { getCurrentUser } from '../lib/current-user';
 
-/** Скриншот может содержать userId от API — фильтруем по текущему пользователю */
-function filterScreenshotsByCurrentUser(list: Screenshot[]): Screenshot[] {
-  const user = getCurrentUser();
-  if (!user) {
-    // Если пользователь не авторизован, не показываем скриншоты (безопасность)
-    logger.warn('SCREENSHOTS_VIEW', 'No current user, filtering all screenshots');
-    return [];
-  }
-  
-  const filtered = list.filter((s) => {
-    const uid = s.userId;
-    // FIX: Показываем только скриншоты текущего пользователя
-    // Если userId не определен, НЕ показываем (безопасность - лучше скрыть, чем показать чужой)
-    return uid !== undefined && uid === user.id;
-  });
-  
-  if (filtered.length !== list.length) {
-    logger.warn('SCREENSHOTS_VIEW', `Filtered ${list.length - filtered.length} screenshots from other users (or without userId)`);
-  }
-  
-  return filtered;
-}
-
+/**
+ * Скриншоты получаем по timeEntryId текущей записи.
+ * Бэкенд GET /screenshots/time-entry/{timeEntryId} возвращает только скриншоты этой записи;
+ * доступ к записи проверяется на бэкенде — пользователь видит только свои.
+ */
 interface ScreenshotsViewProps {
   timeEntryId: string | null;
 }
@@ -62,11 +43,8 @@ export function ScreenshotsView({ timeEntryId }: ScreenshotsViewProps) {
     setIsLoading(true);
     setError(null);
     try {
-      const raw = await useTrackerStore.getState().getScreenshots(timeEntryId);
-      const data = filterScreenshotsByCurrentUser(raw);
-      console.log('[Screenshots] loadScreenshots', timeEntryId, '→', data.length, 'items', data);
+      const data = await useTrackerStore.getState().getScreenshots(timeEntryId);
       setScreenshots(data);
-      // Автоматически разворачиваем, если есть скриншоты
       if (data.length > 0) {
         setIsExpanded(true);
       }
@@ -82,9 +60,7 @@ export function ScreenshotsView({ timeEntryId }: ScreenshotsViewProps) {
     if (!timeEntryId) return;
     setIsRefreshing(true);
     try {
-      const raw = await useTrackerStore.getState().getScreenshots(timeEntryId);
-      const data = filterScreenshotsByCurrentUser(raw);
-      console.log('[Screenshots] refreshScreenshots', timeEntryId, '→', data.length, 'items');
+      const data = await useTrackerStore.getState().getScreenshots(timeEntryId);
       setScreenshots(data);
       if (expandIfNew && data.length > 0) {
         setIsExpanded(true);
