@@ -743,10 +743,9 @@ pub async fn set_auth_tokens(
             .set_app_meta("current_user_id", new_id)
             .map_err(|e| format!("Failed to set current user: {}", e))?;
     } else if new_id.is_empty() && !current_id.is_empty() && !has_tokens {
-        // Logout: сбрасываем таймер и очищаем current_user_id, чтобы следующий вход не видел старый state
-        engine
-            .reset_state()
-            .map_err(|e| format!("Failed to reset timer on logout: {}", e))?;
+        // Logout: НЕ сбрасываем таймер - активный time entry продолжает работать на сервере
+        // При повторном входе loadActiveTimeEntry() восстановит активный time entry и синхронизирует Timer Engine
+        // Очищаем только current_user_id для безопасности
         sync_manager
             .db
             .set_app_meta("current_user_id", "")

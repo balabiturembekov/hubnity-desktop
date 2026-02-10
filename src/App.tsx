@@ -1178,8 +1178,24 @@ function App() {
             {user && (
               <Button
                 onClick={async () => {
+                  // При logout не вызываем reset() - это позволит восстановить таймер при повторном входе
+                  // Timer Engine в Rust будет сброшен через set_auth_tokens, но активный time entry на сервере продолжит работать
+                  // При login loadActiveTimeEntry() восстановит активный time entry и синхронизирует Timer Engine
                   await logout();
-                  await reset();
+                  // Очищаем только локальное UI состояние, не останавливая таймер на сервере
+                  const { useTrackerStore } = await import('./store/useTrackerStore');
+                  const store = useTrackerStore.getState();
+                  store.set({
+                    projects: [],
+                    selectedProject: null,
+                    currentTimeEntry: null,
+                    isTracking: false,
+                    isPaused: false,
+                    isLoading: false,
+                    error: null,
+                    idlePauseStartTime: null,
+                    urlActivities: [],
+                  });
                 }}
                 variant="ghost"
                 size="sm"
