@@ -19,6 +19,8 @@ import { setCurrentUser } from './lib/current-user';
 import { USER_ROLES } from './lib/api';
 import './App.css';
 
+const RELEASES_URL = 'https://github.com/balabiturembekov/hubnity-desktop/releases';
+
 function App() {
   const { isAuthenticated, user, logout } = useAuthStore();
   const { loadActiveTimeEntry } = useTrackerStore();
@@ -333,11 +335,27 @@ function App() {
       await update.downloadAndInstall();
       await relaunch();
     } catch (e) {
-      logger.error('APP', 'Update install failed', e);
+      const err = e instanceof Error ? e : new Error(String(e));
+      logger.error('APP', `Update install failed: ${err.message}`, err);
       await invoke('show_notification', {
         title: 'Hubnity',
         body: 'Не удалось установить обновление. Попробуйте скачать с сайта.',
       }).catch(() => {});
+      try {
+        const { openUrl } = await import('@tauri-apps/plugin-opener');
+        await openUrl(RELEASES_URL);
+      } catch {
+        // ignore
+      }
+    }
+  }, []);
+
+  const openReleasesPage = useCallback(async () => {
+    try {
+      const { openUrl } = await import('@tauri-apps/plugin-opener');
+      await openUrl(RELEASES_URL);
+    } catch (e) {
+      logger.error('APP', 'Failed to open releases page', e);
     }
   }, []);
 
@@ -1164,13 +1182,22 @@ function App() {
             <span className="text-sm">
               Доступна новая версия {updateAvailable.version}. {updateAvailable.body ?? ''}
             </span>
-            <button
-              type="button"
-              onClick={installUpdate}
-              className="shrink-0 px-3 py-1 rounded bg-primary-foreground text-primary text-sm font-medium hover:opacity-90"
-            >
-              Установить
-            </button>
+            <div className="shrink-0 flex items-center gap-2">
+              <button
+                type="button"
+                onClick={openReleasesPage}
+                className="px-3 py-1 rounded bg-primary-foreground/80 text-primary text-sm font-medium hover:bg-primary-foreground"
+              >
+                Скачать вручную
+              </button>
+              <button
+                type="button"
+                onClick={installUpdate}
+                className="px-3 py-1 rounded bg-primary-foreground text-primary text-sm font-medium hover:opacity-90"
+              >
+                Установить
+              </button>
+            </div>
           </div>
         )}
         <Tabs defaultValue="tracker" className="flex flex-col h-full">
