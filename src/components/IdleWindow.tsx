@@ -225,7 +225,7 @@ export function IdleWindow() {
           className="gap-2 flex-1 h-10 transition-colors duration-300"
         >
           <RotateCcw className="h-4 w-4" />
-          Возобновить
+          Resume
         </Button>
         
         {/* Secondary: Стоп */}
@@ -237,7 +237,7 @@ export function IdleWindow() {
           className="gap-2 h-10 px-4 bg-destructive-soft hover:bg-destructive-soft-hover transition-colors duration-300"
         >
           <Square className="h-4 w-4" />
-          Стоп
+          Stop
         </Button>
       </div>
       

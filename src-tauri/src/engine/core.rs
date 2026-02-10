@@ -55,7 +55,7 @@ impl TimerEngine {
         // Обновляем last_updated_at в БД
         // НЕ возобновляем RUNNING автоматически - безопаснее оставить PAUSED
         if let Err(e) = self.save_state() {
-            eprintln!("[WAKE] Failed to save state after wake: {}", e);
+            error!("[WAKE] Failed to save state after wake: {}", e);
         }
 
         eprintln!(
@@ -104,7 +104,7 @@ impl TimerEngine {
 
                 // Сохраняем состояние в БД
                 if let Err(e) = self.save_state() {
-                    eprintln!("[TIMER] Failed to save state after start: {}", e);
+                    error!("[TIMER] Failed to save state after start: {}", e);
                 }
 
                 Ok(())
@@ -126,7 +126,7 @@ impl TimerEngine {
 
                 // FIX: Сохраняем состояние в БД (как в других переходах start())
                 if let Err(e) = self.save_state() {
-                    eprintln!(
+                    error!(
                         "[TIMER] Failed to save state after start (Paused→Running): {}",
                         e
                     );
@@ -202,7 +202,7 @@ impl TimerEngine {
                         // ДОКАЗАНО: Сохранение не удалось - accumulated НЕ обновлен в памяти
                         // State уже изменен на Paused, но accumulated остался старым
                         // Это безопаснее, чем обновить accumulated до сохранения
-                        eprintln!("[TIMER] Failed to save state after pause: {}", e);
+                        error!("[TIMER] Failed to save state after pause: {}", e);
                         // Возвращаем ошибку, чтобы вызывающий код знал о проблеме
                         return Err(format!("Failed to save state after pause: {}", e));
                     }
@@ -252,7 +252,7 @@ impl TimerEngine {
 
                 // FIX: Сохраняем состояние в БД (как в start(), pause(), stop())
                 if let Err(e) = self.save_state() {
-                    eprintln!("[TIMER] Failed to save state after resume: {}", e);
+                    error!("[TIMER] Failed to save state after resume: {}", e);
                 }
 
                 Ok(())
@@ -327,7 +327,7 @@ impl TimerEngine {
                     }
                     Err(e) => {
                         // ДОКАЗАНО: Сохранение не удалось - accumulated НЕ обновлен
-                        eprintln!("[TIMER] Failed to save state after stop: {}", e);
+                        error!("[TIMER] Failed to save state after stop: {}", e);
                         return Err(format!("Failed to save state after stop: {}", e));
                     }
                 }
@@ -341,7 +341,7 @@ impl TimerEngine {
 
                 // Сохраняем состояние в БД
                 if let Err(e) = self.save_state() {
-                    eprintln!("[TIMER] Failed to save state after stop: {}", e);
+                    error!("[TIMER] Failed to save state after stop: {}", e);
                 }
 
                 Ok(())
@@ -446,12 +446,24 @@ impl TimerEngine {
             TimerState::Paused => TimerStateForAPI::Paused,
         };
 
+        // Этап 4: прочитать и сбросить флаг «восстановлено из RUNNING» (показать уведомление один раз)
+        let restored_from_running = self
+            .restored_from_running
+            .lock()
+            .map(|mut f| {
+                let v = *f;
+                *f = false;
+                v
+            })
+            .unwrap_or(false);
+
         Ok(TimerStateResponse {
             state: state_for_response,
             elapsed_seconds,
             accumulated_seconds: accumulated,
             session_start,
             day_start,
+            restored_from_running,
         })
     }
 

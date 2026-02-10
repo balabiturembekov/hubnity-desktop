@@ -590,9 +590,11 @@ mod tests {
             // Тест: Если rollover вызывается несколько раз → no-op
             let engine = TimerEngine::new();
 
-            // Симулируем смену дня
-            let yesterday_start = Utc::now()
-                .checked_sub_signed(chrono::Duration::hours(25))
+            // Симулируем смену дня (вчера по локальному времени)
+            let yesterday = Local::now().date_naive() - chrono::Duration::days(1);
+            let yesterday_start = yesterday
+                .and_hms_opt(0, 0, 0)
+                .and_then(|ndt| ndt.and_local_timezone(Local).earliest())
                 .unwrap()
                 .timestamp() as u64;
 
@@ -613,16 +615,16 @@ mod tests {
 
             assert_eq!(first_run_ts, second_run_ts, "Second call must be no-op");
 
-            // Проверяем, что день обновлен на сегодня
-            let today = Utc::now().date_naive();
+            // Проверяем, что день обновлен на сегодня (локальная дата)
+            let today_local = Local::now().date_naive();
             let day_start = *engine.day_start_timestamp.lock().unwrap();
-            let day_start_date =
-                chrono::DateTime::<Utc>::from_timestamp(day_start.unwrap() as i64, 0)
-                    .unwrap()
-                    .date_naive();
+            let day_start_date = chrono::DateTime::<Utc>::from_timestamp(day_start.unwrap() as i64, 0)
+                .unwrap()
+                .with_timezone(&Local)
+                .date_naive();
             assert_eq!(
-                day_start_date, today,
-                "Engine UTC date must match current UTC date"
+                day_start_date, today_local,
+                "Engine local date must match current local date"
             );
         }
 

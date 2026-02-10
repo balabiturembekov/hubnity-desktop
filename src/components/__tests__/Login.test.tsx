@@ -49,8 +49,8 @@ describe('Login', () => {
     render(<Login />);
     
     expect(screen.getByLabelText(/email/i)).toBeInTheDocument();
-    expect(screen.getByLabelText(/пароль/i)).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /войти/i })).toBeInTheDocument();
+    expect(screen.getByLabelText(/password/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /sign in/i })).toBeInTheDocument();
   });
 
   it('handles successful login', async () => {
@@ -61,8 +61,8 @@ describe('Login', () => {
     render(<Login />);
     
     const emailInput = screen.getByLabelText(/email/i);
-    const passwordInput = screen.getByLabelText(/пароль/i);
-    const submitButton = screen.getByRole('button', { name: /войти/i });
+    const passwordInput = screen.getByLabelText(/password/i);
+    const submitButton = screen.getByRole('button', { name: /sign in/i });
     
     await user.type(emailInput, 'test@example.com');
     await user.type(passwordInput, 'password123');
@@ -91,8 +91,8 @@ describe('Login', () => {
     render(<Login />);
     
     const emailInput = screen.getByLabelText(/email/i);
-    const passwordInput = screen.getByLabelText(/пароль/i);
-    const submitButton = screen.getByRole('button', { name: /войти/i });
+    const passwordInput = screen.getByLabelText(/password/i);
+    const submitButton = screen.getByRole('button', { name: /sign in/i });
     
     await user.type(emailInput, 'test@example.com');
     await user.type(passwordInput, 'wrongpassword');
@@ -112,8 +112,8 @@ describe('Login', () => {
     render(<Login />);
     
     const emailInput = screen.getByLabelText(/email/i);
-    const passwordInput = screen.getByLabelText(/пароль/i);
-    const submitButton = screen.getByRole('button', { name: /войти/i });
+    const passwordInput = screen.getByLabelText(/password/i);
+    const submitButton = screen.getByRole('button', { name: /sign in/i });
     
     await user.type(emailInput, 'test@example.com');
     await user.type(passwordInput, 'password123');
@@ -137,8 +137,8 @@ describe('Login', () => {
     render(<Login />);
     
     const emailInput = screen.getByLabelText(/email/i);
-    const passwordInput = screen.getByLabelText(/пароль/i);
-    const submitButton = screen.getByRole('button', { name: /войти/i });
+    const passwordInput = screen.getByLabelText(/password/i);
+    const submitButton = screen.getByRole('button', { name: /sign in/i });
     
     await user.type(emailInput, '  test@example.com  ');
     await user.type(passwordInput, '  password123  ');

@@ -17,6 +17,8 @@ pub struct TimerEngine {
     pub(crate) day_start_timestamp: Arc<Mutex<Option<u64>>>,
     /// База данных для персистентности
     pub(crate) db: Option<Arc<Database>>,
+    /// Этап 4: true если состояние было восстановлено из "running" как Paused (показать уведомление один раз)
+    pub(crate) restored_from_running: Arc<Mutex<bool>>,
 }
 /// Состояние таймера - строгая FSM
 /// Невозможные состояния физически невозможны
@@ -41,6 +43,9 @@ pub struct TimerStateResponse {
     pub accumulated_seconds: u64,   // Накопленное время за день
     pub session_start: Option<u64>, // Unix timestamp начала сессии (только для Running)
     pub day_start: Option<u64>,     // Unix timestamp начала дня
+    /// true если таймер был восстановлен из RUNNING как PAUSED после перезапуска (показать уведомление)
+    #[serde(default)]
+    pub restored_from_running: bool,
 }
 
 /// Упрощенная версия TimerState для API (без Instant)
@@ -62,6 +67,7 @@ impl TimerEngine {
             accumulated_seconds: Arc::new(Mutex::new(0)),
             day_start_timestamp: Arc::new(Mutex::new(None)),
             db: None,
+            restored_from_running: Arc::new(Mutex::new(false)),
         }
     }
 }

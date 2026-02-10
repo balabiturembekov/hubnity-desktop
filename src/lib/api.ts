@@ -3,6 +3,16 @@ import { logger } from './logger';
 
 const API_BASE_URL = 'https://app.automatonsoft.de/api';
 
+// Роли пользователей (значения, которые приходят с сервера)
+// ВАЖНО: Если сервер возвращает другие значения, нужно обновить эти константы
+export const USER_ROLES = {
+  OWNER: 'OWNER',
+  ADMIN: 'ADMIN',
+  USER: 'EMPLOYEE',
+} as const;
+
+export type UserRole = typeof USER_ROLES[keyof typeof USER_ROLES];
+
 export interface LoginRequest {
   email: string;
   password: string;

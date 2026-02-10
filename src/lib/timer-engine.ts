@@ -8,7 +8,7 @@
  * Соответствует Rust TimerStateForAPI с #[serde(flatten)]
  * Из-за flatten, поля enum разворачиваются в TimerStateResponse
  */
-export type TimerStateResponse = 
+export type TimerStateResponse = (
   | {
       state: 'STOPPED';
       elapsed_seconds: number;
@@ -30,7 +30,11 @@ export type TimerStateResponse =
       accumulated_seconds: number;
       session_start: null;
       day_start: number | null;
-    };
+    }
+) & {
+  /** Этап 4: true если таймер восстановлен из RUNNING как PAUSED после перезапуска (показать уведомление один раз) */
+  restored_from_running?: boolean;
+};
 
 /**
  * Timer Engine API - вызывает Rust команды

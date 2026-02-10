@@ -19,16 +19,18 @@ export function ProjectSelector() {
   const handleSelect = (projectId: string) => {
     const project = projects.find((p) => p.id === projectId);
     if (project) {
-      selectProject(project);
+      selectProject(project).catch(() => {
+        // Ошибка уже в store (error), UI покажет
+      });
     }
   };
 
   // Inline формат без Card обертки - macOS-style
   return (
     <div className="flex items-center gap-2.5 px-1 py-1.5">
-      <span className="text-xs text-muted-foreground/70 whitespace-nowrap">Проект:</span>
+      <span className="text-xs text-muted-foreground/70 whitespace-nowrap">Project:</span>
       {isLoading ? (
-        <span className="text-sm text-muted-foreground">Загрузка...</span>
+        <span className="text-sm text-muted-foreground">Loading...</span>
       ) : error ? (
         <div className="flex items-center gap-2">
           <span className="text-sm text-destructive">{error}</span>
@@ -36,11 +38,11 @@ export function ProjectSelector() {
             onClick={() => loadProjects()}
             className="text-xs text-primary underline hover:no-underline"
           >
-            Повторить
+            Retry
           </button>
         </div>
       ) : projects.length === 0 ? (
-        <span className="text-sm text-muted-foreground">Нет проектов</span>
+        <span className="text-sm text-muted-foreground">No projects</span>
       ) : (
         <Select
           value={selectedProject?.id || ''}

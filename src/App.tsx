@@ -14,10 +14,11 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from './components/ui/tabs';
 import { logger } from './lib/logger';
 import { setSentryUser } from './lib/sentry';
 import { setCurrentUser } from './lib/current-user';
+import { USER_ROLES } from './lib/api';
 import './App.css';
 
 function App() {
-  const { isAuthenticated } = useAuthStore();
+  const { isAuthenticated, user } = useAuthStore();
   const { loadActiveTimeEntry } = useTrackerStore();
   const [updateAvailable, setUpdateAvailable] = useState<{ version: string; body?: string } | null>(null);
   const pendingUpdateRef = useRef<Update | null>(null);
@@ -196,12 +197,25 @@ function App() {
 
     const syncTimerState = async () => {
       try {
+        const { currentTimeEntry, isTracking } = useTrackerStore.getState();
+        
+        // Если локально нет активной записи и таймер остановлен, не нужно синхронизировать
+        if (!currentTimeEntry && !isTracking) {
+          return;
+        }
+        
         const { api } = await import('./lib/api');
         const activeEntries = await api.getActiveTimeEntries();
         
         if (activeEntries.length > 0) {
           const activeEntry = activeEntries[0];
-          const { getTimerState } = useTrackerStore.getState();
+          const { getTimerState, currentTimeEntry: currentEntry } = useTrackerStore.getState();
+          
+          // Если нет currentTimeEntry, не синхронизируем остановку (уже остановлено локально)
+          if (!currentEntry) {
+            return;
+          }
+          
           const timerState = await getTimerState();
           
           // Синхронизируем состояние таймера с сервером
@@ -221,6 +235,7 @@ function App() {
             });
           } else if (activeEntry.status === 'STOPPED' && timerState.state !== 'STOPPED') {
             // На сервере STOPPED, но локально не STOPPED - останавливаем
+            // currentEntry уже проверен выше
             logger.info('APP', 'Syncing timer: server is STOPPED, stopping local timer');
             const { stopTracking } = useTrackerStore.getState();
             await stopTracking().catch((e) => {
@@ -229,7 +244,11 @@ function App() {
           }
         } else {
           // Нет активных записей на сервере, но локально таймер работает - останавливаем
-          const { getTimerState } = useTrackerStore.getState();
+          // Проверяем, что есть currentTimeEntry перед остановкой
+          const { currentTimeEntry: currentEntry, getTimerState } = useTrackerStore.getState();
+          if (!currentEntry) {
+            return; // Уже остановлено локально
+          }
           const timerState = await getTimerState();
           if (timerState.state !== 'STOPPED') {
             logger.info('APP', 'Syncing timer: no active entries on server, stopping local timer');
@@ -245,8 +264,8 @@ function App() {
       }
     };
 
-    // Первая проверка через 5 секунд после монтирования
-    const initialTimeout = setTimeout(syncTimerState, 5000);
+    // Первая проверка через 30 секунд (не останавливать только что восстановленный таймер сразу)
+    const initialTimeout = setTimeout(syncTimerState, 30000);
     // Затем каждые 10 секунд
     const interval = setInterval(syncTimerState, 10000);
 
@@ -1150,7 +1169,9 @@ function App() {
           <div className="px-6 pt-3 pb-2.5 border-b">
             <TabsList className="w-auto">
               <TabsTrigger value="tracker">Трекер</TabsTrigger>
-              <TabsTrigger value="settings">Настройки</TabsTrigger>
+              {user && (user.role === USER_ROLES.OWNER || user.role === USER_ROLES.ADMIN) && (
+                <TabsTrigger value="settings">Настройки</TabsTrigger>
+              )}
             </TabsList>
           </div>
           
@@ -1167,9 +1188,11 @@ function App() {
             </div>
           </TabsContent>
           
-          <TabsContent value="settings" className="flex-1 overflow-y-auto p-4 m-0">
-            <Settings />
-          </TabsContent>
+          {user && (user.role === USER_ROLES.OWNER || user.role === USER_ROLES.ADMIN) && (
+            <TabsContent value="settings" className="flex-1 overflow-y-auto p-4 m-0">
+              <Settings />
+            </TabsContent>
+          )}
           
           {/* Footer - Синхронизация (ненавязчиво) */}
           <div className="px-6 py-3 border-t bg-muted/30">

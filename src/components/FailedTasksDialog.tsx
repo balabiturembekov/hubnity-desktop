@@ -66,7 +66,7 @@ export function FailedTasksDialog({
       onRetry(); // Обновляем индикатор синхронизации
       // Показываем уведомление
       await invoke('show_notification', {
-        title: 'Повторная синхронизация',
+        title: 'Retry synchronization',
         body: `Сброшено ${count} задач для повторной попытки`,
       });
     } catch (err: any) {

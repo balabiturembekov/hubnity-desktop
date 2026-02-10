@@ -54,4 +54,3 @@ unexpected_cfgs = "allow"
 [package.metadata.rust-analyzer]
 # Tauri sets cfg(desktop) at build time; rust-analyzer needs it for desktop-only code (updater, process)
 rustc-flags = ["--cfg", "desktop"]
-

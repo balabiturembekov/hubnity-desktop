@@ -176,7 +176,7 @@ describe('Timer', () => {
     });
     
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: /старт/i })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /start/i })).toBeInTheDocument();
     });
   });
 
@@ -214,8 +214,8 @@ describe('Timer', () => {
     });
     
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: /пауза/i })).toBeInTheDocument();
-      expect(screen.getByRole('button', { name: /стоп/i })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /pause/i })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /stop/i })).toBeInTheDocument();
     });
   });
 
@@ -252,8 +252,8 @@ describe('Timer', () => {
     });
     
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: /возобновить/i })).toBeInTheDocument();
-      expect(screen.getByRole('button', { name: /стоп/i })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /resume/i })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /stop/i })).toBeInTheDocument();
     });
   });
 
@@ -286,7 +286,7 @@ describe('Timer', () => {
     });
     
     await waitFor(async () => {
-      const startButton = screen.getByRole('button', { name: /старт/i });
+      const startButton = screen.getByRole('button', { name: /start/i });
       await user.click(startButton);
     });
     
@@ -337,10 +337,10 @@ describe('Timer', () => {
     
     // Wait for timer state to update and buttons to render
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: /пауза/i })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /pause/i })).toBeInTheDocument();
     }, { timeout: 3000 });
     
-    const pauseButton = screen.getByRole('button', { name: /пауза/i });
+    const pauseButton = screen.getByRole('button', { name: /pause/i });
     await act(async () => {
       await user.click(pauseButton);
     });
@@ -388,15 +388,62 @@ describe('Timer', () => {
     
     // Wait for timer state to update and buttons to render
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: /возобновить/i })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /resume/i })).toBeInTheDocument();
     }, { timeout: 5000 });
     
-    const resumeButton = screen.getByRole('button', { name: /возобновить/i });
+    const resumeButton = screen.getByRole('button', { name: /resume/i });
     await user.click(resumeButton);
     
     await waitFor(() => {
       expect(hoisted.mockResumeTracking).toHaveBeenCalled();
     });
+  });
+
+  /** Этап 1: защита от повторных кликов — при двойном клике start вызывается только один раз */
+  it('calls startTracking only once on double click (debounce / isProcessing)', async () => {
+    const user = userEvent.setup();
+    let resolveStart: () => void;
+    const startPromise = new Promise<void>((r) => { resolveStart = r; });
+    hoisted.mockStartTracking.mockImplementation(() => startPromise);
+
+    const { useTrackerStore } = await import('../../store/useTrackerStore');
+    vi.mocked(useTrackerStore).mockImplementation((selector: any) => {
+      const state = {
+        selectedProject: { id: '1', name: 'Test Project', color: '#000000', description: '', clientName: '', budget: 0, status: 'ACTIVE' as const, companyId: '', createdAt: '', updatedAt: '' },
+        isTracking: false,
+        isPaused: false,
+        currentTimeEntry: null,
+        isLoading: false,
+        error: null,
+        isTakingScreenshot: false,
+        idlePauseStartTime: null,
+        startTracking: hoisted.mockStartTracking,
+        stopTracking: hoisted.mockStopTracking,
+        pauseTracking: hoisted.mockPauseTracking,
+        resumeTracking: hoisted.mockResumeTracking,
+        getTimerState: () => hoisted.getTimerStateImpl.current(),
+        resetDay: () => hoisted.getTimerStateImpl.current(),
+        setState: hoisted.mockSetState,
+      };
+      return selector ? selector(state) : state;
+    });
+
+    await act(async () => {
+      render(<Timer />);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /start/i })).toBeInTheDocument();
+    });
+
+    const startButton = screen.getByRole('button', { name: /start/i });
+    await user.dblClick(startButton);
+
+    await waitFor(() => {
+      expect(hoisted.mockStartTracking).toHaveBeenCalledTimes(1);
+    });
+
+    resolveStart!();
   });
 
   it('calls stopTracking when stop button is clicked', async () => {
@@ -438,10 +485,10 @@ describe('Timer', () => {
     
     // Wait for timer state to update and buttons to render
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: /стоп/i })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /stop/i })).toBeInTheDocument();
     }, { timeout: 5000 });
     
-    const stopButton = screen.getByRole('button', { name: /стоп/i });
+    const stopButton = screen.getByRole('button', { name: /stop/i });
     await user.click(stopButton);
     
     await waitFor(() => {

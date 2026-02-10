@@ -23,7 +23,7 @@ export interface TrackerState {
   // Actions
   loadProjects: () => Promise<void>;
   loadActiveTimeEntry: () => Promise<void>;
-  selectProject: (project: Project) => void;
+  selectProject: (project: Project) => Promise<void>;
   startTracking: (description?: string) => Promise<void>;
   pauseTracking: (isIdlePause?: boolean) => Promise<void>;
   resumeTracking: () => Promise<void>;
@@ -216,17 +216,20 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
     }
   },
 
-  selectProject: (project: Project) => {
+  selectProject: async (project: Project) => {
     const { isTracking, currentTimeEntry } = get();
-    
-    // Warn if changing project while tracking (but allow it - user might want to switch)
+    // Этап 2: при смене проекта во время трекинга сначала останавливаем таймер (как в Hubstaff)
     if (isTracking && currentTimeEntry) {
-      logger.warn('START', `Changing project while tracking. Current entry project: ${currentTimeEntry.project?.id}, New project: ${project.id}`);
-      // Note: We don't prevent this, but it might cause confusion
-      // The currentTimeEntry.project will remain different from selectedProject
+      logger.info('SELECT_PROJECT', 'Stopping tracking before switching project');
+      try {
+        await get().stopTracking();
+      } catch (e) {
+        logger.error('SELECT_PROJECT', 'Failed to stop tracking before project switch', e);
+        set({ error: 'Не удалось остановить таймер перед сменой проекта' });
+        throw e;
+      }
     }
-    
-    set({ selectedProject: project });
+    set({ selectedProject: project, error: null });
   },
 
   startTracking: async (description?: string) => {
@@ -812,10 +815,6 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
 
   stopTracking: async () => {
     const { currentTimeEntry, isLoading: currentLoading, isTracking } = get();
-    if (!currentTimeEntry) {
-      await logger.safeLogToRust('[STOP] No current time entry, skipping');
-      return;
-    }
     
     // Prevent multiple simultaneous calls
     if (currentLoading) {
@@ -824,7 +823,27 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
     
     // Prevent stopping if already stopped
     if (!isTracking) {
-      await logger.safeLogToRust('[STOP] Already stopped, skipping');
+      return;
+    }
+    
+    // Если нет currentTimeEntry, но таймер работает - просто останавливаем движок
+    // Это может произойти при синхронизации после того, как запись уже остановлена
+    if (!currentTimeEntry) {
+      // Останавливаем только Timer Engine, без API вызова и без логирования
+      try {
+        await TimerEngineAPI.stop();
+        await invoke('stop_activity_monitoring');
+        set({
+          isTracking: false,
+          isPaused: false,
+          isLoading: false,
+          error: null,
+          idlePauseStartTime: null,
+        });
+      } catch (e) {
+        // Игнорируем ошибки - это нормально если таймер уже остановлен
+        logger.debug('STOP', 'Failed to stop timer engine (non-critical)', e);
+      }
       return;
     }
 
@@ -1239,7 +1258,12 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
   },
 
   saveTimerState: async () => {
-    await TimerEngineAPI.saveState();
+    try {
+      await TimerEngineAPI.saveState();
+    } catch (e) {
+      logger.error('STORE', 'Failed to save timer state (backend)', e);
+      throw e;
+    }
   },
   getTimerState: async () => TimerEngineAPI.getState(),
   sendHeartbeat: async (active: boolean) => {

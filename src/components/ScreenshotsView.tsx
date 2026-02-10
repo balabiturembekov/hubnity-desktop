@@ -10,6 +10,21 @@ import {
   DialogTitle,
 } from './ui/dialog';
 import { logger } from '../lib/logger';
+import { getCurrentUser } from '../lib/current-user';
+
+/** Скриншот может содержать userId от API — фильтруем по текущему пользователю */
+function filterScreenshotsByCurrentUser(list: Screenshot[]): Screenshot[] {
+  const user = getCurrentUser();
+  if (!user) return list;
+  const filtered = list.filter((s) => {
+    const uid = (s as Screenshot & { userId?: string }).userId;
+    return uid === undefined || uid === user.id;
+  });
+  if (filtered.length !== list.length) {
+    logger.warn('SCREENSHOTS_VIEW', `Filtered ${list.length - filtered.length} screenshots from other users`);
+  }
+  return filtered;
+}
 
 interface ScreenshotsViewProps {
   timeEntryId: string | null;
@@ -38,7 +53,8 @@ export function ScreenshotsView({ timeEntryId }: ScreenshotsViewProps) {
     setIsLoading(true);
     setError(null);
     try {
-      const data = await useTrackerStore.getState().getScreenshots(timeEntryId);
+      const raw = await useTrackerStore.getState().getScreenshots(timeEntryId);
+      const data = filterScreenshotsByCurrentUser(raw);
       console.log('[Screenshots] loadScreenshots', timeEntryId, '→', data.length, 'items', data);
       setScreenshots(data);
       // Автоматически разворачиваем, если есть скриншоты
@@ -57,7 +73,8 @@ export function ScreenshotsView({ timeEntryId }: ScreenshotsViewProps) {
     if (!timeEntryId) return;
     setIsRefreshing(true);
     try {
-      const data = await useTrackerStore.getState().getScreenshots(timeEntryId);
+      const raw = await useTrackerStore.getState().getScreenshots(timeEntryId);
+      const data = filterScreenshotsByCurrentUser(raw);
       console.log('[Screenshots] refreshScreenshots', timeEntryId, '→', data.length, 'items');
       setScreenshots(data);
       if (expandIfNew && data.length > 0) {
@@ -127,7 +144,7 @@ export function ScreenshotsView({ timeEntryId }: ScreenshotsViewProps) {
           <div className="flex items-center gap-2">
             <Camera className="h-3.5 w-3.5 text-muted-foreground/60" />
             <span className="text-xs text-muted-foreground/70 group-hover:text-muted-foreground transition-colors">
-              Скриншоты
+              Screenshots
             </span>
             {screenshots.length > 0 && (
               <span className="text-xs text-muted-foreground/50">
@@ -136,7 +153,7 @@ export function ScreenshotsView({ timeEntryId }: ScreenshotsViewProps) {
             )}
             {/* P1.3: Subtle hint для снижения тревожности */}
             <span className="text-xs text-muted-foreground/40 italic ml-0.5">
-              (автоматически)
+              (automatically)
             </span>
             {(isLoading || isRefreshing) && (
               <Loader2 className="h-3 w-3 animate-spin text-muted-foreground/50" />
@@ -158,7 +175,7 @@ export function ScreenshotsView({ timeEntryId }: ScreenshotsViewProps) {
             {isLoading ? (
               <div className="flex items-center justify-center py-6">
                 <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
-                <span className="ml-2 text-xs text-muted-foreground">Загрузка...</span>
+                <span className="ml-2 text-xs text-muted-foreground">Loading...</span>
               </div>
             ) : error ? (
               <div className="text-xs text-destructive py-4 text-center">
@@ -174,7 +191,7 @@ export function ScreenshotsView({ timeEntryId }: ScreenshotsViewProps) {
               </div>
             ) : screenshots.length === 0 ? (
               <div className="text-xs text-muted-foreground text-center py-4">
-                Скриншоты появятся здесь после первого снимка
+                Screenshots will appear here after the first screenshot
               </div>
             ) : (
               <div className="grid grid-cols-4 gap-2">
@@ -210,7 +227,7 @@ export function ScreenshotsView({ timeEntryId }: ScreenshotsViewProps) {
       <Dialog open={!!selectedScreenshot} onOpenChange={(open) => !open && setSelectedScreenshot(null)}>
         <DialogContent className="max-w-4xl max-h-[90vh] overflow-auto">
           <DialogHeader>
-            <DialogTitle>Скриншот</DialogTitle>
+            <DialogTitle>Screenshot</DialogTitle>
             <DialogDescription>
               {selectedScreenshot && new Date(selectedScreenshot.timestamp).toLocaleString()}
             </DialogDescription>

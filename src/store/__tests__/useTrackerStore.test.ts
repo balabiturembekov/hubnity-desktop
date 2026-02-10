@@ -9,6 +9,8 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { useTrackerStore } from '../useTrackerStore';
+import { logger } from '../../lib/logger';
+import { TimerEngineAPI } from '../../lib/timer-engine';
 
 // Mock dependencies before imports
 const mockInvoke = vi.fn();
@@ -386,6 +388,40 @@ describe('useTrackerStore', () => {
       // When only engine fails, store still updates from API (isTracking true); either error or tracking set
       const state = useTrackerStore.getState();
       expect(state.error != null || state.isTracking === true).toBeTruthy();
+    });
+  });
+
+  /** Этап 2: при смене проекта во время трекинга сначала вызывается stopTracking, затем выставляется новый проект */
+  describe('selectProject while tracking', () => {
+    it('stops tracking then sets new project when switching project during tracking', async () => {
+      const project1 = { id: '1', name: 'Project A', color: '#000000', description: '', clientName: '', budget: 0, status: 'ACTIVE' as const, companyId: '', createdAt: '', updatedAt: '' };
+      const project2 = { id: '2', name: 'Project B', color: '#111111', description: '', clientName: '', budget: 0, status: 'ACTIVE' as const, companyId: '', createdAt: '', updatedAt: '' };
+      await useTrackerStore.getState().selectProject(project1);
+      await useTrackerStore.getState().startTracking();
+      expect(useTrackerStore.getState().isTracking).toBe(true);
+      expect(useTrackerStore.getState().currentTimeEntry).toBeTruthy();
+
+      const currentEntry = useTrackerStore.getState().currentTimeEntry;
+      mockStopTimeEntry.mockResolvedValueOnce({ ...currentEntry, status: 'STOPPED' });
+
+      await useTrackerStore.getState().selectProject(project2);
+
+      expect(mockStopTimer).toHaveBeenCalled();
+      expect(mockStopTimeEntry).toHaveBeenCalled();
+      const state = useTrackerStore.getState();
+      expect(state.selectedProject?.id).toBe(project2.id);
+      expect(state.isTracking).toBe(false);
+      expect(state.currentTimeEntry).toBeNull();
+    });
+  });
+
+  /** Этап 3: при ошибке save_timer_state store логирует и пробрасывает ошибку (не глотает) */
+  describe('saveTimerState', () => {
+    it('throws and logs when backend save_timer_state fails', async () => {
+      const err = new Error('Failed to save state to DB');
+      vi.mocked(TimerEngineAPI.saveState).mockRejectedValueOnce(err);
+      await expect(useTrackerStore.getState().saveTimerState()).rejects.toThrow();
+      expect(logger.error).toHaveBeenCalledWith('STORE', 'Failed to save timer state (backend)', err);
     });
   });
 

@@ -76,10 +76,10 @@ export function Login() {
       <Card className="w-full max-w-md border shadow-sm">
         <CardHeader className="pb-6 pt-8">
           <CardTitle className="text-2xl text-center font-semibold tracking-tight">
-            Вход в систему
+            Welcome back!
           </CardTitle>
           <CardDescription className="text-center text-muted-foreground/80 mt-2">
-            Введите ваши учетные данные
+            Enter your credentials to access your account
           </CardDescription>
         </CardHeader>
         <CardContent className="px-8 pb-8">
@@ -106,11 +106,12 @@ export function Login() {
             </div>
             <div className="space-y-2">
               <Label htmlFor="password" className="text-sm font-medium">
-                Пароль
+                password
               </Label>
               <Input
                 id="password"
                 type="password"
+                placeholder="********"
                 value={password}
                 onChange={(e) => {
                   setPassword(e.target.value);
@@ -133,7 +134,7 @@ export function Login() {
               className="w-full h-10 mt-2 transition-colors duration-300" 
               disabled={isLoading}
             >
-              {isLoading ? 'Вход...' : 'Войти'}
+              {isLoading ? 'Loading...' : 'Sign in'}
             </Button>
           </form>
         </CardContent>

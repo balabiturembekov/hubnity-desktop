@@ -7,7 +7,7 @@ import { Button } from './ui/button';
 import { LogOut, Check, RefreshCw, Database } from 'lucide-react';
 import { useAuthStore } from '../store/useAuthStore';
 import { logger } from '../lib/logger';
-import { api } from '../lib/api';
+import { api, USER_ROLES } from '../lib/api';
 import { invoke } from '@tauri-apps/api/core';
 
 interface QueueStats {
@@ -25,6 +25,24 @@ export function Settings() {
   const [saved, setSaved] = useState(false);
   const [queueStats, setQueueStats] = useState<QueueStats | null>(null);
   const [isLoadingStats, setIsLoadingStats] = useState(false);
+
+  // Проверка прав доступа: только owner или admin могут видеть настройки
+  // Используем константы USER_ROLES для проверки (case-sensitive, как приходит с сервера)
+  const hasAccess = user && (user.role === USER_ROLES.OWNER || user.role === USER_ROLES.ADMIN);
+
+  if (!hasAccess) {
+    return (
+      <div className="space-y-3">
+        <Card className="border-2">
+          <CardContent className="pt-6">
+            <p className="text-sm text-muted-foreground text-center">
+              У вас нет доступа к настройкам. Доступ разрешен только для владельцев и администраторов.
+            </p>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
 
   // Sync local state with store when idleThreshold changes
   useEffect(() => {
@@ -91,7 +109,7 @@ export function Settings() {
       
       // Show notification
       await invoke('show_notification', {
-        title: 'Настройки сохранены',
+        title: 'Settings saved',
         body: `Порог неактивности установлен: ${validThreshold} ${validThreshold === 1 ? 'минута' : validThreshold < 5 ? 'минуты' : 'минут'}`,
       }).catch((e) => {
         logger.warn('SETTINGS', 'Failed to show notification (non-critical)', e);
@@ -119,7 +137,7 @@ export function Settings() {
     <div className="space-y-3">
       <Card className="border-2">
         <CardHeader className="pb-3">
-          <CardTitle className="text-base">Настройки</CardTitle>
+          <CardTitle className="text-base">Settings</CardTitle>
         </CardHeader>
         <CardContent className="space-y-3 pt-0">
           <div className="space-y-2">
@@ -151,7 +169,7 @@ export function Settings() {
                 ) : saved ? (
                   <>
                     <Check className="h-3.5 w-3.5 mr-1" />
-                    Сохранено
+                    Saved
                   </>
                 ) : (
                   'Сохранить'
@@ -167,13 +185,13 @@ export function Settings() {
 
       <Card className="border-2">
         <CardHeader className="pb-3">
-          <CardTitle className="text-base">Профиль</CardTitle>
+          <CardTitle className="text-base">Profile</CardTitle>
         </CardHeader>
         <CardContent className="space-y-3 pt-0">
           {user && (
             <div className="space-y-2.5">
               <div>
-                <Label className="text-xs text-muted-foreground">Имя</Label>
+                <Label className="text-xs text-muted-foreground">Name</Label>
                 <p className="text-sm font-medium mt-0.5">{user.name}</p>
               </div>
               <div>
@@ -181,7 +199,7 @@ export function Settings() {
                 <p className="text-sm font-medium mt-0.5">{user.email}</p>
               </div>
               <div>
-                <Label className="text-xs text-muted-foreground">Компания</Label>
+                <Label className="text-xs text-muted-foreground">Company</Label>
                 <p className="text-sm font-medium mt-0.5">{user.company.name}</p>
               </div>
             </div>
@@ -195,7 +213,7 @@ export function Settings() {
             className="gap-2 w-full h-9 mt-2"
           >
             <LogOut className="h-3.5 w-3.5" />
-            Выйти
+            Log out
           </Button>
         </CardContent>
       </Card>
@@ -205,7 +223,7 @@ export function Settings() {
           <div className="flex items-center justify-between">
             <CardTitle className="text-base flex items-center gap-2">
               <Database className="h-4 w-4" />
-              Синхронизация
+              Synchronization
             </CardTitle>
             <Button
               onClick={() => loadQueueStats(true)}
@@ -222,11 +240,11 @@ export function Settings() {
           {queueStats ? (
             <div className="space-y-2.5">
               <div className="flex items-center justify-between text-sm">
-                <span className="text-muted-foreground">В очереди:</span>
+                <span className="text-muted-foreground">In queue:</span>
                 <span className="font-medium">{queueStats.pending_count}</span>
               </div>
               <div className="flex items-center justify-between text-sm">
-                <span className="text-muted-foreground">Ошибки:</span>
+                <span className="text-muted-foreground">Errors:</span>
                 <span className={`font-medium ${queueStats.failed_count > 0 ? 'text-destructive' : ''}`}>
                   {queueStats.failed_count}
                 </span>
@@ -251,7 +269,7 @@ export function Settings() {
               {queueStats.pending_count > 0 && queueStats.sent_count === 0 && (
                 <div className="pt-2 border-t space-y-1">
                   <p className="text-xs font-medium text-amber-600 dark:text-amber-500">
-                    Для синхронизации нужен вход в аккаунт.
+                    To synchronize, you need to log in to your account.
                   </p>
                   <p className="text-xs text-muted-foreground">
                     Если в логах «access_token present=false» — выйдите из аккаунта и войдите снова (вкладка «Трекер» → выход, затем логин). После входа счётчик начнёт расти.

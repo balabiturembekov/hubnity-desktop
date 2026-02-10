@@ -75,19 +75,19 @@ export function Timer() {
     return () => clearInterval(interval);
   }, []);
 
-  // Проверка смены дня
+  // Проверка смены дня (локальная дата — как в Rust ensure_correct_day)
   useEffect(() => {
     const checkDayChange = async () => {
       if (!timerState?.day_start) return;
-      
+
       const dayStartTimestamp = timerState.day_start;
       const today = new Date();
-      const todayUTC = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()));
-      const dayStartDateUTC = new Date(dayStartTimestamp * 1000);
-      const dayStartUTC = new Date(Date.UTC(dayStartDateUTC.getUTCFullYear(), dayStartDateUTC.getUTCMonth(), dayStartDateUTC.getUTCDate()));
-      
-      const isDifferentDay = todayUTC.getTime() !== dayStartUTC.getTime();
-      
+      const todayLocal = new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime();
+      const dayStartDate = new Date(dayStartTimestamp * 1000);
+      const dayStartLocal = new Date(dayStartDate.getFullYear(), dayStartDate.getMonth(), dayStartDate.getDate()).getTime();
+
+      const isDifferentDay = todayLocal !== dayStartLocal;
+
       if (isDifferentDay) {
         try {
           const newState = await useTrackerStore.getState().resetDay();
@@ -185,7 +185,7 @@ export function Timer() {
       return {
         state: 'RUNNING' as const,
         color: 'text-timer-running dark:text-timer-running-dark',
-        statusText: 'Отслеживается',
+        statusText: 'Tracking',
         statusColor: 'bg-timer-running dark:bg-timer-running-dark',
       };
     }
@@ -193,14 +193,14 @@ export function Timer() {
       return {
         state: 'PAUSED' as const,
         color: 'text-muted-foreground',
-        statusText: idlePauseStartTime ? 'Приостановлено (нет активности)' : 'Приостановлено',
+        statusText: idlePauseStartTime ? 'Paused (no activity)' : 'Paused',
         statusColor: 'bg-muted-foreground/40',
       };
     }
     return {
       state: 'STOPPED' as const,
       color: 'text-muted-foreground',
-      statusText: 'Не запущено',
+      statusText: 'Not started',
       statusColor: undefined,
     };
   };
@@ -212,7 +212,7 @@ export function Timer() {
     return (
       <div className="flex flex-col items-center justify-center py-16 px-4">
         <p className="text-sm text-muted-foreground text-center">
-          Выберите проект для начала отслеживания
+          Choose a project to start tracking
         </p>
       </div>
     );
@@ -223,8 +223,15 @@ export function Timer() {
       {/* Error message */}
       {error && (
         <div className="w-full max-w-md p-3 rounded-md bg-destructive/10 border border-destructive/20 animate-in fade-in">
-          <div className="text-xs font-medium text-destructive mb-0.5">Ошибка</div>
+          <div className="text-xs font-medium text-destructive mb-0.5">Error</div>
           <div className="text-xs text-destructive/80">{error}</div>
+        </div>
+      )}
+
+      {/* Этап 4: уведомление при восстановлении RUNNING → PAUSED после перезапуска */}
+      {timerState?.state === 'PAUSED' && timerState?.restored_from_running && (
+        <div className="w-full max-w-md p-3 rounded-md bg-muted/50 border border-muted-foreground/20 text-center text-sm text-muted-foreground animate-in fade-in">
+          Timer was paused after restarting the application. Click "Resume" to continue.
         </div>
       )}
       
@@ -280,7 +287,7 @@ export function Timer() {
                 className="gap-2 px-6 h-10 text-sm rounded-md"
               >
                 <Play className="h-4 w-4" />
-                Старт
+                Start
               </Button>
             );
           }
@@ -298,7 +305,7 @@ export function Timer() {
                   className="gap-2 px-6 h-10 text-sm rounded-md"
                 >
                   <RotateCcw className="h-4 w-4" />
-                  Возобновить
+                  Resume
                 </Button>
               ) : (
                 <Button
@@ -309,7 +316,7 @@ export function Timer() {
                   className="gap-2 px-6 h-10 text-sm rounded-md"
                 >
                   <Pause className="h-4 w-4" />
-                  Пауза
+                  Pause
                 </Button>
               )}
               <Button
@@ -319,7 +326,7 @@ export function Timer() {
                 className="gap-2 px-6 h-10 text-sm rounded-md bg-destructive-soft hover:bg-destructive-softHover text-white"
               >
                 <Square className="h-4 w-4" />
-                Стоп
+                Stop
               </Button>
             </>
           );

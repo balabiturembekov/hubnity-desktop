@@ -71,6 +71,7 @@ impl TimerEngine {
             accumulated_seconds: Arc::new(Mutex::new(0)),
             day_start_timestamp: Arc::new(Mutex::new(None)),
             db: Some(db),
+            restored_from_running: Arc::new(Mutex::new(false)),
         };
 
         // Восстанавливаем состояние из БД
@@ -157,22 +158,28 @@ impl TimerEngine {
                     }
 
                     // Восстанавливаем состояние
-                    let state = match state_str.as_str() {
-                        "stopped" => TimerState::Stopped,
-                        "paused" => TimerState::Paused,
+                    let (state, set_restored_flag) = match state_str.as_str() {
+                        "stopped" => (TimerState::Stopped, false),
+                        "paused" => (TimerState::Paused, false),
                         "running" => {
                             // Если было running, восстанавливаем как paused (безопаснее)
-                            // Пользователь может возобновить вручную
-                            TimerState::Paused
+                            // Пользователь может возобновить вручную (этап 4: покажем уведомление)
+                            (TimerState::Paused, true)
                         }
                         _ => {
                             warn!(
                                 "[RECOVERY] Unknown state '{}', defaulting to Stopped",
                                 state_str
                             );
-                            TimerState::Stopped
+                            (TimerState::Stopped, false)
                         }
                     };
+
+                    if set_restored_flag {
+                        if let Ok(mut flag) = self.restored_from_running.lock() {
+                            *flag = true;
+                        }
+                    }
 
                     match self.state.lock() {
                         Ok(mut state_mutex) => *state_mutex = state,
@@ -237,6 +244,9 @@ impl TimerEngine {
                 .lock()
                 .map_err(|e| format!("Mutex poisoned: {}", e))?;
             *day = None;
+        }
+        if let Ok(mut flag) = self.restored_from_running.lock() {
+            *flag = false;
         }
         let db = match &self.db {
             Some(db) => db,
