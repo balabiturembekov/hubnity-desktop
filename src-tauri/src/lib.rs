@@ -133,10 +133,23 @@ pub fn run() {
             // ДОКАЗАНО: Это гарантирует, что состояние сохранено даже при force quit
             let engine_for_periodic = engine_arc.clone();
             std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
-                    eprintln!("[TIMER] Failed to create runtime for periodic save: {}", e);
-                    std::process::exit(1);
-                });
+                // BUG FIX: Graceful degradation вместо process::exit(1)
+                // Если не удается создать runtime, логируем ошибку и выходим из потока
+                // Приложение продолжит работу без периодического сохранения
+                let rt = match tokio::runtime::Runtime::new() {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        error!(
+                            "[TIMER] CRITICAL: Failed to create runtime for periodic save: {}. \
+                            Periodic saving disabled. Application will continue but timer state \
+                            will only be saved on explicit save operations or window close.",
+                            e
+                        );
+                        // Выходим из потока, но не завершаем приложение
+                        // Пользователь все еще может использовать приложение
+                        return;
+                    }
+                };
                 rt.block_on(async {
                     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
                     loop {

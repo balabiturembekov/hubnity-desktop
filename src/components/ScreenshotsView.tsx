@@ -114,20 +114,27 @@ export function ScreenshotsView({ timeEntryId }: ScreenshotsViewProps) {
   useEffect(() => {
     if (!timeEntryId) return;
 
+    // BUG FIX: Store timeout IDs to clean them up on unmount
+    const timeoutIds: NodeJS.Timeout[] = [];
+
     const handleScreenshotUploaded = () => {
       console.log('[Screenshots] screenshot:uploaded received, scheduling refetch');
       // Сразу один запрос (если отправка была напрямую на сервер); затем — после sync (Rust кладёт в очередь).
       const delays = [500, 2000, 5000, 12000];
       delays.forEach((delayMs) => {
-        setTimeout(() => {
+        const timeoutId = setTimeout(() => {
           refreshScreenshots(true);
         }, delayMs);
+        timeoutIds.push(timeoutId);
       });
     };
 
     window.addEventListener('screenshot:uploaded', handleScreenshotUploaded);
     return () => {
       window.removeEventListener('screenshot:uploaded', handleScreenshotUploaded);
+      // BUG FIX: Clean up all timeouts when component unmounts to prevent memory leaks
+      timeoutIds.forEach(id => clearTimeout(id));
+      timeoutIds.length = 0; // Clear array
     };
   }, [timeEntryId, refreshScreenshots]);
 

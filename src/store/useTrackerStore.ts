@@ -110,7 +110,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       }
 
       {
-        let activeEntry: TimeEntry;
+        let activeEntry: TimeEntry | undefined;
         
         // FIX: Если несколько активных записей, выбираем самую свежую и останавливаем остальные
         // NOTE: userEntries уже отфильтрованы по userId текущего пользователя
@@ -123,6 +123,12 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           );
           
           // Выбираем самую свежую запись
+          // BUG FIX: Ensure array is not empty before accessing (defensive check)
+          if (sortedEntries.length === 0) {
+            logger.error('LOAD', 'sortedEntries is empty after sorting, this should not happen');
+            await get().clearTrackingStateFromServer();
+            return;
+          }
           activeEntry = sortedEntries[0];
           
           // Останавливаем все остальные активные записи (дубликаты)
@@ -145,6 +151,12 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           }
         } else {
           // Только одна активная запись - используем её
+          // BUG FIX: Ensure array is not empty before accessing
+          if (userEntries.length === 0) {
+            logger.error('LOAD', 'userEntries is empty in else branch, this should not happen');
+            await get().clearTrackingStateFromServer();
+            return;
+          }
           activeEntry = userEntries[0];
         }
         
@@ -269,7 +281,11 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         });
       }
     } catch (error: any) {
-      // Silently fail - active entry might not exist
+      // BUG FIX: Log error instead of silently failing
+      // Silent failures hide important issues like network errors or API changes
+      logger.error('LOAD', 'Failed to load active time entry', error);
+      // Don't clear state on error - might be temporary network issue
+      // User can retry or sync will happen on next poll
     }
   },
 
@@ -352,6 +368,12 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           );
           
           // Выбираем самую свежую запись
+          // BUG FIX: Ensure array is not empty before accessing
+          if (sortedEntries.length === 0) {
+            logger.error('START', 'sortedEntries is empty after sorting, this should not happen');
+            set({ error: 'Invalid active entries data', isLoading: false });
+            return;
+          }
           activeEntry = sortedEntries[0];
           
           // Останавливаем все остальные активные записи (дубликаты)
@@ -371,6 +393,12 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           }
         } else {
           // Только одна активная запись - используем её
+          // BUG FIX: Ensure array is not empty before accessing
+          if (activeEntries.length === 0) {
+            logger.error('START', 'activeEntries is empty in else branch, this should not happen');
+            set({ error: 'Invalid active entries data', isLoading: false });
+            return;
+          }
           activeEntry = activeEntries[0];
         }
         
@@ -623,7 +651,13 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         try {
           const activeEntries = await api.getActiveTimeEntries();
           if (activeEntries.length > 0) {
+            // BUG FIX: Ensure array is not empty before accessing
             const activeEntry = activeEntries[0];
+            if (!activeEntry) {
+              logger.error('START', 'activeEntries[0] is undefined, this should not happen');
+              set({ error: 'Invalid active entries data', isLoading: false });
+              return;
+            }
             const timerState = await TimerEngineAPI.getState();
             set({
               currentTimeEntry: activeEntry,

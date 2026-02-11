@@ -336,7 +336,11 @@ impl SyncManager {
 
         loop {
             let response_result = if entity_type.starts_with("time_entry_") {
-                let operation = entity_type.strip_prefix("time_entry_").unwrap();
+                // BUG FIX: Use expect with clear error message instead of unwrap to prevent panic
+                // This should never fail because we check starts_with above, but defensive programming
+                let operation = entity_type.strip_prefix("time_entry_").expect(
+                    "BUG: strip_prefix failed after starts_with check - this should never happen"
+                );
                 let builder = self.send_time_entry_request(
                     operation,
                     &payload_json,

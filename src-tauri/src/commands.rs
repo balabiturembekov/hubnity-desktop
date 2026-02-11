@@ -326,8 +326,9 @@ pub async fn take_screenshot(_time_entry_id: String) -> Result<Vec<u8>, String> 
         return Err("No screens available".to_string());
     }
 
-    // Use first screen without cloning (more efficient)
-    let screen = &screens[0];
+    // BUG FIX: Use safe access method instead of indexing to prevent panic
+    // This should never fail because we check is_empty above, but defensive programming
+    let screen = screens.first().expect("BUG: screens is empty after is_empty check - this should never happen");
 
     // Capture screenshot
     let image = screen.capture().map_err(|e| {
@@ -680,17 +681,14 @@ pub async fn get_active_window_info() -> Result<ActiveWindowInfo, String> {
 
         // Разделяем результат: "AppName|WindowTitle"
         let parts: Vec<&str> = result.split('|').collect();
-        let app_name = if parts.len() > 0 && !parts[0].is_empty() {
-            Some(parts[0].to_string())
-        } else {
-            None
-        };
-
-        let window_title = if parts.len() > 1 && !parts[1].is_empty() {
-            Some(parts[1].to_string())
-        } else {
-            None
-        };
+        // BUG FIX: Use safe access methods instead of indexing to prevent panic
+        let app_name = parts.first()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        
+        let window_title = parts.get(1)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
 
         // Извлекаем URL и domain из window_title (если это браузер)
         let (url, domain) = if let Some(ref title) = window_title {
