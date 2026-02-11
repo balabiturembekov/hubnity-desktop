@@ -1242,6 +1242,7 @@ function App() {
                   // При login loadActiveTimeEntry() восстановит активный time entry и синхронизирует Timer Engine
                   await logout();
                   // Очищаем только локальное UI состояние, не останавливая таймер на сервере
+                  // BUG FIX: Also reset lastActivityTime to prevent stale idle detection on next login
                   const { useTrackerStore } = await import('./store/useTrackerStore');
                   useTrackerStore.setState({
                     projects: [],
@@ -1252,6 +1253,7 @@ function App() {
                     isLoading: false,
                     error: null,
                     idlePauseStartTime: null,
+                    lastActivityTime: Date.now(), // Reset to current time to prevent stale idle detection
                     urlActivities: [],
                   });
                 }}
