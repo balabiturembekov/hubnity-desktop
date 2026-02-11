@@ -306,11 +306,39 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       throw new Error('User not authenticated');
     }
 
+    // BUG FIX: Set isLoading immediately after checks to prevent race condition
+    // This ensures no other call can start between the check and the set
+    set({ isLoading: true, error: null });
+    
+    // Double-check after setting isLoading (race condition protection)
+    // Verify that isLoading was actually set (another call might have set it between check and set)
+    const stateAfterLock = get();
+    if (stateAfterLock.isLoading !== true) {
+      // Another call modified state between our check and set - abort
+      logger.warn('START', 'Race condition detected: state changed between check and set');
+      return;
+    }
+
     try {
-      set({ isLoading: true, error: null });
-      
       // Check for active time entries first
       const activeEntries = await api.getActiveTimeEntries();
+      
+      // SECURITY: Filter out entries that don't belong to current user
+      const currentUser = getCurrentUser();
+      if (currentUser) {
+        const userEntries = activeEntries.filter(entry => entry.userId === currentUser.id);
+        const foreignEntries = activeEntries.filter(entry => entry.userId !== currentUser.id);
+        
+        if (foreignEntries.length > 0) {
+          logger.error('START', `SECURITY: Found ${foreignEntries.length} active time entries belonging to other users. Current user: ${currentUser.id}, Foreign entries: ${foreignEntries.map(e => `${e.id} (user: ${e.userId})`).join(', ')}`);
+        }
+        
+        // Use only user's entries
+        if (userEntries.length > 0) {
+          activeEntries.length = 0;
+          activeEntries.push(...userEntries);
+        }
+      }
       if (activeEntries.length > 0) {
         let activeEntry: TimeEntry;
         
@@ -737,8 +765,24 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
             timeEntry = currentTimeEntry; // Fallback
           }
         } else {
-          // Другая ошибка - пробрасываем дальше
-          throw apiError;
+          // Другая ошибка API - но проверяем Timer Engine состояние перед пробросом
+          // Если Timer Engine успешно паузился, синхронизируем состояние, а не пробрасываем ошибку
+          const currentTimerState = await TimerEngineAPI.getState().catch(() => null);
+          if (currentTimerState?.state === 'PAUSED') {
+            // Timer Engine успешно паузился - используем его состояние, игнорируем API ошибку
+            logger.warn('PAUSE', 'API failed but Timer Engine paused successfully - syncing state');
+            timerState = currentTimerState;
+            // Получаем актуальное состояние entry с сервера для обновления
+            try {
+              const activeEntries = await api.getActiveTimeEntries();
+              timeEntry = activeEntries.find(e => e.id === currentTimeEntry.id) || currentTimeEntry;
+            } catch {
+              timeEntry = currentTimeEntry; // Fallback
+            }
+          } else {
+            // Timer Engine не на паузе - пробрасываем ошибку API
+            throw apiError;
+          }
         }
       }
       
@@ -861,8 +905,17 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       return;
     }
 
+    // BUG FIX: Set isLoading immediately to prevent race condition
+    set({ isLoading: true, error: null });
+    
+    // Double-check after setting isLoading (race condition protection)
+    const stateAfterLock = get();
+    if (stateAfterLock.isLoading !== true) {
+      logger.warn('RESUME', 'Race condition detected: state changed between check and set');
+      return;
+    }
+
     try {
-      set({ isLoading: true, error: null });
       
       // FIX: Проверяем актуальный статус entry на сервере перед попыткой возобновления
       // Это предотвращает ошибку "Only paused entries can be resumed" если entry уже не на паузе
@@ -942,12 +995,15 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       }
       
       // Возобновляем Timer Engine в Rust
+      let timerState: import('../lib/timer-engine').TimerStateResponse | null = null;
       try {
-        await TimerEngineAPI.resume();
+        timerState = await TimerEngineAPI.resume();
       } catch (timerError: any) {
-        // Если таймер уже запущен, это нормально
-        if (!timerError.message?.includes('already running')) {
-          // Другая ошибка - показываем toast
+        // Если таймер уже запущен, получаем текущее состояние
+        if (timerError.message?.includes('already running')) {
+          timerState = await TimerEngineAPI.getState();
+        } else {
+          // Другая ошибка - показываем toast, но пытаемся получить состояние
           const { invoke } = await import('@tauri-apps/api/core');
           await invoke('show_notification', {
             title: 'Ошибка таймера',
@@ -955,6 +1011,29 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           }).catch((e) => {
             logger.warn('RESUME', 'Failed to show notification (non-critical)', e);
           });
+          // Пытаемся получить текущее состояние Timer Engine
+          timerState = await TimerEngineAPI.getState().catch(() => null);
+        }
+      }
+      
+      // BUG FIX: Если Timer Engine не запустился, но API запись обновлена, синхронизируем состояние
+      if (!timerState || timerState.state !== 'RUNNING') {
+        logger.warn('RESUME', 'Timer Engine not resumed but API entry updated - syncing state');
+        // Пытаемся запустить Timer Engine еще раз
+        try {
+          timerState = await TimerEngineAPI.resume();
+        } catch (retryError: any) {
+          logger.error('RESUME', 'Failed to resume Timer Engine after API success', retryError);
+          // Если не удалось запустить Timer Engine, но запись обновлена, показываем ошибку
+          set({
+            currentTimeEntry: timeEntry,
+            isPaused: false,
+            isTracking: false, // Timer Engine не запущен
+            isLoading: false,
+            error: 'Запись обновлена, но таймер не запущен. Попробуйте возобновить вручную.',
+            idlePauseStartTime: null,
+          });
+          return;
         }
       }
       
@@ -972,11 +1051,11 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         logger.error('RESUME', 'Failed to send heartbeat on resume', heartbeatError);
       }
       
-      // Обновляем UI state
+      // Обновляем UI state на основе Timer Engine (source of truth)
       set({
         currentTimeEntry: timeEntry,
         isPaused: false,
-        isTracking: true,
+        isTracking: timerState?.state === 'RUNNING' || false,
         lastActivityTime: Date.now(),
         isLoading: false,
         error: null,
@@ -1049,6 +1128,16 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       return;
     }
     
+    // BUG FIX: Set isLoading immediately to prevent race condition
+    set({ isLoading: true, error: null });
+    
+    // Double-check after setting isLoading (race condition protection)
+    const stateAfterLock = get();
+    if (stateAfterLock.isLoading !== true) {
+      logger.warn('STOP', 'Race condition detected: state changed between check and set');
+      return;
+    }
+    
     // Если нет currentTimeEntry, но таймер работает - просто останавливаем движок
     // Это может произойти при синхронизации после того, как запись уже остановлена
     if (!currentTimeEntry) {
@@ -1066,12 +1155,14 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       } catch (e) {
         // Игнорируем ошибки - это нормально если таймер уже остановлен
         logger.debug('STOP', 'Failed to stop timer engine (non-critical)', e);
+        // BUG FIX: Always reset isLoading even on error
+        set({ isLoading: false });
       }
       return;
     }
 
     try {
-      set({ isLoading: true, error: null }); // Clear previous errors
+      // isLoading already set above for race condition protection
       
       // Send accumulated URL activities before stopping
       try {
