@@ -3,6 +3,8 @@
  * Frontend НЕ считает время - только получает состояние из Rust
  */
 
+import { invoke } from '@tauri-apps/api/core';
+
 /**
  * Состояние таймера - строгая FSM
  * Соответствует Rust TimerStateForAPI с #[serde(flatten)]
@@ -32,6 +34,8 @@ export type TimerStateResponse = (
       day_start: number | null;
     }
 ) & {
+  /** Секунды за текущий календарный день (для "Today" display). После rollover — только время с полуночи */
+  today_seconds?: number;
   /** Этап 4: true если таймер восстановлен из RUNNING как PAUSED после перезапуска (показать уведомление один раз) */
   restored_from_running?: boolean;
 };
@@ -45,7 +49,6 @@ export class TimerEngineAPI {
    * Начать трекинг (из состояния STOPPED)
    */
   static async start(): Promise<TimerStateResponse> {
-    const { invoke } = await import('@tauri-apps/api/core');
     return await invoke<TimerStateResponse>('start_timer');
   }
 
@@ -53,7 +56,6 @@ export class TimerEngineAPI {
    * Приостановить трекинг (из состояния RUNNING)
    */
   static async pause(): Promise<TimerStateResponse> {
-    const { invoke } = await import('@tauri-apps/api/core');
     return await invoke<TimerStateResponse>('pause_timer');
   }
 
@@ -61,7 +63,6 @@ export class TimerEngineAPI {
    * Возобновить трекинг (из состояния PAUSED)
    */
   static async resume(): Promise<TimerStateResponse> {
-    const { invoke } = await import('@tauri-apps/api/core');
     return await invoke<TimerStateResponse>('resume_timer');
   }
 
@@ -69,7 +70,6 @@ export class TimerEngineAPI {
    * Остановить трекинг (из состояния RUNNING или PAUSED)
    */
   static async stop(): Promise<TimerStateResponse> {
-    const { invoke } = await import('@tauri-apps/api/core');
     return await invoke<TimerStateResponse>('stop_timer');
   }
 
@@ -78,7 +78,6 @@ export class TimerEngineAPI {
    * Frontend должен вызывать это периодически для обновления UI
    */
   static async getState(): Promise<TimerStateResponse> {
-    const { invoke } = await import('@tauri-apps/api/core');
     return await invoke<TimerStateResponse>('get_timer_state');
   }
 
@@ -86,7 +85,6 @@ export class TimerEngineAPI {
    * Сбросить накопленное время за день (при смене дня)
    */
   static async resetDay(): Promise<void> {
-    const { invoke } = await import('@tauri-apps/api/core');
     await invoke('reset_timer_day');
   }
 
@@ -94,7 +92,6 @@ export class TimerEngineAPI {
    * Сохранить состояние таймера в БД (например, при закрытии приложения)
    */
   static async saveState(): Promise<void> {
-    const { invoke } = await import('@tauri-apps/api/core');
     await invoke('save_timer_state');
   }
 }

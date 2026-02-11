@@ -492,8 +492,8 @@ mod tests {
         }
 
         #[test]
-        fn test_day_rollover_stops_running_timer() {
-            // Тест: RUNNING → rollover → state == STOPPED
+        fn test_day_rollover_keeps_running_timer() {
+            // Тест: RUNNING → rollover → state == RUNNING (Hubstaff-style)
             let engine = TimerEngine::new();
 
             // Запускаем таймер
@@ -516,10 +516,11 @@ mod tests {
             // Вызываем ensure_correct_day() - должен произойти rollover
             engine.ensure_correct_day().unwrap();
 
-            // Проверяем, что таймер остановлен
+            // Проверяем, что таймер продолжает работать (Hubstaff-style)
             let state = engine.get_state().unwrap();
-            assert!(matches!(state.state, engine::TimerStateForAPI::Stopped));
-            assert_eq!(state.accumulated_seconds, 0); // Новый день - accumulated обнулен
+            assert!(matches!(state.state, engine::TimerStateForAPI::Running { .. }));
+            // today_seconds = время с полуночи; при rollover <= elapsed (только новая часть дня)
+            assert!(state.today_seconds <= state.elapsed_seconds);
         }
 
         #[test]
@@ -554,8 +555,8 @@ mod tests {
         }
 
         #[test]
-        fn test_day_rollover_after_midnight_elapsed_is_zero() {
-            // Тест: Timer started before midnight → after midnight → elapsed == 0
+        fn test_day_rollover_after_midnight_today_reset() {
+            // Тест: Timer started before midnight → after midnight → today_seconds сброшен, elapsed полный
             let engine = TimerEngine::new();
 
             // Запускаем таймер (это установит day_start на сегодня)
@@ -579,10 +580,12 @@ mod tests {
             // Вызываем ensure_correct_day() - должен произойти rollover
             engine.ensure_correct_day().unwrap();
 
-            // Проверяем, что elapsed == 0 (новый день, таймер остановлен)
+            // Проверяем: таймер работает, today_seconds = время с полуночи
             let state = engine.get_state().unwrap();
-            assert_eq!(state.elapsed_seconds, 0);
-            assert!(matches!(state.state, engine::TimerStateForAPI::Stopped));
+            assert!(matches!(state.state, engine::TimerStateForAPI::Running { .. }));
+            assert!(state.today_seconds <= state.elapsed_seconds);
+            // elapsed_seconds содержит полную длительность (включая до полуночи)
+            assert!(state.elapsed_seconds >= 200 / 1000); // Был sleep 200ms
         }
 
         #[test]

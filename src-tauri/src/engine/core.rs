@@ -2,7 +2,7 @@ use crate::engine::TimerEngine;
 use crate::engine::TimerState;
 use crate::engine::{TimerStateForAPI, TimerStateResponse};
 use chrono::{Local, Utc};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
 
 impl TimerEngine {
@@ -395,6 +395,11 @@ impl TimerEngine {
             .lock()
             .map_err(|e| format!("Mutex poisoned: {}", e))?;
 
+        let now_wall = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
         // Расчет elapsed только для RUNNING состояния
         // Формула: accumulated + (now - started_at_instant)
         // Дополнительно: проверка на sleep (большой пропуск времени)
@@ -409,10 +414,6 @@ impl TimerEngine {
                 // Sleep detection: реальный сон = разрыв между wall-clock и monotonic.
                 // При сне системы monotonic почти не растёт, wall-clock прыгает вперёд.
                 // Раньше ошибочно паузили при session_elapsed > 15 мин (просто долгая сессия).
-                let now_wall = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
                 let wall_elapsed = now_wall.saturating_sub(*started_at);
                 const SLEEP_GAP_THRESHOLD_SECONDS: u64 = 5 * 60; // 5 минут разрыва = сон
                 let is_sleep = wall_elapsed > session_elapsed
@@ -457,12 +458,28 @@ impl TimerEngine {
             })
             .unwrap_or(false);
 
+        // today_seconds: для "Today" display. При rollover (started_at == day_start) — только время с полуночи.
+        let today_seconds = match &*state {
+            TimerState::Running { started_at, .. } => {
+                let rolled_over = day_start.map_or(false, |ds| *started_at == ds);
+                if rolled_over {
+                    day_start
+                        .map(|ds| now_wall.saturating_sub(ds))
+                        .unwrap_or(accumulated)
+                } else {
+                    elapsed_seconds
+                }
+            }
+            TimerState::Paused | TimerState::Stopped => accumulated,
+        };
+
         Ok(TimerStateResponse {
             state: state_for_response,
             elapsed_seconds,
             accumulated_seconds: accumulated,
             session_start,
             day_start,
+            today_seconds,
             restored_from_running,
         })
     }
@@ -655,32 +672,37 @@ impl TimerEngine {
                 );
             }
 
-            // Переводим таймер в STOPPED вручную (без вызова stop_internal, чтобы избежать двойного добавления времени)
+            // Hubstaff-style: НЕ останавливаем таймер — обнуляем Today и продолжаем.
+            // Сохраняем accumulated = time_until_midnight для полной длительности при stop.
+            let elapsed_in_new_day = now_system.saturating_sub(old_day_end);
+            let new_started_at_instant =
+                Instant::now() - Duration::from_secs(elapsed_in_new_day);
+
             let mut state = self
                 .state
                 .lock()
                 .map_err(|e| format!("Mutex poisoned: {}", e))?;
-            *state = TimerState::Stopped;
+            *state = TimerState::Running {
+                started_at: old_day_end,
+                started_at_instant: new_started_at_instant,
+            };
             drop(state);
 
-            // CRITICAL: Сохраняем состояние старого дня (accumulated = итог за старый день) ДО обнуления.
-            // Иначе при следующем save_state() сохранится уже 0 и итог за старый день будет потерян.
-            if let Err(e) = self.save_state() {
-                warn!(
-                    "[DAY_ROLLOVER] Failed to save old day state before zeroing: {}",
-                    e
-                );
-            }
+            info!(
+                "[DAY_ROLLOVER] Timer continues running (Hubstaff-style), Today reset"
+            );
         }
 
-        // Обнуляем accumulated_seconds для нового дня
-        // ВАЖНО: Это делается ПОСЛЕ обработки RUNNING состояния и сохранения старого дня
-        let mut accumulated = self
-            .accumulated_seconds
-            .lock()
-            .map_err(|e| format!("Mutex poisoned: {}", e))?;
-        *accumulated = 0;
-        drop(accumulated);
+        // Обнуляем accumulated_seconds для нового дня (только если НЕ was_running)
+        // При was_running accumulated сохраняем для полной длительности сессии
+        if !was_running {
+            let mut accumulated = self
+                .accumulated_seconds
+                .lock()
+                .map_err(|e| format!("Mutex poisoned: {}", e))?;
+            *accumulated = 0;
+            drop(accumulated);
+        }
 
         // Обновляем day_start_timestamp на новый день (локальная полночь)
         let new_day_start = new_day

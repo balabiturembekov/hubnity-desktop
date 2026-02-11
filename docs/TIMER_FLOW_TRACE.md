@@ -103,15 +103,15 @@ pub async fn pause_timer(engine: State<'_, Arc<TimerEngine>>) -> Result<TimerSta
 
 **Файл:** `src-tauri/src/engine/core.rs`
 
-1. Если состояние было **Running**:
-   - Считается время до полуночи старого дня (`time_until_midnight`), с учётом clock skew (сравнение SystemTime и Instant).
-   - `accumulated_seconds += time_until_midnight` (время «до полуночи» засчитывается в старый день).
-   - Переход в **Stopped**: `state = Stopped`.
-2. `accumulated_seconds = 0` для нового дня.
-3. `day_start_timestamp = Some(new_day_start)` (полночь нового дня в UTC).
+1. Если состояние было **Running** (Hubstaff-style):
+   - Считается время до полуночи старого дня (`time_until_midnight`), с учётом clock skew.
+   - `accumulated_seconds += time_until_midnight` (время «до полуночи» сохраняется для полной длительности при stop).
+   - Остаётся **Running**: `state = Running { started_at: midnight, ... }` — таймер продолжает работать.
+2. `accumulated_seconds = 0` для нового дня (только если НЕ was_running).
+3. `day_start_timestamp = Some(new_day_start)` (полночь нового дня).
 4. `save_state()` — новое состояние в БД.
 
-**Итог:** при первом после полуночи вызове start/pause/stop/get_state день переключается, время до полуночи учтено в старом дне, новый день начинается с нуля.
+**Итог:** при rollover таймер продолжает работать, «Today» обнуляется и показывает время с полуночи.
 
 ---
 

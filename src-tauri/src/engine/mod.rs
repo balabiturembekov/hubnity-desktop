@@ -43,6 +43,8 @@ pub struct TimerStateResponse {
     pub accumulated_seconds: u64,   // Накопленное время за день
     pub session_start: Option<u64>, // Unix timestamp начала сессии (только для Running)
     pub day_start: Option<u64>,     // Unix timestamp начала дня
+    /// Секунды за текущий календарный день (для "Today" display). После rollover — только время с полуночи.
+    pub today_seconds: u64,
     /// true если таймер был восстановлен из RUNNING как PAUSED после перезапуска (показать уведомление)
     #[serde(default)]
     pub restored_from_running: bool,

@@ -1,7 +1,8 @@
 import { useEffect, useState, useRef } from 'react';
 import { Button } from './ui/button';
 import { useTrackerStore, type TimerStateResponse } from '../store/useTrackerStore';
-import { Play, Pause, Square, RotateCcw, Camera } from 'lucide-react';
+import { useSyncStore } from '../store/useSyncStore';
+import { Play, Pause, Square, RotateCcw, Camera, AlertCircle } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { logger } from '../lib/logger';
 import { cn } from '../lib/utils';
@@ -14,9 +15,17 @@ function formatTime(seconds: number): string {
   return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
 }
 
+function formatTimeShort(seconds: number): string {
+  const s = Math.max(0, seconds);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  return h > 0 ? `${h}:${m.toString().padStart(2, '0')}` : `0:${m.toString().padStart(2, '0')}`;
+}
+
 export function Timer() {
   const {
     selectedProject,
+    currentTimeEntry,
     startTracking,
     pauseTracking,
     resumeTracking,
@@ -26,6 +35,7 @@ export function Timer() {
     isTakingScreenshot,
     idlePauseStartTime,
   } = useTrackerStore();
+  const isOnline = useSyncStore((s) => s.status?.is_online ?? true);
 
   // Состояние таймера из Rust (единственный source of truth)
   const [timerState, setTimerState] = useState<TimerStateResponse | null>(null);
@@ -63,7 +73,9 @@ export function Timer() {
           useTrackerStore.setState({
             isTracking: isRunning || isPaused,
             isPaused: isPaused,
-            ...(state.state === 'STOPPED' ? { currentTimeEntry: null } : {}),
+            ...(state.state === 'STOPPED'
+              ? { currentTimeEntry: null, idlePauseStartTime: null }
+              : {}),
           });
         }
         
@@ -191,8 +203,49 @@ export function Timer() {
     setIsProcessing(true);
     try {
       await pauseTracking();
+      // BUG FIX: Force update timer state after pause to sync with Timer Engine
+      // This ensures UI shows correct state even if pause had errors
+      try {
+        const state = await useTrackerStore.getState().getTimerState();
+        if (isMountedRef.current) {
+          setTimerState(state);
+          // Sync store state with Timer Engine
+          const isRunning = state.state === 'RUNNING';
+          const isPaused = state.state === 'PAUSED';
+          const storeState = useTrackerStore.getState();
+          // Clear error if Timer Engine was paused successfully
+          const shouldClearError = isPaused && storeState.error?.includes('pause');
+          useTrackerStore.setState({
+            isTracking: isRunning || isPaused,
+            isPaused: isPaused,
+            ...(shouldClearError ? { error: null } : {}),
+          });
+        }
+      } catch (syncError) {
+        logger.warn('TIMER', 'Failed to sync timer state after pause', syncError);
+      }
     } catch (error) {
       logger.error('TIMER', 'Failed to pause tracking', error);
+      // BUG FIX: Even on error, try to sync state with Timer Engine
+      // If Timer Engine was paused successfully, clear error and sync state
+      try {
+        const state = await useTrackerStore.getState().getTimerState();
+        if (isMountedRef.current) {
+          setTimerState(state);
+          const isRunning = state.state === 'RUNNING';
+          const isPaused = state.state === 'PAUSED';
+          const storeState = useTrackerStore.getState();
+          // Clear error if Timer Engine was paused successfully despite API error
+          const shouldClearError = isPaused && storeState.error?.includes('pause');
+          useTrackerStore.setState({
+            isTracking: isRunning || isPaused,
+            isPaused: isPaused,
+            ...(shouldClearError ? { error: null } : {}),
+          });
+        }
+      } catch (syncError) {
+        logger.warn('TIMER', 'Failed to sync timer state after pause error', syncError);
+      }
     } finally {
       // BUG FIX: Only update state if component is still mounted
       if (isMountedRef.current) {
@@ -239,7 +292,7 @@ export function Timer() {
       return { 
         state: 'STOPPED' as const, 
         color: 'text-muted-foreground', 
-        statusText: 'Не запущено',
+        statusText: 'Not started',
         statusColor: undefined,
       };
     }
@@ -264,38 +317,87 @@ export function Timer() {
     return {
       state: 'STOPPED' as const,
       color: 'text-muted-foreground',
-      statusText: 'Not started',
+        statusText: 'Not started',
       statusColor: undefined,
     };
   };
 
   const timerStateInfo = getTimerState();
   const elapsedSeconds = timerState?.elapsed_seconds ?? 0;
-  const { currentTimeEntry } = useTrackerStore();
+  const totalTodaySeconds = timerState?.today_seconds ?? elapsedSeconds;
 
   // FIX: Показываем таймер если есть active time entry, даже если selectedProject не установлен
   // Это исправляет ситуацию когда таймер работает, но UI показывает "No projects"
   if (!selectedProject && !currentTimeEntry) {
     return (
-      <div className="flex flex-col items-center justify-center py-16 px-4">
-        <p className="text-sm text-muted-foreground text-center">
-          Choose a project to start tracking
+      <div className="flex flex-col items-center justify-center py-20 px-6 max-w-sm mx-auto">
+        <div className="mb-6">
+          <svg
+            width="120"
+            height="120"
+            viewBox="0 0 120 120"
+            fill="none"
+            xmlns="http://www.w3.org/2000/svg"
+            className="text-muted-foreground/40"
+          >
+            <circle cx="60" cy="60" r="50" stroke="currentColor" strokeWidth="2" opacity="0.5" />
+            <circle cx="60" cy="60" r="4" fill="currentColor" opacity="0.6" />
+            <line x1="60" y1="60" x2="60" y2="30" stroke="currentColor" strokeWidth="2" strokeLinecap="round" opacity="0.7" />
+            <line x1="60" y1="60" x2="82" y2="60" stroke="currentColor" strokeWidth="2" strokeLinecap="round" opacity="0.5" />
+            <path d="M60 20 L60 24 M60 96 L60 100 M20 60 L24 60 M96 60 L100 60" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" opacity="0.3" />
+          </svg>
+        </div>
+        <h3 className="text-base font-medium text-foreground mb-1.5">
+          Ready to track time
+        </h3>
+        <p className="text-sm text-muted-foreground text-center mb-4">
+          Select a project above to start the timer and begin tracking your work.
+        </p>
+        <p className="text-xs text-muted-foreground/70 text-center">
+          Projects are loaded from your account. If the list is empty, check your project settings.
         </p>
       </div>
     );
   }
 
   return (
-    <div className="flex flex-col items-center space-y-6 py-8">
-      {/* Error message */}
-      {error && (
-        <div className="w-full max-w-md p-3 rounded-md bg-destructive/10 border border-destructive/20 animate-in fade-in">
-          <div className="text-xs font-medium text-destructive mb-0.5">Error</div>
-          <div className="text-xs text-destructive/80">{error}</div>
+    <div className="flex flex-col items-center space-y-4 py-4">
+      {/* Error message - hide when offline + project selected + timer working (expected offline state) */}
+      {error && !(!isOnline && (selectedProject || currentTimeEntry) && (timerState?.state === 'RUNNING' || timerState?.state === 'PAUSED')) && (
+        <div className="w-full max-w-md p-3 rounded-lg bg-muted/50 border border-border animate-in fade-in flex gap-2">
+          <AlertCircle className="h-5 w-5 text-muted-foreground flex-shrink-0 mt-0.5" />
+          <div className="flex-1 min-w-0">
+            <div className="text-sm font-medium text-foreground mb-0.5">Something went wrong</div>
+            <div className="text-sm text-muted-foreground">{error}</div>
+            <p className="text-xs text-muted-foreground mt-2">You can try again or switch projects.</p>
+          </div>
         </div>
       )}
 
-      {/* Этап 4: уведомление при восстановлении RUNNING → PAUSED после перезапуска */}
+      {/* Project badge - prominent when tracking */}
+      {(selectedProject || currentTimeEntry?.project) && (
+        <div className="w-full max-w-md flex justify-center">
+          <div
+            className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-sm font-medium transition-colors"
+            style={{
+              backgroundColor: (selectedProject?.color || currentTimeEntry?.project?.color || '#475569') + '20',
+              color: selectedProject?.color || currentTimeEntry?.project?.color || '#475569',
+            }}
+          >
+            <div
+              className="w-2.5 h-2.5 rounded-full flex-shrink-0"
+            style={{
+              backgroundColor: selectedProject?.color || currentTimeEntry?.project?.color || '#475569',
+            }}
+            />
+            <span className="truncate max-w-[200px]">
+              {selectedProject?.name || currentTimeEntry?.project?.name || 'Project'}
+            </span>
+          </div>
+        </div>
+      )}
+
+      {/* Уведомление при восстановлении RUNNING → PAUSED после перезапуска */}
       {timerState?.state === 'PAUSED' && timerState?.restored_from_running && (
         <div className="w-full max-w-md p-3 rounded-md bg-muted/50 border border-muted-foreground/20 text-center text-sm text-muted-foreground animate-in fade-in">
           Timer was paused after restarting the application. Click "Resume" to continue.
@@ -303,7 +405,7 @@ export function Timer() {
       )}
       
       {/* Timer Display - Главный визуальный якорь */}
-      <div className="flex flex-col items-center space-y-3">
+      <div className="flex flex-col items-center space-y-2">
         {/* Время - самый крупный элемент с state-based color transition */}
         <div className={cn(
           "text-6xl font-mono font-bold tracking-tight transition-colors duration-300",
@@ -316,7 +418,7 @@ export function Timer() {
         {timerState?.state === 'PAUSED' && idlePauseStartTime && (
           <div className="flex flex-col items-center space-y-1">
             <div className="text-xs text-muted-foreground font-medium">
-              Простой:
+              Idle:
             </div>
             <div className="text-2xl font-mono text-muted-foreground/80">
               {formatTime(idleTime)}
@@ -324,7 +426,7 @@ export function Timer() {
           </div>
         )}
         
-        {/* Статус - визуально связан с временем */}
+        {/* Статус и дневная сводка */}
         <div className="flex items-center gap-2 text-sm text-muted-foreground">
           {timerState && timerState.state === 'RUNNING' && (
             <div className={cn(
@@ -336,14 +438,16 @@ export function Timer() {
             <div className="w-2 h-2 rounded-full bg-muted-foreground/40" />
           )}
           {isTakingScreenshot && (
-            <Camera className="w-3.5 h-3.5 text-blue-500 animate-pulse" />
+            <Camera className="w-3.5 h-3.5 text-primary animate-pulse" />
           )}
           <span>{timerStateInfo.statusText}</span>
+          <span className="text-muted-foreground/70">•</span>
+          <span>Today: {formatTimeShort(totalTodaySeconds)}</span>
         </div>
       </div>
 
       {/* Кнопки управления - macOS-style unified controls */}
-      <div className="flex gap-2.5 justify-center">
+      <div className="flex gap-2 justify-center">
         {(() => {
           if (!timerState || timerState.state === 'STOPPED') {
             return (
@@ -390,7 +494,8 @@ export function Timer() {
                 onClick={handleStop}
                 disabled={isLoading || isProcessing}
                 size="lg"
-                className="gap-2 px-6 h-10 text-sm rounded-md bg-destructive-soft hover:bg-destructive-softHover text-white"
+                variant="outline"
+                className="gap-2 px-6 h-10 text-sm rounded-md"
               >
                 <Square className="h-4 w-4" />
                 Stop
