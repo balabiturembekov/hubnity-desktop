@@ -69,6 +69,11 @@ vi.mock('../../lib/timer-engine', () => ({
   },
 }));
 
+vi.mock('../../store/useSyncStore', () => ({
+  useSyncStore: (selector: (s: { status: { is_online: boolean } | null }) => unknown) =>
+    selector({ status: { is_online: true } }),
+}));
+
 vi.mock('../../lib/logger', () => ({
   logger: {
     error: vi.fn(),

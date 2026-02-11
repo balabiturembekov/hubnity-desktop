@@ -85,29 +85,29 @@ describe('Settings', () => {
   it('renders settings and idle threshold input', async () => {
     render(<Settings />);
     await waitFor(() => {
-      expect(screen.getByLabelText(/порог неактивности/i)).toBeInTheDocument();
+      expect(screen.getByLabelText(/idle threshold/i)).toBeInTheDocument();
     });
-    expect(screen.getByRole('button', { name: /сохранить/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /save/i })).toBeInTheDocument();
   });
 
   it('saves idle threshold on Save click', async () => {
     const user = userEvent.setup();
     render(<Settings />);
     await waitFor(() => {
-      expect(screen.getByLabelText(/порог неактивности/i)).toBeInTheDocument();
+      expect(screen.getByLabelText(/idle threshold/i)).toBeInTheDocument();
     });
-    const input = screen.getByLabelText(/порог неактивности/i) as HTMLInputElement;
+    const input = screen.getByLabelText(/idle threshold/i) as HTMLInputElement;
     // Изменяем значение, чтобы кнопка стала активна (threshold !== idleThreshold)
     await user.clear(input);
     await user.type(input, '3');
     // Ждем, пока состояние обновится и кнопка станет активной
     await waitFor(async () => {
-      const saveBtn = screen.getByRole('button', { name: /сохранить/i });
+      const saveBtn = screen.getByRole('button', { name: /save/i });
       if (saveBtn.hasAttribute('disabled')) {
         throw new Error('Button still disabled');
       }
     }, { timeout: 2000 });
-    const saveBtn = screen.getByRole('button', { name: /сохранить/i });
+    const saveBtn = screen.getByRole('button', { name: /save/i });
     expect(saveBtn).not.toBeDisabled();
     await user.click(saveBtn);
     // Ждем вызова setIdleThreshold
@@ -126,8 +126,8 @@ describe('Settings', () => {
 
     render(<Settings />);
     await waitFor(() => {
-      expect(screen.getByText(/нет доступа к настройкам/i)).toBeInTheDocument();
+      expect(screen.getByText(/do not have access to settings/i)).toBeInTheDocument();
     });
-    expect(screen.queryByLabelText(/порог неактивности/i)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/idle threshold/i)).not.toBeInTheDocument();
   });
 });

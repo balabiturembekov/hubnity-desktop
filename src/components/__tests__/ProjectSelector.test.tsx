@@ -26,9 +26,17 @@ vi.mock('../../store/useTrackerStore', () => ({
   },
 }));
 
+let mockIsOnline = true;
+vi.mock('../../store/useSyncStore', () => ({
+  useSyncStore: (selector: (s: { status: { is_online: boolean } | null }) => unknown) => {
+    return selector({ status: { is_online: mockIsOnline } });
+  },
+}));
+
 describe('ProjectSelector', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockIsOnline = true;
     mockLoadProjects.mockResolvedValue(undefined);
     mockSelectProject.mockResolvedValue(undefined);
     defaultState.isLoading = false;
@@ -59,12 +67,22 @@ describe('ProjectSelector', () => {
     expect(screen.getByText(/Loading/i)).toBeInTheDocument();
   });
 
-  it('shows error and Retry when error', () => {
+  it('shows error and Retry when error (online)', () => {
     defaultState.error = 'Network error';
     defaultState.projects = [];
+    mockIsOnline = true;
     render(<ProjectSelector />);
     expect(screen.getByText('Network error')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /retry/i })).toBeInTheDocument();
+  });
+
+  it('shows Offline message without Retry when error (offline)', () => {
+    defaultState.error = 'Network Error';
+    defaultState.projects = [];
+    mockIsOnline = false;
+    render(<ProjectSelector />);
+    expect(screen.getByText(/Offline — projects unavailable/i)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /retry/i })).not.toBeInTheDocument();
   });
 
   it('shows No projects when projects empty', () => {

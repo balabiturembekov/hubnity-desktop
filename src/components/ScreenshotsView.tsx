@@ -98,7 +98,7 @@ export function ScreenshotsView({ timeEntryId }: ScreenshotsViewProps) {
       // BUG FIX: Check if component is still mounted before updating state
       if (!isMountedRef.current) return;
       
-      setError(err.message || 'Не удалось загрузить скриншоты');
+      setError(err.message || 'Could not load screenshots');
       setScreenshots([]);
     } finally {
       // BUG FIX: Only update state if component is still mounted
@@ -255,7 +255,7 @@ export function ScreenshotsView({ timeEntryId }: ScreenshotsViewProps) {
                   onClick={loadScreenshots}
                   className="ml-2 h-auto p-0 text-xs"
                 >
-                  Повторить
+                  Retry
                 </Button>
               </div>
             ) : screenshots.length === 0 ? (
@@ -275,7 +275,7 @@ export function ScreenshotsView({ timeEntryId }: ScreenshotsViewProps) {
                       alt={`Screenshot ${new Date(screenshot.timestamp).toLocaleTimeString()}`}
                       className="w-full h-full object-cover"
                       onError={(e) => {
-                        (e.target as HTMLImageElement).src = 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" width="100" height="100"%3E%3Crect width="100" height="100" fill="%23ddd"/%3E%3Ctext x="50%25" y="50%25" text-anchor="middle" dy=".3em" fill="%23999"%3EНет изображения%3C/text%3E%3C/svg%3E';
+                        (e.target as HTMLImageElement).src = 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" width="100" height="100"%3E%3Crect width="100" height="100" fill="%23ddd"/%3E%3Ctext x="50%25" y="50%25" text-anchor="middle" dy=".3em" fill="%23999"%3ENo image%3C/text%3E%3C/svg%3E';
                       }}
                     />
                     <div className="absolute inset-0 bg-black/0 group-hover:bg-black/20 transition-colors flex items-center justify-center">
@@ -308,7 +308,7 @@ export function ScreenshotsView({ timeEntryId }: ScreenshotsViewProps) {
                 alt={`Screenshot ${new Date(selectedScreenshot.timestamp).toLocaleString()}`}
                 className="w-full h-auto rounded-md"
                 onError={(e) => {
-                  (e.target as HTMLImageElement).src = 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" width="800" height="600"%3E%3Crect width="800" height="600" fill="%23ddd"/%3E%3Ctext x="50%25" y="50%25" text-anchor="middle" dy=".3em" fill="%23999"%3EНе удалось загрузить изображение%3C/text%3E%3C/svg%3E';
+                  (e.target as HTMLImageElement).src = 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" width="800" height="600"%3E%3Crect width="800" height="600" fill="%23ddd"/%3E%3Ctext x="50%25" y="50%25" text-anchor="middle" dy=".3em" fill="%23999"%3ECould not load image%3C/text%3E%3C/svg%3E';
                 }}
               />
             </div>

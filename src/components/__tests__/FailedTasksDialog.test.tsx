@@ -44,11 +44,11 @@ describe('FailedTasksDialog', () => {
       expect(mockInvoke).toHaveBeenCalledWith('get_failed_tasks', { limit: 50 });
     });
     await waitFor(() => {
-      expect(screen.getByText(/Остановка/i)).toBeInTheDocument();
+      expect(screen.getByText(/Stop/i)).toBeInTheDocument();
     });
   });
 
-  it('calls retry_failed_tasks and onRetry when Повторить всё clicked', async () => {
+  it('calls retry_failed_tasks and onRetry when Retry all clicked', async () => {
     mockInvoke.mockImplementation((cmd: string) => {
       if (cmd === 'get_failed_tasks') return Promise.resolve([]);
       if (cmd === 'retry_failed_tasks') return Promise.resolve(3);
@@ -59,10 +59,10 @@ describe('FailedTasksDialog', () => {
       <FailedTasksDialog open={true} onOpenChange={vi.fn()} failedCount={2} onRetry={onRetry} />
     );
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: /повторить все/i })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /retry all/i })).toBeInTheDocument();
     });
     const user = userEvent.setup();
-    await user.click(screen.getByRole('button', { name: /повторить все/i }));
+    await user.click(screen.getByRole('button', { name: /retry all/i }));
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith('retry_failed_tasks', { limit: 100 });
       expect(onRetry).toHaveBeenCalled();

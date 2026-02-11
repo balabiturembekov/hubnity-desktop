@@ -39,8 +39,8 @@ describe('ErrorBoundary', () => {
         <Throw message="Test error" />
       </ErrorBoundary>
     );
-    expect(screen.getByText(/Произошла ошибка/i)).toBeInTheDocument();
-    expect(screen.getByText(/Приложение столкнулось с неожиданной ошибкой/i)).toBeInTheDocument();
+    expect(screen.getByText(/An error occurred/i)).toBeInTheDocument();
+    expect(screen.getByText(/The app encountered an unexpected error/i)).toBeInTheDocument();
   });
 
   it('renders custom fallback when provided', () => {
@@ -50,28 +50,28 @@ describe('ErrorBoundary', () => {
       </ErrorBoundary>
     );
     expect(screen.getByText('Custom fallback')).toBeInTheDocument();
-    expect(screen.queryByText(/Произошла ошибка/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/An error occurred/i)).not.toBeInTheDocument();
   });
 
-  it('shows Перезапустить button and it is clickable', async () => {
+  it('shows Restart button and it is clickable', async () => {
     const user = userEvent.setup();
     render(
       <ErrorBoundary>
         <Throw message="Err" />
       </ErrorBoundary>
     );
-    const resetBtn = screen.getByRole('button', { name: /перезапустить/i });
+    const resetBtn = screen.getByRole('button', { name: /restart/i });
     expect(resetBtn).toBeInTheDocument();
     await user.click(resetBtn);
-    expect(screen.getByRole('button', { name: /перезапустить/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /restart/i })).toBeInTheDocument();
   });
 
-  it('has Обновить страницу button', () => {
+  it('has Refresh page button', () => {
     render(
       <ErrorBoundary>
         <Throw message="Err" />
       </ErrorBoundary>
     );
-    expect(screen.getByRole('button', { name: /обновить страницу/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /refresh page/i })).toBeInTheDocument();
   });
 });

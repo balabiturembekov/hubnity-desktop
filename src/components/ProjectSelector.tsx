@@ -1,6 +1,7 @@
 import { useEffect } from 'react';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
 import { useTrackerStore } from '../store/useTrackerStore';
+import { useSyncStore } from '../store/useSyncStore';
 import { logger } from '../lib/logger';
 
 /**
@@ -11,6 +12,7 @@ import { logger } from '../lib/logger';
  */
 export function ProjectSelector() {
   const { projects, selectedProject, loadProjects, selectProject, isLoading, error } = useTrackerStore();
+  const isOnline = useSyncStore((s) => s.status?.is_online ?? true);
 
   useEffect(() => {
     loadProjects();
@@ -39,13 +41,17 @@ export function ProjectSelector() {
         <span className="text-sm text-muted-foreground">Loading...</span>
       ) : error ? (
         <div className="flex items-center gap-2">
-          <span className="text-sm text-destructive">{error}</span>
-          <button
-            onClick={() => loadProjects()}
-            className="text-xs text-primary underline hover:no-underline"
-          >
-            Retry
-          </button>
+          <span className="text-sm text-muted-foreground">
+            {!isOnline ? 'Offline — projects unavailable' : error}
+          </span>
+          {isOnline && (
+            <button
+              onClick={() => loadProjects()}
+              className="text-xs text-foreground underline hover:no-underline"
+            >
+              Retry
+            </button>
+          )}
         </div>
       ) : projects.length === 0 ? (
         <span className="text-sm text-muted-foreground">No projects</span>

@@ -30,7 +30,7 @@ describe('IdleWindow', () => {
 
   it('renders idle state and buttons', () => {
     render(<IdleWindow />);
-    expect(screen.getByText(/Приостановлено \(нет активности\)/i)).toBeInTheDocument();
+    expect(screen.getByText(/Paused \(no activity\)/i)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /resume/i })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /stop/i })).toBeInTheDocument();
   });

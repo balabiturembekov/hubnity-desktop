@@ -187,24 +187,25 @@ describe('useTrackerStore', () => {
 
   describe('startTracking', () => {
     it('creates time entry and starts timer engine', async () => {
-      // Setup: select project first
       const project = { id: '1', name: 'Test Project', color: '#000000', description: '', clientName: '', budget: 0, status: 'ACTIVE' as const, companyId: '', createdAt: '', updatedAt: '' };
       useTrackerStore.getState().selectProject(project);
       
       await useTrackerStore.getState().startTracking();
       
       expect(mockGetActiveTimeEntries).toHaveBeenCalled();
-      expect(mockCreateTimeEntry).toHaveBeenCalledWith({
-        projectId: project.id,
-        userId: 'test-user-id',
-        description: `Работа над проектом ${project.name}`,
-      });
-      
       expect(mockStartTimer).toHaveBeenCalled();
       
       const state = useTrackerStore.getState();
       expect(state.isTracking).toBe(true);
       expect(state.currentTimeEntry).toBeTruthy();
+      
+      // API вызывается в фоне — ждём
+      await new Promise(r => setTimeout(r, 50));
+      expect(mockCreateTimeEntry).toHaveBeenCalledWith({
+        projectId: project.id,
+        userId: 'test-user-id',
+        description: `Work on project ${project.name}`,
+      });
     });
 
     it('handles error when creating time entry', async () => {
@@ -231,30 +232,33 @@ describe('useTrackerStore', () => {
       
       const error = new Error('Timer Engine Error');
       mockStartTimer.mockRejectedValueOnce(error);
+      mockGetTimerState.mockResolvedValueOnce({ state: 'STOPPED', elapsed_seconds: 0, accumulated_seconds: 0, session_start: null, day_start: Math.floor(Date.now() / 1000) });
       
       await useTrackerStore.getState().startTracking();
       
-      // Time entry should still be created
-      expect(mockCreateTimeEntry).toHaveBeenCalled();
-      
-      // But tracking state might be inconsistent
       const state = useTrackerStore.getState();
-      // Error should be logged but not crash
-      expect(state.currentTimeEntry).toBeTruthy();
+      expect(state.error != null || !state.isTracking).toBeTruthy();
+      expect(mockCreateTimeEntry).not.toHaveBeenCalled();
     });
   });
 
   describe('pauseTracking', () => {
     it('pauses timer engine and updates time entry', async () => {
-      // Setup: start tracking first
       const project = { id: '1', name: 'Test Project', color: '#000000', description: '', clientName: '', budget: 0, status: 'ACTIVE' as const, companyId: '', createdAt: '', updatedAt: '' };
       useTrackerStore.getState().selectProject(project);
       await useTrackerStore.getState().startTracking();
+      await new Promise(r => setTimeout(r, 80));
       
       const currentEntry = useTrackerStore.getState().currentTimeEntry;
       expect(currentEntry).toBeTruthy();
-      
-      // Mock pause API
+      mockGetTimerState.mockResolvedValueOnce({
+        state: 'RUNNING',
+        started_at: Date.now() / 1000,
+        elapsed_seconds: 0,
+        accumulated_seconds: 0,
+        session_start: Date.now() / 1000,
+        day_start: Math.floor(Date.now() / 1000),
+      });
       mockPauseTimeEntry.mockResolvedValueOnce({
         ...currentEntry,
         status: 'PAUSED',
@@ -263,11 +267,13 @@ describe('useTrackerStore', () => {
       await useTrackerStore.getState().pauseTracking();
       
       expect(mockPauseTimer).toHaveBeenCalled();
-      expect(mockPauseTimeEntry).toHaveBeenCalled();
       
       const state = useTrackerStore.getState();
       expect(state.isPaused).toBe(true);
-      expect(state.isTracking).toBe(true); // Still tracking, just paused
+      expect(state.isTracking).toBe(true);
+      
+      await new Promise(r => setTimeout(r, 50));
+      expect(mockPauseTimeEntry).toHaveBeenCalled();
     });
 
     it('handles error when pausing timer engine', async () => {
@@ -322,16 +328,14 @@ describe('useTrackerStore', () => {
 
   describe('resumeTracking', () => {
     it('resumes timer engine and updates time entry', async () => {
-      // Setup: start and pause tracking
       const project = { id: '1', name: 'Test Project', color: '#000000', description: '', clientName: '', budget: 0, status: 'ACTIVE' as const, companyId: '', createdAt: '', updatedAt: '' };
       useTrackerStore.getState().selectProject(project);
       await useTrackerStore.getState().startTracking();
+      await new Promise(r => setTimeout(r, 80));
       await useTrackerStore.getState().pauseTracking();
+      await new Promise(r => setTimeout(r, 50));
       
       const currentEntry = useTrackerStore.getState().currentTimeEntry;
-      
-      // BUG FIX: Mock Timer Engine state to return PAUSED before resume
-      // resumeTracking now checks Timer Engine state directly
       mockGetTimerState.mockResolvedValueOnce({
         state: 'PAUSED',
         elapsed_seconds: 100,
@@ -339,14 +343,10 @@ describe('useTrackerStore', () => {
         session_start: Date.now() / 1000,
         day_start: Math.floor(Date.now() / 1000),
       });
-      
-      // Mock resume API
       mockResumeTimeEntry.mockResolvedValueOnce({
         ...currentEntry,
         status: 'RUNNING',
       });
-      
-      // Mock Timer Engine resume response
       mockResumeTimer.mockResolvedValueOnce({
         state: 'RUNNING',
         started_at: Date.now() / 1000,
@@ -359,33 +359,33 @@ describe('useTrackerStore', () => {
       await useTrackerStore.getState().resumeTracking();
       
       expect(mockResumeTimer).toHaveBeenCalled();
-      expect(mockResumeTimeEntry).toHaveBeenCalled();
       
       const state = useTrackerStore.getState();
       expect(state.isPaused).toBe(false);
       expect(state.isTracking).toBe(true);
+      
+      await new Promise(r => setTimeout(r, 50));
+      expect(mockResumeTimeEntry).toHaveBeenCalled();
     });
 
     it('handles error when resuming timer engine', async () => {
-      // Setup: start and pause tracking
       const project = { id: '1', name: 'Test Project', color: '#000000', description: '', clientName: '', budget: 0, status: 'ACTIVE' as const, companyId: '', createdAt: '', updatedAt: '' };
       useTrackerStore.getState().selectProject(project);
       await useTrackerStore.getState().startTracking();
-      
-      // Setup: ensure we have a currentTimeEntry
-      const currentEntry = useTrackerStore.getState().currentTimeEntry;
-      expect(currentEntry).toBeTruthy();
-      
-      // Mock getState to return PAUSED state
+      await new Promise(r => setTimeout(r, 80));
       mockGetTimerState.mockResolvedValueOnce({
-        state: 'PAUSED',
+        state: 'RUNNING',
+        started_at: Date.now() / 1000,
         elapsed_seconds: 0,
         accumulated_seconds: 0,
-        session_start: null,
+        session_start: Date.now() / 1000,
         day_start: Math.floor(Date.now() / 1000),
       });
-      
       await useTrackerStore.getState().pauseTracking();
+      await new Promise(r => setTimeout(r, 50));
+      
+      const currentEntry = useTrackerStore.getState().currentTimeEntry;
+      expect(currentEntry).toBeTruthy();
       
       // Mock getState to return PAUSED state for resume
       mockGetTimerState.mockResolvedValueOnce({
@@ -418,6 +418,7 @@ describe('useTrackerStore', () => {
       const project2 = { id: '2', name: 'Project B', color: '#111111', description: '', clientName: '', budget: 0, status: 'ACTIVE' as const, companyId: '', createdAt: '', updatedAt: '' };
       await useTrackerStore.getState().selectProject(project1);
       await useTrackerStore.getState().startTracking();
+      await new Promise(r => setTimeout(r, 80));
       expect(useTrackerStore.getState().isTracking).toBe(true);
       expect(useTrackerStore.getState().currentTimeEntry).toBeTruthy();
 
@@ -459,6 +460,7 @@ describe('useTrackerStore', () => {
       await useTrackerStore.getState().selectProject(project2);
 
       expect(mockStopTimer).toHaveBeenCalled();
+      await new Promise(r => setTimeout(r, 50));
       expect(mockStopTimeEntry).toHaveBeenCalled();
       const state = useTrackerStore.getState();
       expect(state.selectedProject?.id).toBe(project2.id);
@@ -479,10 +481,10 @@ describe('useTrackerStore', () => {
 
   describe('stopTracking', () => {
     it('stops timer engine and updates time entry', async () => {
-      // Setup: start tracking
       const project = { id: '1', name: 'Test Project', color: '#000000', description: '', clientName: '', budget: 0, status: 'ACTIVE' as const, companyId: '', createdAt: '', updatedAt: '' };
       useTrackerStore.getState().selectProject(project);
       await useTrackerStore.getState().startTracking();
+      await new Promise(r => setTimeout(r, 80));
       
       const currentEntry = useTrackerStore.getState().currentTimeEntry;
       
@@ -515,6 +517,7 @@ describe('useTrackerStore', () => {
       await useTrackerStore.getState().stopTracking();
       
       expect(mockStopTimer).toHaveBeenCalled();
+      await new Promise(r => setTimeout(r, 50));
       expect(mockStopTimeEntry).toHaveBeenCalled();
       
       const state = useTrackerStore.getState();
@@ -523,10 +526,10 @@ describe('useTrackerStore', () => {
     });
 
     it('handles error when stopping timer engine', async () => {
-      // Setup: start tracking
       const project = { id: '1', name: 'Test Project', color: '#000000', description: '', clientName: '', budget: 0, status: 'ACTIVE' as const, companyId: '', createdAt: '', updatedAt: '' };
       useTrackerStore.getState().selectProject(project);
       await useTrackerStore.getState().startTracking();
+      await new Promise(r => setTimeout(r, 80));
       
       // Setup: ensure we have a currentTimeEntry
       const currentEntry = useTrackerStore.getState().currentTimeEntry;

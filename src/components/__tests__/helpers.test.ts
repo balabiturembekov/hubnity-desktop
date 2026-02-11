@@ -28,12 +28,12 @@ function formatDate(timestamp: number): string {
 // getEntityTypeLabel - функция из FailedTasksDialog.tsx
 function getEntityTypeLabel(entityType: string): string {
   const labels: Record<string, string> = {
-    time_entry_start: 'Старт трекера',
-    time_entry_pause: 'Пауза',
-    time_entry_resume: 'Возобновление',
-    time_entry_stop: 'Остановка',
-    screenshot: 'Скриншот',
-    activity: 'Активность',
+    time_entry_start: 'Start tracking',
+    time_entry_pause: 'Pause',
+    time_entry_resume: 'Resume',
+    time_entry_stop: 'Stop',
+    screenshot: 'Screenshot',
+    activity: 'Activity',
   };
   return labels[entityType] || entityType;
 }
@@ -109,12 +109,12 @@ describe('formatDate', () => {
 
 describe('getEntityTypeLabel', () => {
   it('returns label for known entity types', () => {
-    expect(getEntityTypeLabel('time_entry_start')).toBe('Старт трекера');
-    expect(getEntityTypeLabel('time_entry_pause')).toBe('Пауза');
-    expect(getEntityTypeLabel('time_entry_resume')).toBe('Возобновление');
-    expect(getEntityTypeLabel('time_entry_stop')).toBe('Остановка');
-    expect(getEntityTypeLabel('screenshot')).toBe('Скриншот');
-    expect(getEntityTypeLabel('activity')).toBe('Активность');
+    expect(getEntityTypeLabel('time_entry_start')).toBe('Start tracking');
+    expect(getEntityTypeLabel('time_entry_pause')).toBe('Pause');
+    expect(getEntityTypeLabel('time_entry_resume')).toBe('Resume');
+    expect(getEntityTypeLabel('time_entry_stop')).toBe('Stop');
+    expect(getEntityTypeLabel('screenshot')).toBe('Screenshot');
+    expect(getEntityTypeLabel('activity')).toBe('Activity');
   });
 
   it('returns entityType as-is for unknown types', () => {

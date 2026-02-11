@@ -96,12 +96,12 @@ export class ErrorBoundary extends Component<Props, State> {
             <CardHeader>
               <div className="flex items-center gap-2">
                 <AlertCircle className="h-5 w-5 text-red-500" />
-                <CardTitle>Произошла ошибка</CardTitle>
+                <CardTitle>An error occurred</CardTitle>
               </div>
             </CardHeader>
             <CardContent className="space-y-4">
               <p className="text-sm text-gray-600">
-                Приложение столкнулось с неожиданной ошибкой. Мы зафиксировали проблему и работаем над её решением.
+                The app encountered an unexpected error. We have recorded the issue and are working on a fix.
               </p>
               
               {import.meta.env.DEV && this.state.error && (
@@ -132,14 +132,14 @@ export class ErrorBoundary extends Component<Props, State> {
                   variant="default"
                 >
                   <RefreshCw className="h-4 w-4 mr-2" />
-                  Перезапустить
+                  Restart
                 </Button>
                 <Button
                   onClick={() => window.location.reload()}
                   variant="outline"
                   className="flex-1"
                 >
-                  Обновить страницу
+                  Refresh page
                 </Button>
               </div>
             </CardContent>

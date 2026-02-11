@@ -69,7 +69,7 @@ export function FailedTasksDialog({
       // BUG FIX: Check if component is still mounted before updating state
       if (!isMountedRef.current) return;
       
-      setError(err.message || 'Не удалось загрузить список ошибок');
+      setError(err.message || 'Could not load failed tasks');
       logger.error('FAILED_TASKS', 'Failed to load failed tasks', err);
     } finally {
       // BUG FIX: Only update state if component is still mounted
@@ -98,7 +98,7 @@ export function FailedTasksDialog({
       // Показываем уведомление
       await invoke('show_notification', {
         title: 'Retry synchronization',
-        body: `Сброшено ${count} задач для повторной попытки`,
+        body: `Reset ${count} tasks for retry`,
       }).catch((e) => {
         // BUG FIX: Log error instead of silently ignoring
         logger.debug('FAILED_TASKS', 'Failed to show notification (non-critical)', e);
@@ -107,7 +107,7 @@ export function FailedTasksDialog({
       // BUG FIX: Check if component is still mounted before updating state
       if (!isMountedRef.current) return;
       
-      setError(err.message || 'Не удалось повторить синхронизацию');
+      setError(err.message || 'Could not retry sync');
       logger.error('FAILED_TASKS', 'Failed to retry failed tasks', err);
     } finally {
       // BUG FIX: Only update state if component is still mounted
@@ -129,12 +129,12 @@ export function FailedTasksDialog({
 
   const getEntityTypeLabel = (entityType: string) => {
     const labels: Record<string, string> = {
-      time_entry_start: 'Старт трекера',
-      time_entry_pause: 'Пауза',
-      time_entry_resume: 'Возобновление',
-      time_entry_stop: 'Остановка',
-      screenshot: 'Скриншот',
-      activity: 'Активность',
+      time_entry_start: 'Start tracking',
+      time_entry_pause: 'Pause',
+      time_entry_resume: 'Resume',
+      time_entry_stop: 'Stop',
+      screenshot: 'Screenshot',
+      activity: 'Activity',
     };
     return labels[entityType] || entityType;
   };
@@ -160,10 +160,10 @@ export function FailedTasksDialog({
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <AlertCircle className="h-5 w-5 text-red-600" />
-            Ошибки синхронизации ({failedCount})
+            Sync errors ({failedCount})
           </DialogTitle>
           <DialogDescription>
-            Задачи, которые не удалось синхронизировать после нескольких попыток
+            Tasks that could not be synced after several attempts
           </DialogDescription>
         </DialogHeader>
 
@@ -172,7 +172,7 @@ export function FailedTasksDialog({
             <div className="flex items-center justify-center py-8">
               <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
               <span className="ml-2 text-sm text-muted-foreground">
-                Загрузка...
+                Loading...
               </span>
             </div>
           ) : error ? (
@@ -181,7 +181,7 @@ export function FailedTasksDialog({
             </div>
           ) : tasks.length === 0 ? (
             <div className="text-sm text-muted-foreground py-4 text-center">
-              Нет failed задач
+              No failed tasks
             </div>
           ) : (
             <div className="space-y-2">
@@ -201,21 +201,21 @@ export function FailedTasksDialog({
                         </span>
                       </div>
                       <div className="text-xs text-muted-foreground">
-                        Попыток: {task.retry_count} / 5
+                        Attempts: {task.retry_count} / 5
                       </div>
                       <div className="text-xs text-muted-foreground">
-                        Создано: {formatDate(task.created_at)}
+                        Created: {formatDate(task.created_at)}
                       </div>
                       {task.last_retry_at && (
                         <div className="text-xs text-muted-foreground">
-                          Последняя попытка:{' '}
+                          Last attempt:{' '}
                           {formatDate(task.last_retry_at)}
                         </div>
                       )}
                       {task.error_message ? (
                         <div className="mt-2 p-2 rounded bg-red-100 dark:bg-red-900/30 border border-red-300 dark:border-red-700">
                           <div className="text-xs font-medium text-red-800 dark:text-red-200 mb-1">
-                            Причина ошибки:
+                            Error reason:
                           </div>
                           <div className="text-xs text-red-700 dark:text-red-300 font-mono break-words">
                             {task.error_message}
@@ -224,13 +224,13 @@ export function FailedTasksDialog({
                       ) : (
                         <div className="mt-2 p-2 rounded bg-yellow-100 dark:bg-yellow-900/30 border border-yellow-300 dark:border-yellow-700">
                           <div className="text-xs text-yellow-800 dark:text-yellow-200">
-                            ⚠️ Причина ошибки не сохранена (старая задача)
+                            ⚠️ Error reason not saved (old task)
                           </div>
                         </div>
                       )}
                       <details className="mt-2">
                         <summary className="text-xs text-muted-foreground cursor-pointer hover:text-foreground">
-                          Показать payload
+                          Show payload
                         </summary>
                         <pre className="mt-1 p-2 text-xs bg-muted rounded overflow-auto max-h-32 font-mono">
                           {getPayloadPreview(task.payload)}
@@ -246,7 +246,7 @@ export function FailedTasksDialog({
 
         <div className="flex items-center justify-between gap-2 pt-4 border-t">
           <div className="text-xs text-muted-foreground">
-            Показано {tasks.length} из {failedCount} задач
+            Showing {tasks.length} of {failedCount} tasks
           </div>
           <div className="flex gap-2">
             <Button
@@ -256,7 +256,7 @@ export function FailedTasksDialog({
               disabled={isLoading}
             >
               <RefreshCw className="h-3.5 w-3.5 mr-1" />
-              Обновить
+              Refresh
             </Button>
             <Button
               variant="default"
@@ -267,12 +267,12 @@ export function FailedTasksDialog({
               {isRetrying ? (
                 <>
                   <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" />
-                  Повтор...
+                  Retrying...
                 </>
               ) : (
                 <>
                   <RefreshCw className="h-3.5 w-3.5 mr-1" />
-                  Повторить все ({failedCount})
+                  Retry all ({failedCount})
                 </>
               )}
             </Button>

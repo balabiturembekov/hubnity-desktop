@@ -24,12 +24,12 @@
     --input: 214.3 31.8% 91.4%;
     --ring: 222.2 84% 4.9%;
     --radius: 0.5rem;
-    /* macOS-friendly timer colors */
-    --timer-running: 142 71% 45%;
-    --timer-running-dark: 142 65% 50%;
-    /* Soft destructive for Stop button */
-    --destructive-soft: 0 72% 50%;
-    --destructive-soft-hover: 0 72% 55%;
+    /* Timer uses primary for cohesive palette */
+    --timer-running: 222.2 47.4% 11.2%;
+    --timer-running-dark: 210 40% 98%;
+    /* Stop button - muted destructive, not traffic light red */
+    --destructive-soft: 222.2 47.4% 25%;
+    --destructive-soft-hover: 222.2 47.4% 20%;
   }
 
   .dark {
@@ -52,12 +52,12 @@
     --border: 217.2 32.6% 17.5%;
     --input: 217.2 32.6% 17.5%;
     --ring: 212.7 26.8% 83.9%;
-    /* macOS-friendly timer colors (dark mode) */
-    --timer-running: 142 65% 50%;
-    --timer-running-dark: 142 71% 45%;
-    /* Soft destructive for Stop button (dark mode) */
-    --destructive-soft: 0 65% 45%;
-    --destructive-soft-hover: 0 65% 50%;
+    /* Timer uses primary (dark mode) */
+    --timer-running: 210 40% 98%;
+    --timer-running-dark: 210 40% 98%;
+    /* Stop button - muted (dark mode) */
+    --destructive-soft: 217.2 32.6% 35%;
+    --destructive-soft-hover: 217.2 32.6% 45%;
   }
 }
 

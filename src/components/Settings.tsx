@@ -43,10 +43,10 @@ export function Settings() {
   if (!hasAccess) {
     return (
       <div className="space-y-3">
-        <Card className="border-2">
+        <Card className="border">
           <CardContent className="pt-6">
             <p className="text-sm text-muted-foreground text-center">
-              У вас нет доступа к настройкам. Доступ разрешен только для владельцев и администраторов.
+              You do not have access to settings. Access is granted only to owners and administrators.
             </p>
           </CardContent>
         </Card>
@@ -132,7 +132,7 @@ export function Settings() {
       // Show notification
       await invoke('show_notification', {
         title: 'Settings saved',
-        body: `Порог неактивности установлен: ${validThreshold} ${validThreshold === 1 ? 'минута' : validThreshold < 5 ? 'минуты' : 'минут'}`,
+        body: `Idle threshold set: ${validThreshold} ${validThreshold === 1 ? 'minute' : 'minutes'}`,
       }).catch((e) => {
         logger.warn('SETTINGS', 'Failed to show notification (non-critical)', e);
       });
@@ -151,8 +151,8 @@ export function Settings() {
     } catch (error) {
       logger.error('SETTINGS', 'Failed to save settings', error);
       await invoke('show_notification', {
-        title: 'Ошибка',
-        body: 'Не удалось сохранить настройки',
+        title: 'Error',
+        body: 'Could not save settings',
       }).catch((e) => {
         logger.warn('SETTINGS', 'Failed to show error notification (non-critical)', e);
       });
@@ -165,15 +165,15 @@ export function Settings() {
   };
 
   return (
-    <div className="space-y-3">
-      <Card className="border-2">
-        <CardHeader className="pb-3">
-          <CardTitle className="text-base">Settings</CardTitle>
+    <div className="space-y-4 max-w-md">
+      <Card className="border shadow-sm">
+        <CardHeader className="pb-2 pt-4 px-4">
+          <CardTitle className="text-sm font-medium text-foreground">Settings</CardTitle>
         </CardHeader>
-        <CardContent className="space-y-3 pt-0">
+        <CardContent className="space-y-3 pt-0 px-4 pb-4">
           <div className="space-y-2">
-            <Label htmlFor="idle-threshold" className="text-sm">
-              Порог неактивности (мин)
+            <Label htmlFor="idle-threshold" className="text-sm text-foreground">
+              Idle threshold (min)
             </Label>
             <div className="flex gap-2">
               <Input
@@ -196,29 +196,29 @@ export function Settings() {
                 disabled={isSaving || threshold === idleThreshold}
               >
                 {isSaving ? (
-                  'Сохранение...'
+                  'Saving...'
                 ) : saved ? (
                   <>
                     <Check className="h-3.5 w-3.5 mr-1" />
                     Saved
                   </>
                 ) : (
-                  'Сохранить'
+                  'Save'
                 )}
               </Button>
             </div>
             <p className="text-xs text-muted-foreground">
-              Автопауза при неактивности более {idleThreshold} {idleThreshold === 1 ? 'минуты' : idleThreshold < 5 ? 'минут' : 'минут'}
+              Auto-pause after {idleThreshold} {idleThreshold === 1 ? 'minute' : 'minutes'} of inactivity
             </p>
           </div>
         </CardContent>
       </Card>
 
-      <Card className="border-2">
-        <CardHeader className="pb-3">
-          <CardTitle className="text-base">Profile</CardTitle>
+      <Card className="border shadow-sm">
+        <CardHeader className="pb-2 pt-4 px-4">
+          <CardTitle className="text-sm font-medium text-foreground">Profile</CardTitle>
         </CardHeader>
-        <CardContent className="space-y-3 pt-0">
+        <CardContent className="space-y-3 pt-0 px-4 pb-4">
           {user && (
             <div className="space-y-2.5">
               <div>
@@ -240,7 +240,7 @@ export function Settings() {
               await logout();
               await useTrackerStore.getState().reset();
             }}
-            variant="destructive"
+            variant="outline"
             className="gap-2 w-full h-9 mt-2"
           >
             <LogOut className="h-3.5 w-3.5" />
@@ -249,11 +249,11 @@ export function Settings() {
         </CardContent>
       </Card>
 
-      <Card className="border-2">
-        <CardHeader className="pb-3">
+      <Card className="border shadow-sm">
+        <CardHeader className="pb-2 pt-4 px-4">
           <div className="flex items-center justify-between">
-            <CardTitle className="text-base flex items-center gap-2">
-              <Database className="h-4 w-4" />
+            <CardTitle className="text-sm font-medium text-foreground flex items-center gap-2">
+              <Database className="h-4 w-4 text-muted-foreground" />
               Synchronization
             </CardTitle>
             <Button
@@ -267,7 +267,7 @@ export function Settings() {
             </Button>
           </div>
         </CardHeader>
-        <CardContent className="space-y-3 pt-0">
+        <CardContent className="space-y-3 pt-0 px-4 pb-4">
           {queueStats ? (
             <div className="space-y-2.5">
               <div className="flex items-center justify-between text-sm">
@@ -276,17 +276,15 @@ export function Settings() {
               </div>
               <div className="flex items-center justify-between text-sm">
                 <span className="text-muted-foreground">Errors:</span>
-                <span className={`font-medium ${queueStats.failed_count > 0 ? 'text-destructive' : ''}`}>
-                  {queueStats.failed_count}
-                </span>
+                <span className="font-medium text-foreground">{queueStats.failed_count}</span>
               </div>
               <div className="flex items-center justify-between text-sm">
-                <span className="text-muted-foreground">Синхронизировано:</span>
-                <span className="font-medium text-green-600 dark:text-green-500">{queueStats.sent_count}</span>
+                <span className="text-muted-foreground">Synced:</span>
+                <span className="font-medium text-foreground">{queueStats.sent_count}</span>
               </div>
               {Object.keys(queueStats.pending_by_type).length > 0 && (
-                <div className="pt-2 border-t">
-                  <Label className="text-xs text-muted-foreground mb-1.5 block">По типам задач:</Label>
+                <div className="pt-2 border-t border-border">
+                  <Label className="text-xs text-muted-foreground mb-1.5 block">By task type:</Label>
                   <div className="space-y-1">
                     {Object.entries(queueStats.pending_by_type).map(([type, count]) => (
                       <div key={type} className="flex items-center justify-between text-xs">
@@ -298,19 +296,19 @@ export function Settings() {
                 </div>
               )}
               {queueStats.pending_count > 0 && queueStats.sent_count === 0 && (
-                <div className="pt-2 border-t space-y-1">
-                  <p className="text-xs font-medium text-amber-600 dark:text-amber-500">
+                <div className="pt-2 border-t border-border space-y-1">
+                  <p className="text-xs font-medium text-foreground">
                     To synchronize, you need to log in to your account.
                   </p>
                   <p className="text-xs text-muted-foreground">
-                    Если в логах «access_token present=false» — выйдите из аккаунта и войдите снова (вкладка «Трекер» → выход, затем логин). После входа счётчик начнёт расти.
+                    If logs show «access_token present=false» — log out and log in again (Tracker tab → logout, then login). After login the counter will start increasing.
                   </p>
                 </div>
               )}
             </div>
           ) : (
             <div className="text-sm text-muted-foreground">
-              {isLoadingStats ? 'Загрузка...' : 'Нет данных'}
+              {isLoadingStats ? 'Loading...' : 'No data'}
             </div>
           )}
         </CardContent>
