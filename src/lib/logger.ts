@@ -14,6 +14,7 @@
  * - Интегрировано с Sentry для мониторинга ошибок
  */
 
+import { invoke } from '@tauri-apps/api/core';
 import { captureException } from './sentry';
 
 type LogLevel = 'debug' | 'info' | 'warn' | 'error';
@@ -105,7 +106,6 @@ class Logger {
    */
   async safeLogToRust(message: string): Promise<void> {
     try {
-      const { invoke } = await import('@tauri-apps/api/core');
       await invoke('log_message', { message });
     } catch (e) {
       // Не критично - просто логируем локально

@@ -1,69 +1,28 @@
-import { useEffect, useState, useCallback, useRef } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { useEffect, useState } from 'react';
 import { CheckCircle2, Loader2, WifiOff, AlertCircle } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { FailedTasksDialog } from './FailedTasksDialog';
-import { logger } from '../lib/logger';
+import { useSyncStore } from '../store/useSyncStore';
 
-interface SyncStatus {
-  pending_count: number;
-  failed_count: number;
-  is_online: boolean;
+function formatLastSync(ts: number): string {
+  const now = Date.now() / 1000;
+  const diff = Math.floor(now - ts);
+  if (diff < 60) return 'just now';
+  if (diff < 3600) return `${Math.floor(diff / 60)} min ago`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)} h ago`;
+  if (diff < 604800) return `${Math.floor(diff / 86400)} d ago`;
+  return `${Math.floor(diff / 604800)} wk ago`;
 }
 
 type SyncState = 'synced' | 'syncing' | 'offline' | 'error';
 
 export function SyncIndicator() {
-  const [status, setStatus] = useState<SyncStatus | null>(null);
-  const [isLoading, setIsLoading] = useState(true);
+  const { status, isLoading, fetchSyncStatus } = useSyncStore();
   const [showFailedDialog, setShowFailedDialog] = useState(false);
-  
-  // BUG FIX: Track component mount state to prevent setState after unmount
-  const isMountedRef = useRef(true);
-  
-  useEffect(() => {
-    isMountedRef.current = true;
-    return () => {
-      isMountedRef.current = false;
-    };
-  }, []);
-
-  // BUG FIX: Use useCallback to ensure stable function reference for useEffect dependencies
-  const fetchSyncStatus = useCallback(async () => {
-    // BUG FIX: Check if component is still mounted before updating state
-    if (!isMountedRef.current) return;
-    
-    try {
-      const result = await invoke<SyncStatus>('get_sync_status');
-      
-      // BUG FIX: Check again after async operation
-      if (!isMountedRef.current) return;
-      
-      setStatus(result);
-      setIsLoading(false);
-    } catch (error) {
-      logger.error('SYNC_INDICATOR', 'Failed to get sync status', error);
-      
-      // BUG FIX: Check if component is still mounted before updating state
-      if (!isMountedRef.current) return;
-      
-      setIsLoading(false);
-      // При ошибке считаем, что офлайн
-      setStatus({
-        pending_count: 0,
-        failed_count: 0,
-        is_online: false,
-      });
-    }
-  }, []);
 
   useEffect(() => {
-    // Загружаем статус сразу
     fetchSyncStatus();
-
-    // Обновляем каждые 5 секунд
     const interval = setInterval(fetchSyncStatus, 5000);
-
     return () => clearInterval(interval);
   }, [fetchSyncStatus]);
 
@@ -71,7 +30,7 @@ export function SyncIndicator() {
     return (
       <div className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-muted/50">
         <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />
-        <span className="text-xs text-muted-foreground">Проверка...</span>
+        <span className="text-xs text-muted-foreground">Checking...</span>
       </div>
     );
   }
@@ -92,47 +51,14 @@ export function SyncIndicator() {
 
   const syncState = getSyncState();
 
-  // Конфигурация для каждого состояния
   const stateConfig: Record<
     SyncState,
-    {
-      icon: typeof CheckCircle2;
-      text: string;
-      className: string;
-      bgClassName: string;
-      borderClassName: string;
-      animate?: boolean;
-    }
+    { icon: typeof CheckCircle2; animate?: boolean }
   > = {
-    synced: {
-      icon: CheckCircle2,
-      text: 'Синхронизировано',
-      className: 'text-green-600 dark:text-green-500',
-      bgClassName: 'bg-green-50 dark:bg-green-950/20',
-      borderClassName: 'border-green-200 dark:border-green-800',
-    },
-    syncing: {
-      icon: Loader2,
-      text: `Синхронизация... (${status.pending_count})`,
-      className: 'text-blue-600 dark:text-blue-500',
-      bgClassName: 'bg-blue-50 dark:bg-blue-950/20',
-      borderClassName: 'border-blue-200 dark:border-blue-800',
-      animate: true,
-    },
-    offline: {
-      icon: WifiOff,
-      text: 'Офлайн',
-      className: 'text-orange-600 dark:text-orange-500',
-      bgClassName: 'bg-orange-50 dark:bg-orange-950/20',
-      borderClassName: 'border-orange-200 dark:border-orange-800',
-    },
-    error: {
-      icon: AlertCircle,
-      text: `Ошибка (${status.failed_count})`,
-      className: 'text-red-600 dark:text-red-500',
-      bgClassName: 'bg-red-50 dark:bg-red-950/20',
-      borderClassName: 'border-red-200 dark:border-red-800',
-    },
+    synced: { icon: CheckCircle2 },
+    syncing: { icon: Loader2, animate: true },
+    offline: { icon: WifiOff },
+    error: { icon: AlertCircle },
   };
 
   const config = stateConfig[syncState];
@@ -148,12 +74,14 @@ export function SyncIndicator() {
         )}
         title={
           syncState === 'synced'
-            ? 'Все данные синхронизированы'
+            ? status.last_sync_at != null
+              ? `All data synced. Last sync: ${formatLastSync(status.last_sync_at)}`
+              : 'All data synced'
             : syncState === 'syncing'
-            ? `${status.pending_count} задач в очереди`
+            ? `${status.pending_count} tasks in queue`
             : syncState === 'offline'
-            ? 'Нет подключения к интернету. Данные будут синхронизированы при восстановлении связи.'
-            : `Кликните, чтобы посмотреть детали ${status.failed_count} ошибок`
+            ? 'Last update failed. Data will sync when connection is restored.'
+            : `Click to view details of ${status.failed_count} errors`
         }
         onClick={() => {
           if (syncState === 'error') {
@@ -162,8 +90,7 @@ export function SyncIndicator() {
         }}
       >
         {syncState === 'error' ? (
-          // При ошибке - только subtle red dot, без текста
-          <div className="w-1.5 h-1.5 rounded-full bg-red-500/70" />
+          <div className="w-1.5 h-1.5 rounded-full bg-muted-foreground/60" />
         ) : (
           <>
             <Icon
@@ -173,11 +100,13 @@ export function SyncIndicator() {
               )}
             />
             <span className="text-xs text-muted-foreground/50">
-              {syncState === 'synced' 
-                ? 'Синхронизировано'
+              {syncState === 'synced'
+                ? status.last_sync_at != null
+                  ? `Last sync ${formatLastSync(status.last_sync_at)}`
+                  : 'Synced'
                 : syncState === 'syncing'
                 ? `${status.pending_count}`
-                : 'Офлайн'
+                : 'Last update failed'
               }
             </span>
           </>

@@ -17,21 +17,22 @@ import { LogOut } from 'lucide-react';
 import { logger } from './lib/logger';
 import { setSentryUser } from './lib/sentry';
 import { setCurrentUser } from './lib/current-user';
-import { USER_ROLES } from './lib/api';
+import { api, USER_ROLES } from './lib/api';
 import './App.css';
 
 const RELEASES_URL = 'https://github.com/balabiturembekov/hubnity-desktop/releases';
 
 function App() {
   const { isAuthenticated, user, logout } = useAuthStore();
-  const { loadActiveTimeEntry } = useTrackerStore();
+  const { loadActiveTimeEntry, selectedProject, currentTimeEntry } = useTrackerStore();
   const [updateAvailable, setUpdateAvailable] = useState<{ version: string; body?: string } | null>(null);
   const pendingUpdateRef = useRef<Update | null>(null);
+  const isInstallingRef = useRef<boolean>(false);
+  const autoInstallTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const [appVersion, setAppVersion] = useState<string | null>(null);
 
   // Восстанавливаем токены в Rust AuthManager — иначе фоновая синхронизация всегда получает "token not set" и Синхронизировано = 0
   const restoreTokens = useCallback(async () => {
-    const { api } = await import('./lib/api');
     const accessToken = api.getAccessToken() || localStorage.getItem('access_token');
     const refreshToken = localStorage.getItem('refresh_token');
 
@@ -73,7 +74,7 @@ function App() {
       .catch(error => {
         logger.debug('APP', 'Failed to get app version', error);
         // Fallback to package.json version if available
-        setAppVersion('0.1.7'); // Fallback version
+        setAppVersion('0.1.9'); // Fallback version
       });
   }, []);
 
@@ -82,7 +83,6 @@ function App() {
   useEffect(() => {
     const pushTokensAndSync = async () => {
       try {
-        const { api } = await import('./lib/api');
         const accessToken = api.getAccessToken() || localStorage.getItem('access_token');
         const refreshToken = localStorage.getItem('refresh_token');
         await logger.safeLogToRust(`[SYNC-FRONT] pushTokensAndSync: hasToken=${!!accessToken}`).catch(() => {});
@@ -140,14 +140,12 @@ function App() {
       try {
         // Create system tray using Tauri command
         // First, try to get existing tray or create new one
-        const { invoke } = await import('@tauri-apps/api/core');
-        
         // Create tray menu items
         const menuItems = [
-          { id: 'show', text: 'Показать' },
-          { id: 'hide', text: 'Скрыть' },
+          { id: 'show', text: 'Show' },
+          { id: 'hide', text: 'Hide' },
           { id: 'separator', text: '' },
-          { id: 'quit', text: 'Выход' },
+          { id: 'quit', text: 'Quit' },
         ];
 
         // Try to create tray if it doesn't exist
@@ -187,8 +185,8 @@ function App() {
           // Message is platform-agnostic - Windows usually doesn't require explicit permission,
           // but if screenshots fail, user may need to run as admin or check system settings
           await invoke('show_notification', {
-            title: 'Проверка разрешений',
-            body: 'Не удалось получить доступ к скриншотам. Убедитесь, что приложение имеет необходимые права доступа.',
+            title: 'Permission check',
+            body: 'Could not access screenshots. Make sure the app has the required permissions.',
           });
         }
       } catch (error) {
@@ -250,7 +248,6 @@ function App() {
           return;
         }
         
-        const { api } = await import('./lib/api');
         const activeEntries = await api.getActiveTimeEntries();
         
         if (activeEntries.length > 0) {
@@ -287,22 +284,68 @@ function App() {
             // На сервере PAUSED, но локально RUNNING - ставим на паузу
             // Но не паузим если локально на паузе из-за idle (пользователь должен решить через idle окно)
             // BUG FIX: Use actual timerState.isPaused instead of store cache
+            // BUG FIX: Also check if idle window might be open (idlePauseStartTime was recently cleared)
+            // If idlePauseStartTime was cleared recently (< 5 seconds ago), user might have just resumed from idle window
+            const storeState = useTrackerStore.getState();
             if (isPaused && idlePauseStartTime !== null) {
               logger.debug('APP', 'Skipping sync pause: timer paused due to idle, user must decide via idle window');
               return;
             }
+            // BUG FIX: Additional check - if idle window was recently closed (idlePauseStartTime cleared < 5s ago),
+            // don't auto-pause - user might have just resumed from idle window
+            // This prevents race condition where syncTimerState tries to pause right after resume from idle window
+            if (storeState.lastResumeTime && storeState.idlePauseStartTime === null) {
+              const FIVE_SECONDS = 5 * 1000;
+              const timeSinceResume = Date.now() - storeState.lastResumeTime;
+              if (timeSinceResume < FIVE_SECONDS) {
+                const secondsSinceResume = Math.round(timeSinceResume / 1000);
+                logger.info('APP', `Skipping sync pause: idle window was recently closed (${secondsSinceResume}s ago), user might have just resumed`);
+                return;
+              }
+            }
             
-            // BUG FIX: Don't auto-pause if resume was just called (< 5 seconds ago)
+            // BUG FIX: Don't auto-pause if resume was just called (< 15 seconds ago)
             // This prevents sync from pausing timer immediately after user resumes it
             // Server may not have updated yet, causing false sync pause
-            const { lastResumeTime } = useTrackerStore.getState();
-            const FIVE_SECONDS = 5 * 1000; // 5 seconds in milliseconds
-            if (lastResumeTime && (Date.now() - lastResumeTime) < FIVE_SECONDS) {
-              logger.debug('APP', 'Skipping sync pause: timer was just resumed (< 5s ago), server may not have updated yet');
+            // Increased to 15 seconds to cover at least one sync cycle (10s interval)
+            const FIFTEEN_SECONDS = 15 * 1000; // 15 seconds in milliseconds
+            if (storeState.lastResumeTime && (Date.now() - storeState.lastResumeTime) < FIFTEEN_SECONDS) {
+              const timeSinceResume = Math.round((Date.now() - storeState.lastResumeTime) / 1000);
+              logger.info('APP', `Skipping sync pause: timer was just resumed (${timeSinceResume}s ago), server may not have updated yet`);
               return;
             }
             
-            logger.info('APP', 'Syncing timer: server is PAUSED, pausing local timer');
+            // BUG FIX: Also check if there are pending resume operations in sync queue
+            // If there's a pending resume, don't auto-pause - wait for it to sync first
+            try {
+              const syncStatus = await invoke<{ pending_count: number; failed_count: number; is_online: boolean }>('get_sync_status');
+              if (syncStatus.pending_count > 0) {
+                // Check if there are any resume operations pending
+                const queueStats = await invoke<{ pending_by_type: Record<string, number> }>('get_sync_queue_stats').catch(() => null);
+                if (queueStats && queueStats.pending_by_type['time_entry_resume'] && queueStats.pending_by_type['time_entry_resume'] > 0) {
+                  logger.info('APP', `Skipping sync pause: ${queueStats.pending_by_type['time_entry_resume']} pending resume operation(s) in queue, waiting for sync`);
+                  return;
+                }
+              }
+            } catch (e) {
+              // If we can't check queue status, continue with pause (better to sync than to ignore)
+              logger.debug('APP', 'Failed to check sync queue status, proceeding with pause', e);
+            }
+            
+            // BUG FIX: Additional check - don't auto-pause if Timer Engine was just started/resumed locally
+            // Check if timer was started/resumed recently (within last 30 seconds)
+            // This protects against auto-pause when user just resumed timer but server hasn't updated yet
+            if (storeState.localTimerStartTime) {
+              const THIRTY_SECONDS = 30 * 1000; // 30 seconds in milliseconds
+              const timeSinceStart = Date.now() - storeState.localTimerStartTime;
+              if (timeSinceStart < THIRTY_SECONDS) {
+                const secondsSinceStart = Math.round(timeSinceStart / 1000);
+                logger.info('APP', `Skipping sync pause: timer was started/resumed locally recently (${secondsSinceStart}s ago), server may not have updated yet`);
+                return;
+              }
+            }
+            
+            logger.info('APP', 'Syncing timer: server is PAUSED, pausing local timer (auto-sync)');
             const { pauseTracking } = useTrackerStore.getState();
             await pauseTracking().catch((e) => {
               logger.warn('APP', 'Failed to pause timer on sync', e);
@@ -423,10 +466,43 @@ function App() {
         if (cancelled || !update) return;
         pendingUpdateRef.current = update;
         setUpdateAvailable({ version: update.version, body: update.body ?? undefined });
+        
+        // Уведомление о найденном обновлении
         await invoke('show_notification', {
           title: 'Hubnity',
-          body: `Доступна новая версия ${update.version}. Откройте приложение и нажмите «Установить».`,
+          body: `New version ${update.version} available. Installation will start automatically...`,
         }).catch(() => {});
+        
+        // Автоматическая установка обновления
+        // Небольшая задержка, чтобы пользователь успел увидеть уведомление
+        autoInstallTimeoutRef.current = setTimeout(async () => {
+          if (cancelled) return;
+          // Атомарная проверка и установка флага для предотвращения race condition
+          if (isInstallingRef.current) return;
+          isInstallingRef.current = true;
+          
+          try {
+            logger.info('APP', `Starting automatic update installation for version ${update.version}`);
+            const { relaunch } = await import('@tauri-apps/plugin-process');
+            await update.downloadAndInstall();
+            logger.info('APP', 'Update installed successfully, relaunching...');
+            await relaunch();
+          } catch (e: any) {
+            isInstallingRef.current = false;
+            const err = e instanceof Error ? e : new Error(String(e));
+            logger.error('APP', `Automatic update install failed: ${err.message}`, err);
+            await invoke('show_notification', {
+              title: 'Hubnity',
+              body: 'Could not install update automatically. Try downloading from the website.',
+            }).catch(() => {});
+            try {
+              const { openUrl } = await import('@tauri-apps/plugin-opener');
+              await openUrl(RELEASES_URL);
+            } catch {
+              // ignore
+            }
+          }
+        }, 3000); // 3 секунды задержки перед началом установки
       } catch (e: any) {
         // Игнорируем ошибки updater - они не критичны (endpoint может быть недоступен или не настроен)
         // Rust плагин логирует ERROR, но это нормально если updater не настроен
@@ -440,22 +516,44 @@ function App() {
     return () => {
       cancelled = true;
       clearTimeout(timeout);
+      if (autoInstallTimeoutRef.current) {
+        clearTimeout(autoInstallTimeoutRef.current);
+      }
     };
   }, []);
 
   const installUpdate = useCallback(async () => {
+    // Атомарная проверка и установка флага для предотвращения race condition
+    if (isInstallingRef.current) {
+      logger.debug('APP', 'Update installation already in progress, skipping');
+      return;
+    }
+    isInstallingRef.current = true;
+    
     const update = pendingUpdateRef.current;
-    if (!update) return;
+    if (!update) {
+      isInstallingRef.current = false;
+      return;
+    }
+    
+    // Отменяем автоматическую установку, если пользователь нажал кнопку вручную
+    if (autoInstallTimeoutRef.current) {
+      clearTimeout(autoInstallTimeoutRef.current);
+      autoInstallTimeoutRef.current = null;
+    }
+    
     try {
       const { relaunch } = await import('@tauri-apps/plugin-process');
       await update.downloadAndInstall();
+      logger.info('APP', 'Update installed successfully, relaunching...');
       await relaunch();
     } catch (e) {
+      isInstallingRef.current = false;
       const err = e instanceof Error ? e : new Error(String(e));
       logger.error('APP', `Update install failed: ${err.message}`, err);
       await invoke('show_notification', {
         title: 'Hubnity',
-        body: 'Не удалось установить обновление. Попробуйте скачать с сайта.',
+        body: 'Could not install update. Try downloading from the website.',
       }).catch(() => {});
       try {
         const { openUrl } = await import('@tauri-apps/plugin-opener');
@@ -642,7 +740,6 @@ function App() {
       }
 
       try {
-        const { invoke } = await import('@tauri-apps/api/core');
         const windowInfo = await invoke<{
           app_name: string | null;
           window_title: string | null;
@@ -817,7 +914,6 @@ function App() {
     };
 
     const takeScreenshot = async () => {
-      const { invoke } = await import('@tauri-apps/api/core');
       
       // Check flag BEFORE async operations to prevent race conditions
       if (isCleanedUp) {
@@ -895,7 +991,6 @@ function App() {
         
         // Try uploading via Rust first (more reliable for large files)
         try {
-          const { invoke } = await import('@tauri-apps/api/core');
           const accessToken = useTrackerStore.getState().getAccessToken();
           
           if (accessToken) {
@@ -939,8 +1034,8 @@ function App() {
         // Show error notification only if not cleaned up
         if (!isCleanedUp) {
           await invoke('show_notification', {
-            title: 'Ошибка скриншота',
-            body: error.message || 'Не удалось сделать скриншот',
+            title: 'Screenshot error',
+            body: error.message || 'Could not take screenshot',
           });
         }
       } finally {
@@ -1333,7 +1428,7 @@ function App() {
         {updateAvailable && (
           <div className="px-4 py-2 bg-primary text-primary-foreground flex items-center justify-between gap-3 shrink-0">
             <span className="text-sm">
-              Доступна новая версия {updateAvailable.version}. {updateAvailable.body ?? ''}
+              New version {updateAvailable.version} available. Installation will start automatically in a few seconds... {updateAvailable.body ?? ''}
             </span>
             <div className="shrink-0 flex items-center gap-2">
               <button
@@ -1341,27 +1436,48 @@ function App() {
                 onClick={openReleasesPage}
                 className="px-3 py-1 rounded bg-primary-foreground/80 text-primary text-sm font-medium hover:bg-primary-foreground"
               >
-                Скачать вручную
+                Download manually
               </button>
               <button
                 type="button"
                 onClick={installUpdate}
                 className="px-3 py-1 rounded bg-primary-foreground text-primary text-sm font-medium hover:opacity-90"
               >
-                Установить
+                Install now
               </button>
             </div>
           </div>
         )}
         <Tabs defaultValue="tracker" className="flex flex-col h-full">
           {/* Header - macOS-style segmented control */}
-          <div className="px-6 pt-3 pb-2.5 border-b flex items-center justify-between">
-            <TabsList className="w-auto">
-              <TabsTrigger value="tracker">Трекер</TabsTrigger>
-              {user && (user.role === USER_ROLES.OWNER || user.role === USER_ROLES.ADMIN) && (
-                <TabsTrigger value="settings">Настройки</TabsTrigger>
+          <div className="px-6 pt-3 pb-2.5 border-b flex items-center justify-between gap-3">
+            <div className="flex items-center gap-3 min-w-0">
+              <TabsList className="w-auto flex-shrink-0">
+                <TabsTrigger value="tracker">Tracker</TabsTrigger>
+                {user && (user.role === USER_ROLES.OWNER || user.role === USER_ROLES.ADMIN) && (
+                  <TabsTrigger value="settings">Settings</TabsTrigger>
+                )}
+              </TabsList>
+              {(selectedProject || currentTimeEntry?.project) && (
+                <div
+                  className="hidden sm:inline-flex items-center gap-2 px-2.5 py-1 rounded-md text-xs font-medium truncate max-w-[140px]"
+                  style={{
+                    backgroundColor: (selectedProject?.color || currentTimeEntry?.project?.color || '#6366f1') + '20',
+                    color: selectedProject?.color || currentTimeEntry?.project?.color || '#6366f1',
+                  }}
+                >
+                  <div
+                    className="w-2 h-2 rounded-full flex-shrink-0"
+                    style={{
+                      backgroundColor: selectedProject?.color || currentTimeEntry?.project?.color || '#6366f1',
+                    }}
+                  />
+                  <span className="truncate">
+                    {selectedProject?.name || currentTimeEntry?.project?.name || 'Project'}
+                  </span>
+                </div>
               )}
-            </TabsList>
+            </div>
             {user && (
               <Button
                 onClick={async () => {
@@ -1371,7 +1487,6 @@ function App() {
                   await logout();
                   // Очищаем только локальное UI состояние, не останавливая таймер на сервере
                   // BUG FIX: Also reset lastActivityTime to prevent stale idle detection on next login
-                  const { useTrackerStore } = await import('./store/useTrackerStore');
                   useTrackerStore.setState({
                     projects: [],
                     selectedProject: null,
@@ -1397,9 +1512,9 @@ function App() {
           
           {/* Main Content - Таймер как главный элемент */}
           <TabsContent value="tracker" className="flex-1 overflow-y-auto m-0">
-            <div className="max-w-3xl mx-auto px-6 py-8">
+            <div className="max-w-3xl mx-auto px-4 py-4">
               {/* Проект - inline формат, минимальный вес */}
-              <div className="mb-6">
+              <div className="mb-4">
                 <ProjectSelector />
               </div>
               
@@ -1415,7 +1530,7 @@ function App() {
           )}
           
           {/* Footer - Синхронизация и версия (ненавязчиво) */}
-          <div className="px-6 py-3 border-t bg-muted/30">
+          <div className="px-4 py-2 border-t bg-muted/30">
             <div className="flex items-center justify-between">
               {appVersion && (
                 <span className="text-xs text-muted-foreground/60">

@@ -1,6 +1,8 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
+import { invoke } from '@tauri-apps/api/core';
 import { api, LoginRequest, LoginResponse } from '../lib/api';
+import { useTrackerStore } from './useTrackerStore';
 import { setCurrentUser } from '../lib/current-user';
 import { logger } from '../lib/logger';
 import { setSentryUser, clearSentryUser } from '../lib/sentry';
@@ -30,8 +32,6 @@ export const useAuthStore = create<AuthState>()(
           
           // PRODUCTION: Передаем токены в Rust AuthManager для синхронизации
           // Rust очистит локальные данные (таймер, очередь) если user_id изменился
-          const { invoke } = await import('@tauri-apps/api/core');
-          
           // Проверяем, сменился ли пользователь (до обновления состояния).
           // После логаута в Rust хранится "", не null — считаем пустую строку как «нет предыдущего пользователя».
           const currentUserId = await invoke<string | null>('get_current_user_id').catch(() => null);
@@ -51,7 +51,6 @@ export const useAuthStore = create<AuthState>()(
           // Очищаем состояние трекера при смене пользователя
           // Rust уже очистил таймер и очередь, но фронтенд хранит проекты и активный time entry
           if (userChanged) {
-            const { useTrackerStore } = await import('./useTrackerStore');
             await useTrackerStore.getState().reset();
           }
           
@@ -85,7 +84,6 @@ export const useAuthStore = create<AuthState>()(
           logger.warn('AUTH', 'Logout API call failed (clearing local state anyway)', e);
         }
         setCurrentUser(null);
-        const { invoke } = await import('@tauri-apps/api/core');
         await invoke('set_auth_tokens', {
           accessToken: null,
           refreshToken: null,
@@ -111,7 +109,6 @@ export const useAuthStore = create<AuthState>()(
           logger.warn('AUTH', 'clearTokens: logout API failed', e);
         }
         setCurrentUser(null);
-        const { invoke } = await import('@tauri-apps/api/core');
         await invoke('set_auth_tokens', {
           accessToken: null,
           refreshToken: null,

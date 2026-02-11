@@ -1,4 +1,5 @@
 import axios, { AxiosInstance } from 'axios';
+import { invoke } from '@tauri-apps/api/core';
 import { logger } from './logger';
 
 const API_BASE_URL = 'https://app.automatonsoft.de/api';
@@ -236,7 +237,6 @@ class ApiClient {
             }
             
             // PRODUCTION: Обновляем токены в Rust AuthManager после refresh
-            const { invoke } = await import('@tauri-apps/api/core');
             await invoke('set_auth_tokens', {
               accessToken: access_token,
               refreshToken: newRefreshToken || localStorage.getItem('refresh_token'),
@@ -417,8 +417,6 @@ class ApiClient {
 
   // Screenshots
   async uploadScreenshot(file: File, timeEntryId: string): Promise<void> {
-    const { invoke } = await import('@tauri-apps/api/core');
-    
     try {
       await logger.safeLogToRust(`[API] Starting screenshot upload: file size=${file.size} bytes, timeEntryId=${timeEntryId}`).catch((e) => {
         logger.debug('API', 'Failed to log (non-critical)', e);
