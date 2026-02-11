@@ -995,12 +995,18 @@ function App() {
   }, [isAuthenticated]);
 
   // Listen for resume/stop events from idle window
+  // CRITICAL FIX: useRef must be called unconditionally, before any early returns
+  const idleWindowCleanupRef = useRef<(() => void) | null>(null);
+  const idleWindowMountedRef = useRef(true);
+  
   useEffect(() => {
-    if (!isAuthenticated) return;
-
-    // BUG FIX: Use ref to track if component is mounted and store cleanup function
-    const isMountedRef = useRef(true);
-    const cleanupRef = useRef<(() => void) | null>(null);
+    if (!isAuthenticated) {
+      idleWindowMountedRef.current = false;
+      return;
+    }
+    
+    // Reset mounted state when authenticated
+    idleWindowMountedRef.current = true;
 
     const setupIdleWindowListeners = async () => {
       try {
@@ -1045,30 +1051,36 @@ function App() {
     };
 
     setupIdleWindowListeners().then((cleanup) => {
-      if (cleanup && isMountedRef.current) {
-        cleanupRef.current = cleanup;
+      if (cleanup && idleWindowMountedRef.current) {
+        idleWindowCleanupRef.current = cleanup;
       }
     }).catch((e) => {
       logger.error('APP', 'Failed to setup idle window listeners (cleanup)', e);
     });
     
     return () => {
-      isMountedRef.current = false;
+      idleWindowMountedRef.current = false;
       // Synchronous cleanup if available
-      if (cleanupRef.current) {
-        cleanupRef.current();
-        cleanupRef.current = null;
+      if (idleWindowCleanupRef.current) {
+        idleWindowCleanupRef.current();
+        idleWindowCleanupRef.current = null;
       }
     };
   }, [isAuthenticated]);
 
   // Listen for state request from idle window
+  // CRITICAL FIX: useRef must be called unconditionally, before any early returns
+  const stateRequestCleanupRef = useRef<(() => void) | null>(null);
+  const stateRequestMountedRef = useRef(true);
+  
   useEffect(() => {
-    if (!isAuthenticated) return;
-
-    // BUG FIX: Use ref to track if component is mounted and store cleanup function
-    const isMountedRef = useRef(true);
-    const cleanupRef = useRef<(() => void) | null>(null);
+    if (!isAuthenticated) {
+      stateRequestMountedRef.current = false;
+      return;
+    }
+    
+    // Reset mounted state when authenticated
+    stateRequestMountedRef.current = true;
 
     const setupStateRequestListener = async () => {
       try {
@@ -1120,19 +1132,19 @@ function App() {
     };
 
     setupStateRequestListener().then((cleanup) => {
-      if (cleanup && isMountedRef.current) {
-        cleanupRef.current = cleanup;
+      if (cleanup && stateRequestMountedRef.current) {
+        stateRequestCleanupRef.current = cleanup;
       }
     }).catch((e) => {
       logger.error('APP', 'Failed to setup state request listener (cleanup)', e);
     });
     
     return () => {
-      isMountedRef.current = false;
+      stateRequestMountedRef.current = false;
       // Synchronous cleanup if available
-      if (cleanupRef.current) {
-        cleanupRef.current();
-        cleanupRef.current = null;
+      if (stateRequestCleanupRef.current) {
+        stateRequestCleanupRef.current();
+        stateRequestCleanupRef.current = null;
       }
     };
   }, [isAuthenticated]);
