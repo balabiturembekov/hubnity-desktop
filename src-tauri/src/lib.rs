@@ -28,6 +28,8 @@ struct SyncStatusResponse {
     pending_count: i32,
     failed_count: i32,
     is_online: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_sync_at: Option<i64>,
 }
 
 

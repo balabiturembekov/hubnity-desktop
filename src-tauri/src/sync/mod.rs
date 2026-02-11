@@ -578,6 +578,12 @@ impl SyncManager {
                         // ДОКАЗАНО: Задача помечена как sent - увеличиваем счетчики
                         synced_count += 1;
                         *by_type_synced.entry(entity_type.clone()).or_insert(0) += 1;
+                        if let Err(e) = self.db.set_app_meta(
+                            "last_sync_at",
+                            &chrono::Utc::now().timestamp().to_string(),
+                        ) {
+                            tracing::warn!("[SYNC] Failed to update last_sync_at: {}", e);
+                        }
                     } else {
                         // ДОКАЗАНО: mark_task_sent не удался после всех попыток
                         // Задача остается pending и будет retried - это лучше, чем потерять задачу

@@ -836,10 +836,18 @@ pub async fn get_sync_status(
     // Проверяем online статус через попытку HTTP запроса (легковесный HEAD запрос)
     let is_online = check_online_status().await;
 
+    let last_sync_at = sync_manager
+        .db
+        .get_app_meta("last_sync_at")
+        .ok()
+        .flatten()
+        .and_then(|s| s.parse::<i64>().ok());
+
     Ok(SyncStatusResponse {
         pending_count,
         failed_count,
         is_online,
+        last_sync_at,
     })
 }
 
