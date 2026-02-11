@@ -356,7 +356,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           await get().stopTracking();
         } catch (e) {
           logger.error('SELECT_PROJECT', 'Failed to stop tracking before project switch', e);
-          set({ error: 'Не удалось остановить таймер перед сменой проекта' });
+          set({ error: 'Could not stop timer before switching project' });
           throw e;
         }
       }
@@ -372,7 +372,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         await get().stopTracking();
       } catch (e) {
         logger.error('SELECT_PROJECT', 'Failed to stop tracking before project switch', e);
-        set({ error: 'Не удалось остановить таймер перед сменой проекта' });
+        set({ error: 'Could not stop timer before switching project' });
         throw e;
       }
     }
@@ -638,81 +638,53 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       if (description) {
         requestData.description = description;
       } else {
-        requestData.description = `Работа над проектом ${selectedProject.name}`;
+        requestData.description = `Work on project ${selectedProject.name}`;
       }
       
-      // Сохраняем в очередь синхронизации (offline-first)
-      const accessToken = api.getAccessToken();
-      const refreshToken = localStorage.getItem('refresh_token');
-      if (accessToken) {
-        try {
-          const { invoke } = await import('@tauri-apps/api/core');
-          await invoke('enqueue_time_entry', {
-            operation: 'start',
-            payload: requestData,
-            accessToken: accessToken,
-            refreshToken: refreshToken || null,
-          }).catch((e) => {
-            logger.warn('START', 'Failed to enqueue, will use direct API', e);
-          });
-        } catch (e) {
-          logger.warn('START', 'Queue unavailable, will use direct API', e);
-        }
-      }
+      // OPTIMISTIC: Сначала Timer Engine (локально), сразу обновляем UI
+      const now = Date.now();
+      const nowStr = new Date(now).toISOString();
+      const optimisticEntry: TimeEntry = {
+        id: `temp-${now}`,
+        userId: user.id,
+        projectId: selectedProject.id,
+        startTime: nowStr,
+        endTime: null,
+        duration: 0,
+        description: requestData.description || `Work on project ${selectedProject.name}`,
+        status: 'RUNNING',
+        createdAt: nowStr,
+        updatedAt: nowStr,
+        project: {
+          id: selectedProject.id,
+          name: selectedProject.name,
+          color: selectedProject.color || '#6366f1',
+        },
+      };
       
-      // BUG FIX: Set local timer start time BEFORE API call
-      // This protects against syncTimerState stopping the timer if API fails
-      const localStartTime = Date.now();
-      set({ localTimerStartTime: localStartTime });
-      
-      // Прямой вызов API для немедленного обновления UI
-      // Если API недоступен, данные останутся в очереди и синхронизируются позже
-      let timeEntry: TimeEntry;
+      let timerState: TimerStateResponse | null = null;
       try {
-        timeEntry = await api.startTimeEntry(requestData);
-      } catch (apiError: any) {
-        // BUG FIX: If API fails but Timer Engine will start, keep localTimerStartTime
-        // This prevents syncTimerState from stopping the timer
-        logger.warn('START', 'API call failed, but Timer Engine will start locally', apiError);
-        // Re-throw to handle in outer catch block
-        throw apiError;
-      }
-      
-      // Запускаем Timer Engine в Rust (единственный source of truth для времени)
-      let timerState;
-      try {
-        // Сначала проверяем текущее состояние таймера
         const currentTimerState = await TimerEngineAPI.getState();
-        
-        // FIX: Используем state напрямую (не state.state.state) из-за #[serde(flatten)] в Rust
         if (currentTimerState.state === 'STOPPED') {
-          // Таймер остановлен - запускаем
           timerState = await TimerEngineAPI.start();
         } else if (currentTimerState.state === 'PAUSED') {
-          // Таймер на паузе - возобновляем
           timerState = await TimerEngineAPI.resume();
         } else if (currentTimerState.state === 'RUNNING') {
-          // Таймер уже запущен - используем текущее состояние
           timerState = currentTimerState;
         } else {
-          // Неизвестное состояние - пытаемся запустить
           timerState = await TimerEngineAPI.start();
         }
       } catch (timerError: any) {
-        // Если таймер уже запущен или на паузе, получаем текущее состояние
         if (timerError.message?.includes('already running') || 
             timerError.message?.includes('already paused')) {
           timerState = await TimerEngineAPI.getState();
         } else {
-          // Другая ошибка - показываем toast и продолжаем
-          const { invoke } = await import('@tauri-apps/api/core');
           await invoke('show_notification', {
-            title: 'Ошибка таймера',
-            body: 'Не удалось запустить таймер, но запись времени создана',
+            title: 'Timer error',
+            body: 'Could not start timer',
           }).catch((e) => {
             logger.warn('START', 'Failed to show notification (non-critical)', e);
           });
-          // Продолжаем - API запись создана
           timerState = await TimerEngineAPI.getState().catch((e) => {
             logger.logError('START:getState_fallback', e);
             return null;
@@ -720,51 +692,81 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         }
       }
       
-      // Start activity monitoring (don't fail if this fails)
-      try {
-        await invoke('start_activity_monitoring');
-      } catch (monitoringError) {
-        logger.error('START', 'Failed to start activity monitoring', monitoringError);
-      }
+      const isStarted = timerState?.state === 'RUNNING' || timerState?.state === 'PAUSED' || false;
       
-      // Send initial heartbeat (don't fail if this fails)
-      try {
-        await api.sendHeartbeat(true);
-      } catch (heartbeatError) {
-        logger.error('START', 'Failed to send initial heartbeat', heartbeatError);
-      }
+      // OPTIMISTIC: Обновляем UI сразу
+      set({
+        currentTimeEntry: optimisticEntry,
+        isTracking: isStarted,
+        isPaused: timerState?.state === 'PAUSED' || false,
+        lastActivityTime: now,
+        isLoading: false,
+        error: !isStarted ? 'Could not start timer' : null,
+        localTimerStartTime: isStarted ? now : null,
+      });
       
-      // Обновляем UI state на основе Timer Engine
-      // FIX: Используем state напрямую (не state.state.state) из-за #[serde(flatten)] в Rust
-      // BUG FIX: Если Timer Engine не запустился, но API запись создана, синхронизируем состояние
-      if (!timerState || timerState.state === 'STOPPED') {
-        logger.warn('START', 'Timer Engine not started but API entry created - syncing state');
-        // Пытаемся запустить Timer Engine еще раз
+      invoke('start_activity_monitoring').catch((e) => {
+        logger.error('START', 'Failed to start activity monitoring', e);
+      });
+      
+      // API в фоне
+      if (isStarted) (async () => {
         try {
-          timerState = await TimerEngineAPI.start();
-        } catch (retryError: any) {
-          logger.error('START', 'Failed to start Timer Engine after API success', retryError);
-          // Если не удалось запустить Timer Engine, но запись создана, показываем ошибку
+          const accessToken = api.getAccessToken();
+          const refreshToken = localStorage.getItem('refresh_token');
+          if (accessToken) {
+            await invoke('enqueue_time_entry', {
+              operation: 'start',
+              payload: requestData,
+              accessToken: accessToken,
+              refreshToken: refreshToken || null,
+            }).catch((e) => {
+              logger.warn('START', 'Failed to enqueue (background)', e);
+            });
+          }
+          const timeEntry = await api.startTimeEntry(requestData);
+          await api.sendHeartbeat(true);
+          const state = get();
+          if (state.isTracking && state.currentTimeEntry?.id?.startsWith('temp-')) {
+            set({
+              currentTimeEntry: timeEntry,
+              localTimerStartTime: null,
+            });
+          }
+        } catch (apiError: any) {
+          if (apiError.message?.includes('already running') || 
+              apiError.message?.includes('User already has')) {
+            try {
+              const activeEntries = await api.getActiveTimeEntries();
+              const userEntries = activeEntries.filter(e => e.userId === user.id);
+              const activeEntry = userEntries[0] ?? activeEntries[0];
+              if (activeEntry) {
+                set({
+                  currentTimeEntry: activeEntry,
+                  localTimerStartTime: null,
+                  error: null,
+                });
+                return;
+              }
+            } catch (_) {}
+          }
+          logger.warn('START', 'API failed (background), queue will retry', apiError);
+          try {
+            await TimerEngineAPI.stop();
+          } catch (_) {}
           set({
-            currentTimeEntry: timeEntry,
+            currentTimeEntry: null,
             isTracking: false,
             isPaused: false,
-            isLoading: false,
-            error: 'Запись создана, но таймер не запущен. Попробуйте возобновить вручную.',
+            localTimerStartTime: null,
+            error: 'Could not create entry (will sync later)',
           });
-          return;
+          invoke('show_notification', {
+            title: 'Sync',
+            body: 'Timer started, but could not sync with server',
+          }).catch(() => {});
         }
-      }
-      
-      set({
-        currentTimeEntry: timeEntry,
-        isTracking: timerState?.state === 'RUNNING' || timerState?.state === 'PAUSED' || false, // BUG FIX: isTracking should be true if RUNNING or PAUSED
-        isPaused: timerState?.state === 'PAUSED' || false,
-        lastActivityTime: Date.now(),
-        isLoading: false,
-        error: null,
-        localTimerStartTime: null, // Clear local timer start time when entry is created on server
-      });
+      })();
     } catch (error: any) {
       // BUG FIX: При ошибке API нужно проверить, была ли запись создана
       // Если запись создана, но произошла ошибка, нужно синхронизировать состояние
@@ -810,17 +812,10 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
   },
 
   pauseTracking: async (isIdlePause: boolean = false) => {
-    const { currentTimeEntry, isLoading: currentLoading } = get();
-    if (!currentTimeEntry) {
-      await logger.safeLogToRust('[PAUSE] No current time entry, skipping').catch((e) => {
-        logger.debug('PAUSE', 'Failed to log (non-critical)', e);
-      });
-      return;
-    }
-    
+    const { isLoading: currentLoading } = get();
+
     // GUARD: Prevent multiple simultaneous calls - устанавливаем isLoading СРАЗУ
     if (currentLoading) {
-      const { invoke } = await import('@tauri-apps/api/core');
       invoke('log_message', { message: '[PAUSE] Already loading, skipping' }).catch((e) => {
         logger.debug('PAUSE', 'Failed to log message (non-critical)', e);
       });
@@ -830,35 +825,135 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
     // Устанавливаем isLoading СРАЗУ для защиты от race condition
     set({ isLoading: true });
     
-    // BUG FIX: Double-check Timer Engine state instead of store cache
-    // Store cache can be stale, Timer Engine is source of truth
+    // BUG FIX: Check Timer Engine state first - it's the source of truth
+    // If Timer Engine is RUNNING but currentTimeEntry is missing, try to load it or pause Timer Engine anyway
+    let timerState: TimerStateResponse | null = null;
     try {
-      const timerState = await TimerEngineAPI.getState();
+      timerState = await TimerEngineAPI.getState();
       if (timerState.state === 'PAUSED' && !isIdlePause) {
         set({ isLoading: false });
-        const { invoke } = await import('@tauri-apps/api/core');
-        invoke('log_message', { message: '[PAUSE] Already paused (double-check from Timer Engine), skipping' }).catch((e) => {
+        invoke('log_message', { message: '[PAUSE] Already paused (Timer Engine check), skipping' }).catch((e) => {
           logger.debug('PAUSE', 'Failed to log message (non-critical)', e);
         });
         return;
       }
+      if (timerState.state === 'STOPPED') {
+        set({ isLoading: false });
+        await logger.safeLogToRust('[PAUSE] Timer Engine is STOPPED, skipping').catch((e) => {
+          logger.debug('PAUSE', 'Failed to log (non-critical)', e);
+        });
+        return;
+      }
     } catch (error) {
-      logger.warn('PAUSE', 'Failed to get Timer Engine state for double-check', error);
-      // Continue with pause if we can't check - better to try than skip
+      logger.warn('PAUSE', 'Failed to get Timer Engine state', error);
+      set({ isLoading: false });
+      return; // Can't pause if we can't check Timer Engine state
     }
 
-    // BUG FIX: Re-check currentTimeEntry after async operations (sendUrlActivities, etc.)
-    // currentTimeEntry from start of function may be stale after async operations
+    // BUG FIX: If Timer Engine is RUNNING but currentTimeEntry is missing, try to load it
     let timeEntryToPause = get().currentTimeEntry;
+    if (!timeEntryToPause && timerState.state === 'RUNNING') {
+      logger.info('PAUSE', 'Timer Engine is RUNNING but no currentTimeEntry - trying to load active entry');
+      try {
+        await get().loadActiveTimeEntry();
+        timeEntryToPause = get().currentTimeEntry;
+        if (!timeEntryToPause) {
+          logger.warn('PAUSE', 'Failed to load active entry, but Timer Engine is RUNNING - pausing Timer Engine anyway');
+          // Continue with pause - Timer Engine is source of truth, we'll pause it even without entry
+        }
+      } catch (loadError) {
+        logger.warn('PAUSE', 'Failed to load active entry', loadError);
+        // Continue with pause - Timer Engine is source of truth
+      }
+    }
+    
+    // BUG FIX: If still no timeEntryToPause but Timer Engine is RUNNING, pause Timer Engine anyway
+    // This handles cases where entry was deleted on server but Timer Engine is still running
+    if (!timeEntryToPause && timerState.state === 'RUNNING') {
+      logger.info('PAUSE', 'Pausing Timer Engine without time entry (entry may have been deleted on server)');
+      try {
+        await TimerEngineAPI.pause();
+        // BUG FIX: Re-check Timer Engine state after pause to ensure it's actually paused
+        const pausedState = await TimerEngineAPI.getState();
+        if (pausedState.state === 'PAUSED') {
+          set({
+            isPaused: true,
+            isTracking: true, // Timer is active, just paused
+            isLoading: false,
+            error: null,
+            idlePauseStartTime: isIdlePause ? Date.now() : null,
+          });
+          await invoke('stop_activity_monitoring').catch(() => {});
+          await logger.safeLogToRust('[PAUSE] Timer Engine paused without time entry').catch(() => {});
+          return;
+        } else {
+          logger.warn('PAUSE', `Timer Engine pause called but state is ${pausedState.state}, not PAUSED`);
+          // Fall through to error handling
+        }
+      } catch (pauseError: any) {
+        logger.error('PAUSE', 'Failed to pause Timer Engine without entry', pauseError);
+        // BUG FIX: Check Timer Engine state - it might have paused successfully despite error
+        try {
+          const actualTimerState = await TimerEngineAPI.getState();
+          if (actualTimerState.state === 'PAUSED') {
+            // Timer Engine was paused successfully - sync state, clear error
+            logger.info('PAUSE', 'Timer Engine paused successfully despite error - syncing state');
+            set({
+              isPaused: true,
+              isTracking: true, // Timer is active, just paused
+              isLoading: false,
+              error: null,
+              idlePauseStartTime: isIdlePause ? Date.now() : null,
+            });
+            await invoke('stop_activity_monitoring').catch(() => {});
+            return;
+          }
+        } catch (stateError) {
+          logger.warn('PAUSE', 'Failed to check Timer Engine state after pause error', stateError);
+        }
+        // Timer Engine is not paused - show error
+        set({ isLoading: false, error: 'Could not pause timer' });
+        return;
+      }
+    }
+    
+    // If we still don't have timeEntryToPause and Timer Engine is not RUNNING, we can't proceed
+    // But if Timer Engine is RUNNING, we should have paused it above
     if (!timeEntryToPause) {
+      // Re-check Timer Engine state - it might have changed
+      try {
+        const finalTimerState = await TimerEngineAPI.getState();
+        if (finalTimerState.state === 'RUNNING') {
+          // Timer Engine is still RUNNING but we don't have entry - try to pause anyway
+          logger.warn('PAUSE', 'Timer Engine is RUNNING but no entry - attempting pause anyway');
+          try {
+            await TimerEngineAPI.pause();
+            const pausedState = await TimerEngineAPI.getState();
+            set({
+              isPaused: pausedState.state === 'PAUSED',
+              isTracking: pausedState.state === 'PAUSED',
+              isLoading: false,
+              error: null,
+              idlePauseStartTime: isIdlePause ? Date.now() : null,
+            });
+            await invoke('stop_activity_monitoring').catch(() => {});
+            return;
+          } catch (finalPauseError) {
+            logger.error('PAUSE', 'Final attempt to pause Timer Engine failed', finalPauseError);
+            set({ isLoading: false, error: 'Could not pause timer' });
+            return;
+          }
+        }
+      } catch (stateCheckError) {
+        logger.warn('PAUSE', 'Failed to re-check Timer Engine state', stateCheckError);
+      }
       set({ isLoading: false });
-      await logger.safeLogToRust('[PAUSE] No current time entry after re-check, skipping').catch((e) => {
+      await logger.safeLogToRust('[PAUSE] No current time entry and Timer Engine is not RUNNING, skipping').catch((e) => {
         logger.debug('PAUSE', 'Failed to log (non-critical)', e);
       });
       return;
     }
 
-    const { invoke } = await import('@tauri-apps/api/core');
     await invoke('log_message', { message: `[PAUSE] Starting pause for timeEntry: ${timeEntryToPause.id}, isIdlePause: ${isIdlePause}` }).catch((e) => {
       logger.debug('PAUSE', 'Failed to log message (non-critical)', e);
     });
@@ -866,24 +961,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
     try {
       set({ error: null }); // Clear previous errors (isLoading уже установлен выше)
       
-      // Send accumulated URL activities before pausing
-      try {
-        await get().sendUrlActivities();
-        // BUG FIX: Re-check currentTimeEntry after sendUrlActivities (it may have changed)
-        const recheckedEntry = get().currentTimeEntry;
-        if (recheckedEntry && recheckedEntry.id === timeEntryToPause.id) {
-          timeEntryToPause = recheckedEntry; // Use updated entry if available
-        }
-      } catch (e) {
-        // Log but don't fail pause operation if URL activities send fails
-        logger.warn('PAUSE', 'Failed to send URL activities before pause', e);
-        await invoke('log_message', { message: `[PAUSE] Failed to send URL activities before pause: ${e}` }).catch((err) => {
-          logger.debug('PAUSE', 'Failed to log message (non-critical)', err);
-        });
-      }
-      
-      // BUG FIX: Re-check currentTimeEntry before using it in async operations
-      // After sendUrlActivities, currentTimeEntry may have changed
+      // Re-check currentTimeEntry before using it
       const finalTimeEntryToPause = get().currentTimeEntry;
       if (!finalTimeEntryToPause || !timeEntryToPause || finalTimeEntryToPause.id !== timeEntryToPause.id) {
         set({ isLoading: false });
@@ -892,163 +970,85 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         });
         return;
       }
-      timeEntryToPause = finalTimeEntryToPause; // Use latest entry
-
-      // Сохраняем в очередь синхронизации (offline-first)
-      const accessToken = api.getAccessToken();
-      const refreshToken = localStorage.getItem('refresh_token');
-      if (accessToken && timeEntryToPause) {
-        try {
-          await invoke('enqueue_time_entry', {
-            operation: 'pause',
-            payload: { id: timeEntryToPause.id },
-            accessToken: accessToken,
-            refreshToken: refreshToken || null,
-          }).catch((e) => {
-            logger.warn('PAUSE', 'Failed to enqueue, will use direct API', e);
-          });
-        } catch (e) {
-          logger.warn('PAUSE', 'Queue unavailable, will use direct API', e);
-        }
-      }
+      timeEntryToPause = finalTimeEntryToPause;
+      const entryIdToPause = timeEntryToPause.id;
       
-      // Сначала паузим Timer Engine в Rust (единственный source of truth)
-      // Rust FSM проверит валидность перехода и вернет ошибку, если переход недопустим
+      // OPTIMISTIC: Сначала паузим Timer Engine (локально) и сразу обновляем UI
+      // Как в Hubstaff — UI реагирует мгновенно, API в фоне
       let timerState: import('../lib/timer-engine').TimerStateResponse | null = null;
       try {
         timerState = await TimerEngineAPI.pause();
       } catch (timerError: any) {
-        // Если таймер уже на паузе или остановлен, получаем текущее состояние
         if (timerError.message?.includes('already paused') || 
             timerError.message?.includes('stopped') ||
             timerError.message?.includes('Cannot pause')) {
-          await invoke('log_message', { 
-            message: `[PAUSE] Timer Engine rejected pause: ${timerError.message}. Getting current state.` 
-          }).catch((e) => {
-            logger.debug('PAUSE', 'Failed to log message (non-critical)', e);
-          });
           timerState = await TimerEngineAPI.getState();
         } else {
-          // Другая ошибка - показываем toast, но продолжаем с API паузой
           await invoke('show_notification', {
-            title: 'Ошибка таймера',
-            body: 'Не удалось приостановить таймер, но попытаемся обновить запись на сервере',
+            title: 'Timer error',
+            body: 'Could not pause timer',
           }).catch((e) => {
             logger.warn('PAUSE', 'Failed to show notification (non-critical)', e);
           });
           timerState = await TimerEngineAPI.getState().catch((e) => {
-            logger.logError('START:getState_fallback', e);
+            logger.logError('PAUSE:getState_fallback', e);
             return null;
           });
         }
       }
       
-      // Вызываем API для паузы time entry (для синхронизации с сервером)
-      // Если Timer Engine уже на паузе, API может вернуть ошибку, но это нормально
-      if (!timeEntryToPause) {
-        set({ isLoading: false });
-        await logger.safeLogToRust('[PAUSE] No time entry to pause, aborting').catch((e) => {
-          logger.debug('PAUSE', 'Failed to log (non-critical)', e);
-        });
-        return;
-      }
-      await logger.safeLogToRust('[PAUSE] Calling API pauseTimeEntry...');
-      let timeEntry: TimeEntry | null = null;
-      try {
-        timeEntry = await api.pauseTimeEntry(timeEntryToPause.id);
-      } catch (apiError: any) {
-        // Если entry уже на паузе на сервере, это нормально - просто обновляем локальное состояние
-        if (apiError.message?.includes('Only running entries can be paused') ||
-            apiError.message?.includes('already paused')) {
-          await logger.safeLogToRust(`[PAUSE] Entry already paused on server: ${apiError.message}`).catch((e) => {
-            logger.debug('PAUSE', 'Failed to log (non-critical)', e);
-          });
-          // Получаем актуальное состояние entry с сервера
-          if (!timeEntryToPause) {
-            set({ isLoading: false });
-            await logger.safeLogToRust('[PAUSE] No time entry to pause after API error, aborting').catch((e) => {
-              logger.debug('PAUSE', 'Failed to log (non-critical)', e);
-            });
-            return;
-          }
-          const entryId = timeEntryToPause.id; // Store ID before async operation
-          try {
-            const activeEntries = await api.getActiveTimeEntries();
-            timeEntry = activeEntries.find(e => e.id === entryId) || timeEntryToPause;
-          } catch {
-            timeEntry = timeEntryToPause; // Fallback
-          }
-        } else {
-          // Другая ошибка API - но проверяем Timer Engine состояние перед пробросом
-          // Если Timer Engine успешно паузился, синхронизируем состояние, а не пробрасываем ошибку
-          const currentTimerState = await TimerEngineAPI.getState().catch(() => null);
-          if (currentTimerState?.state === 'PAUSED') {
-            // Timer Engine успешно паузился - используем его состояние, игнорируем API ошибку
-            logger.warn('PAUSE', 'API failed but Timer Engine paused successfully - syncing state');
-            timerState = currentTimerState;
-            // Получаем актуальное состояние entry с сервера для обновления
-            if (!timeEntryToPause) {
-              set({ isLoading: false });
-              await logger.safeLogToRust('[PAUSE] No time entry to pause after Timer Engine sync, aborting').catch((e) => {
-                logger.debug('PAUSE', 'Failed to log (non-critical)', e);
-              });
-              return;
-            }
-            const entryId = timeEntryToPause.id; // Store ID before async operation
-            try {
-              const activeEntries = await api.getActiveTimeEntries();
-              timeEntry = activeEntries.find(e => e.id === entryId) || timeEntryToPause;
-            } catch {
-              timeEntry = timeEntryToPause; // Fallback
-            }
-          } else {
-            // Timer Engine не на паузе - пробрасываем ошибку API
-            throw apiError;
-          }
-        }
-      }
-      
-      // Используем состояние Timer Engine как источник истины
-      // Если Timer Engine на паузе, значит пауза успешна, независимо от ответа API
-      
-      // Stop monitoring when paused
-      try {
-        await invoke('stop_activity_monitoring');
-      } catch (monitoringError) {
-        // BUG FIX: Log error instead of silently ignoring
-        logger.debug('PAUSE', 'Failed to stop activity monitoring (non-critical)', monitoringError);
-      }
-      
-      // Send heartbeat
-      try {
-        await api.sendHeartbeat(false);
-      } catch (heartbeatError) {
-        // BUG FIX: Log error instead of silently ignoring
-        logger.debug('PAUSE', 'Failed to send heartbeat (non-critical)', heartbeatError);
-      }
-      
-      // Set idlePauseStartTime only if this is an idle pause
-      // idlePauseStart используется ниже в update_idle_state
-      
-      // Обновляем UI state на основе Timer Engine (единственный source of truth)
-      // Timer Engine уже проверил валидность перехода через FSM
-      // FIX: Используем state напрямую (не state.state.state) из-за #[serde(flatten)] в Rust
+      const pauseStartTime = isIdlePause ? Date.now() : null;
       const isPaused = timerState?.state === 'PAUSED' || false;
       
-      // FIX: Устанавливаем idlePauseStartTime для idle pause
-      // Если это idle pause, устанавливаем время паузы сразу (проверим после set, что пауза успешна)
-      // Используем более надежную логику: устанавливаем для idle pause, затем проверяем
-      const pauseStartTime = isIdlePause ? Date.now() : null;
-      
-      logger.debug('PAUSE', `Setting idlePauseStartTime: ${pauseStartTime}, isIdlePause: ${isIdlePause}, isPaused: ${isPaused}, timerState: ${timerState?.state}`);
-      
+      // OPTIMISTIC: Обновляем UI сразу после Timer Engine — без ожидания API
       set({
-        currentTimeEntry: timeEntry || currentTimeEntry, // Используем обновленное entry, если есть
+        currentTimeEntry: timeEntryToPause,
         isPaused: isPaused,
         isLoading: false,
-        error: null,
-        idlePauseStartTime: pauseStartTime, // Устанавливаем для idle pause, проверим после
+        error: !isPaused ? 'Could not pause' : null,
+        localTimerStartTime: null,
+        idlePauseStartTime: pauseStartTime,
       });
+      
+      // Stop monitoring immediately (local, fast)
+      invoke('stop_activity_monitoring').catch((e) => {
+        logger.debug('PAUSE', 'Failed to stop activity monitoring (non-critical)', e);
+      });
+      
+      // API в фоне, только если пауза успешна (пропускаем temp id — запись ещё не создана)
+      if (isPaused && !entryIdToPause.startsWith('temp-')) (async () => {
+        try {
+          await get().sendUrlActivities();
+        } catch (e) {
+          logger.warn('PAUSE', 'Failed to send URL activities (background)', e);
+        }
+        try {
+          const accessToken = api.getAccessToken();
+          const refreshToken = localStorage.getItem('refresh_token');
+          if (accessToken) {
+            await invoke('enqueue_time_entry', {
+              operation: 'pause',
+              payload: { id: entryIdToPause },
+              accessToken: accessToken,
+              refreshToken: refreshToken || null,
+            }).catch((e) => {
+              logger.warn('PAUSE', 'Failed to enqueue (background)', e);
+            });
+          }
+          await api.pauseTimeEntry(entryIdToPause);
+          await api.sendHeartbeat(false);
+        } catch (apiError: any) {
+          if (apiError.message?.includes('Only running entries can be paused') ||
+              apiError.message?.includes('already paused')) {
+            return;
+          }
+          logger.warn('PAUSE', 'API failed (background), queue will retry', apiError);
+          invoke('show_notification', {
+            title: 'Sync',
+            body: 'Pause completed, but could not sync with server',
+          }).catch(() => {});
+        }
+      })();
       
       const stateAfterPause = get();
       
@@ -1099,18 +1099,30 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         }
       } else {
         // Проверяем реальное состояние Timer Engine при ошибке
+        // BUG FIX: If Timer Engine was paused successfully, sync state and clear error
         try {
           const timerState = await TimerEngineAPI.getState();
           // Синхронизируем состояние с Timer Engine
+          const wasPausedSuccessfully = timerState.state === 'PAUSED';
           set({
             isPaused: timerState.state === 'PAUSED',
             isTracking: timerState.state === 'RUNNING' || timerState.state === 'PAUSED',
             isLoading: false,
-            error: msg,
+            error: wasPausedSuccessfully ? null : msg, // Clear error if pause was successful
+            idlePauseStartTime: (timerState.state === 'PAUSED' && isIdlePause) ? Date.now() : null,
             ...(timerState.state === 'STOPPED' ? { currentTimeEntry: null, idlePauseStartTime: null } : {}),
           });
+          if (wasPausedSuccessfully) {
+            logger.info('PAUSE', 'Timer Engine paused successfully despite API error - state synced, error cleared');
+            try {
+              await invoke('stop_activity_monitoring');
+            } catch (e) {
+              logger.debug('PAUSE', 'Failed to stop activity monitoring (non-critical)', e);
+            }
+          }
         } catch (e) {
           // Если не удалось проверить Timer Engine, только устанавливаем ошибку
+          logger.warn('PAUSE', 'Failed to check Timer Engine state after error', e);
           set({ error: msg, isLoading: false });
         }
         try {
@@ -1173,12 +1185,15 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         await TimerEngineAPI.resume();
         // Update store state
         const newTimerState = await TimerEngineAPI.getState();
+        const resumeTimeNoEntry = Date.now();
         set({
           isPaused: false,
           isTracking: newTimerState.state === 'RUNNING',
           isLoading: false,
           error: null,
           idlePauseStartTime: null,
+          lastResumeTime: resumeTimeNoEntry, // BUG FIX: Track resume time to prevent sync from pausing immediately after resume
+          localTimerStartTime: resumeTimeNoEntry, // BUG FIX: Track local resume time to prevent auto-pause from syncTimerState
         });
         // Try to load active time entry after resume
         await get().loadActiveTimeEntry();
@@ -1266,117 +1281,78 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         // Продолжаем попытку возобновления - возможно, это временная проблема сети
       }
       
-      // Сохраняем в очередь синхронизации (offline-first)
-      const accessToken = api.getAccessToken();
-      const refreshToken = localStorage.getItem('refresh_token');
-      if (accessToken && timeEntryToResume) {
-        try {
-          await invoke('enqueue_time_entry', {
-            operation: 'resume',
-            payload: { id: timeEntryToResume.id },
-            accessToken: accessToken,
-            refreshToken: refreshToken || null,
-          }).catch((e) => {
-            logger.warn('RESUME', 'Failed to enqueue, will use direct API', e);
-          });
-        } catch (e) {
-          logger.warn('RESUME', 'Queue unavailable, will use direct API', e);
-        }
-      }
-      
-      // Вызываем API для возобновления time entry (для немедленного обновления UI)
-      if (!timeEntryToResume) {
-        set({ isLoading: false });
-        await logger.safeLogToRust('[RESUME] No time entry to resume, aborting').catch((e) => {
-          logger.debug('RESUME', 'Failed to log (non-critical)', e);
-        });
-        return;
-      }
-      const timeEntry = await api.resumeTimeEntry(timeEntryToResume.id);
-      
-      // Validate response
-      if (!timeEntry || !timeEntry.id || timeEntry.status !== 'RUNNING') {
-        throw new Error('Invalid resume response from server');
-      }
-      
-      // Возобновляем Timer Engine в Rust
+      // OPTIMISTIC: Сначала Timer Engine (локально), сразу обновляем UI
+      const entryIdToResume = timeEntryToResume.id;
       let timerState: import('../lib/timer-engine').TimerStateResponse | null = null;
       try {
         timerState = await TimerEngineAPI.resume();
       } catch (timerError: any) {
-        // Если таймер уже запущен, получаем текущее состояние
         if (timerError.message?.includes('already running')) {
           timerState = await TimerEngineAPI.getState();
         } else {
-          // Другая ошибка - показываем toast, но пытаемся получить состояние
-          const { invoke } = await import('@tauri-apps/api/core');
           await invoke('show_notification', {
-            title: 'Ошибка таймера',
-            body: 'Не удалось возобновить таймер, но запись времени обновлена',
+            title: 'Timer error',
+            body: 'Could not resume timer',
           }).catch((e) => {
             logger.warn('RESUME', 'Failed to show notification (non-critical)', e);
           });
-          // Пытаемся получить текущее состояние Timer Engine
           timerState = await TimerEngineAPI.getState().catch(() => null);
         }
       }
       
-      // BUG FIX: Если Timer Engine не запустился, но API запись обновлена, синхронизируем состояние
-      if (!timerState || timerState.state !== 'RUNNING') {
-        logger.warn('RESUME', 'Timer Engine not resumed but API entry updated - syncing state');
-        // Пытаемся запустить Timer Engine еще раз
-        try {
-          timerState = await TimerEngineAPI.resume();
-        } catch (retryError: any) {
-          logger.error('RESUME', 'Failed to resume Timer Engine after API success', retryError);
-          // Если не удалось запустить Timer Engine, но запись обновлена, показываем ошибку
-          set({
-            currentTimeEntry: timeEntry,
-            isPaused: false,
-            isTracking: false, // Timer Engine не запущен
-            isLoading: false,
-            error: 'Запись обновлена, но таймер не запущен. Попробуйте возобновить вручную.',
-            idlePauseStartTime: null,
-          });
-          return;
-        }
-      }
+      const isResumed = timerState?.state === 'RUNNING' || false;
+      const resumeTime = Date.now();
       
-      // Start activity monitoring
-      try {
-        await invoke('start_activity_monitoring');
-      } catch (monitoringError) {
-        logger.error('RESUME', 'Failed to start activity monitoring on resume', monitoringError);
-      }
-      
-      // Send heartbeat
-      try {
-        await api.sendHeartbeat(true);
-      } catch (heartbeatError) {
-        logger.error('RESUME', 'Failed to send heartbeat on resume', heartbeatError);
-      }
-      
-      // Обновляем UI state на основе Timer Engine (source of truth)
-      // BUG FIX: isTracking should be true if RUNNING or PAUSED (timer is active, just paused)
-      // Only false if STOPPED
-      const isTracking = timerState?.state === 'RUNNING' || timerState?.state === 'PAUSED' || false;
+      // OPTIMISTIC: Обновляем UI сразу
       set({
-        currentTimeEntry: timeEntry,
+        currentTimeEntry: timeEntryToResume,
         isPaused: false,
-        isTracking: isTracking,
-        lastActivityTime: Date.now(),
+        isTracking: isResumed,
+        lastActivityTime: resumeTime,
         isLoading: false,
-        error: null,
-        idlePauseStartTime: null, // Clear idle pause time on resume
-        lastResumeTime: Date.now(), // BUG FIX: Track resume time to prevent sync from pausing immediately after resume
+        error: !isResumed ? 'Could not resume timer' : null,
+        idlePauseStartTime: null,
+        lastResumeTime: resumeTime,
+        localTimerStartTime: resumeTime,
       });
       
-      // Hide idle window on resume
-      try {
-        await invoke('hide_idle_window');
-      } catch (error) {
-        // Ignore errors
+      invoke('start_activity_monitoring').catch((e) => {
+        logger.error('RESUME', 'Failed to start activity monitoring on resume', e);
+      });
+      
+      if (isResumed) {
+        invoke('hide_idle_window').catch(() => {});
       }
+      
+      // API в фоне (пропускаем temp id — запись ещё не создана)
+      if (isResumed && !entryIdToResume.startsWith('temp-')) (async () => {
+        try {
+          const accessToken = api.getAccessToken();
+          const refreshToken = localStorage.getItem('refresh_token');
+          if (accessToken) {
+            await invoke('enqueue_time_entry', {
+              operation: 'resume',
+              payload: { id: entryIdToResume },
+              accessToken: accessToken,
+              refreshToken: refreshToken || null,
+            }).catch((e) => {
+              logger.warn('RESUME', 'Failed to enqueue (background)', e);
+            });
+          }
+          await api.resumeTimeEntry(entryIdToResume);
+          await api.sendHeartbeat(true);
+        } catch (apiError: any) {
+          if (apiError.message?.includes('already running') ||
+              apiError.message?.includes('Only paused entries can be resumed')) {
+            return;
+          }
+          logger.warn('RESUME', 'API failed (background), queue will retry', apiError);
+          invoke('show_notification', {
+            title: 'Sync',
+            body: 'Timer resumed, but could not sync with server',
+          }).catch(() => {});
+        }
+      })();
     } catch (error: any) {
       const msg = error.message || 'Failed to resume tracking';
       const needSyncFromServer = typeof msg === 'string' && (msg.includes('already running') || msg.includes('Only paused entries can be resumed'));
@@ -1390,6 +1366,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
             // BUG FIX: Get actual Timer Engine state to ensure isTracking is correct
             const actualTimerState = await TimerEngineAPI.getState().catch(() => null);
             const isTracking = actualTimerState?.state === 'RUNNING' || actualTimerState?.state === 'PAUSED' || true; // Default to true if can't get state
+            const resumeTimeForSync = Date.now();
             set({
               currentTimeEntry: serverEntry,
               isPaused: false,
@@ -1397,7 +1374,8 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
               isLoading: false,
               error: null,
               idlePauseStartTime: null,
-              lastResumeTime: Date.now(), // BUG FIX: Track resume time to prevent sync from pausing immediately after resume
+              lastResumeTime: resumeTimeForSync, // BUG FIX: Track resume time to prevent sync from pausing immediately after resume
+              localTimerStartTime: resumeTimeForSync, // BUG FIX: Track local resume time to prevent auto-pause from syncTimerState
             });
             return;
           }
@@ -1406,7 +1384,30 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         }
       }
       if (entryStoppedOrGone) {
-        try { await TimerEngineAPI.stop(); } catch (_) { /* ignore */ }
+        // BUG FIX: Check Timer Engine state before stopping to avoid "already stopped" warning
+        try {
+          const timerState = await TimerEngineAPI.getState();
+          if (timerState.state !== 'STOPPED') {
+            try {
+              await TimerEngineAPI.stop();
+            } catch (stopError: any) {
+              // Ignore "already stopped" errors - this is normal
+              if (!stopError?.message?.includes('already stopped')) {
+                logger.debug('RESUME', 'Failed to stop Timer Engine (non-critical)', stopError);
+              }
+            }
+          }
+        } catch (stateError) {
+          // If we can't check state, try to stop anyway
+          try {
+            await TimerEngineAPI.stop();
+          } catch (stopError: any) {
+            // Ignore "already stopped" errors - this is normal
+            if (!stopError?.message?.includes('already stopped')) {
+              logger.debug('RESUME', 'Failed to stop Timer Engine after state check error (non-critical)', stopError);
+            }
+          }
+        }
         try { await invoke('stop_activity_monitoring'); } catch (_) { /* ignore */ }
         set({
           currentTimeEntry: null,
@@ -1504,115 +1505,76 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
     }
 
     try {
-      // isLoading already set above for race condition protection
+      const entryIdToStop = timeEntryToStop.id;
       
-      // Send accumulated URL activities before stopping
-      try {
-        await get().sendUrlActivities();
-      } catch (e) {
-        // Log but don't fail stop operation if URL activities send fails
-        logger.warn('STOP', 'Failed to send URL activities before stop', e);
-        await logger.safeLogToRust(`[STOP] Failed to send URL activities before stop: ${e}`).catch((err) => {
-          logger.debug('STOP', 'Failed to log (non-critical)', err);
-        });
-      }
-      
-      // Send final heartbeat before stopping
-      try {
-        await api.sendHeartbeat(false);
-      } catch (e) {
-        // Ignore heartbeat errors on stop
-      }
-      // Сохраняем в очередь синхронизации (offline-first)
-      const accessToken = api.getAccessToken();
-      const refreshToken = localStorage.getItem('refresh_token');
-      if (accessToken) {
-        try {
-          await invoke('enqueue_time_entry', {
-            operation: 'stop',
-            payload: { id: timeEntryToStop.id },
-            accessToken: accessToken,
-            refreshToken: refreshToken || null,
-          }).catch((e) => {
-            logger.warn('STOP', 'Failed to enqueue, will use direct API', e);
-          });
-        } catch (e) {
-          logger.warn('STOP', 'Queue unavailable, will use direct API', e);
-        }
-      }
-      
-      // Вызываем API для остановки time entry (для немедленного обновления UI)
-      const timeEntry = await api.stopTimeEntry(timeEntryToStop.id);
-      
-      // Validate response
-      if (!timeEntry || !timeEntry.id || timeEntry.status !== 'STOPPED') {
-        logger.warn('STOP', 'Invalid stop response, but continuing');
-        await logger.safeLogToRust(`[STOP] Warning: Invalid stop response, but continuing`).catch((e) => {
-          logger.debug('STOP', 'Failed to log (non-critical)', e);
-        });
-      }
-      
-      // Останавливаем Timer Engine в Rust
+      // OPTIMISTIC: Сначала Timer Engine (локально), сразу обновляем UI
       let timerState: import('../lib/timer-engine').TimerStateResponse | null = null;
       try {
         timerState = await TimerEngineAPI.stop();
       } catch (timerError: any) {
-        // Если таймер уже остановлен, получаем текущее состояние
         if (timerError.message?.includes('already stopped')) {
           timerState = await TimerEngineAPI.getState();
         } else {
-          // Другая ошибка - показываем toast, но пытаемся получить состояние
           await invoke('show_notification', {
-            title: 'Ошибка таймера',
-            body: 'Не удалось остановить таймер, но запись времени завершена',
+            title: 'Timer error',
+            body: 'Could not stop timer',
           }).catch((e) => {
             logger.warn('STOP', 'Failed to show notification (non-critical)', e);
           });
-          // Пытаемся получить текущее состояние Timer Engine
           timerState = await TimerEngineAPI.getState().catch(() => null);
         }
       }
       
-      // BUG FIX: Если Timer Engine не остановился, но API запись остановлена, синхронизируем состояние
-      if (timerState && timerState.state !== 'STOPPED') {
-        logger.warn('STOP', 'Timer Engine not stopped but API entry stopped - retrying stop');
-        // Пытаемся остановить Timer Engine еще раз
-        try {
-          timerState = await TimerEngineAPI.stop();
-        } catch (retryError: any) {
-          logger.error('STOP', 'Failed to stop Timer Engine after API success', retryError);
-          // Если не удалось остановить Timer Engine, но запись остановлена, синхронизируем состояние
-          const currentTimerState = await TimerEngineAPI.getState().catch(() => null);
-          if (currentTimerState) {
-            timerState = currentTimerState;
-          }
-        }
-      }
+      const isStopped = timerState?.state === 'STOPPED' || false;
       
-      // Stop activity monitoring (don't fail if this fails)
-      try {
-        await invoke('stop_activity_monitoring');
-      } catch (monitoringError) {
-        logger.warn('STOP', 'Failed to stop activity monitoring', monitoringError);
-        // Continue anyway - timer is stopped
-      }
-      
-      // Обновляем UI state на основе Timer Engine (source of truth)
+      // OPTIMISTIC: Обновляем UI сразу
       set({
         currentTimeEntry: null,
-        isTracking: timerState?.state === 'RUNNING' || timerState?.state === 'PAUSED' ? true : false,
+        isTracking: timerState?.state === 'RUNNING' || timerState?.state === 'PAUSED' || false,
         isPaused: timerState?.state === 'PAUSED' || false,
         isLoading: false,
-        error: timerState && timerState.state !== 'STOPPED' ? 'Запись остановлена, но таймер не остановлен. Попробуйте остановить вручную.' : null,
+        error: !isStopped ? 'Could not stop timer' : null,
         idlePauseStartTime: null,
+        localTimerStartTime: null,
+        lastResumeTime: null,
       });
       
-      // Hide idle window on stop (after state update so subscription can send update)
-      try {
-        await invoke('hide_idle_window');
-      } catch (error) {
-        // Ignore errors
-      }
+      invoke('stop_activity_monitoring').catch((e) => {
+        logger.warn('STOP', 'Failed to stop activity monitoring', e);
+      });
+      
+      invoke('hide_idle_window').catch(() => {});
+      
+      // API в фоне (пропускаем если entry с temp id — запись ещё не создана на сервере)
+      if (isStopped && !entryIdToStop.startsWith('temp-')) (async () => {
+        try {
+          await get().sendUrlActivities();
+        } catch (e) {
+          logger.warn('STOP', 'Failed to send URL activities (background)', e);
+        }
+        try {
+          const accessToken = api.getAccessToken();
+          const refreshToken = localStorage.getItem('refresh_token');
+          if (accessToken) {
+            await invoke('enqueue_time_entry', {
+              operation: 'stop',
+              payload: { id: entryIdToStop },
+              accessToken: accessToken,
+              refreshToken: refreshToken || null,
+            }).catch((e) => {
+              logger.warn('STOP', 'Failed to enqueue (background)', e);
+            });
+          }
+          await api.stopTimeEntry(entryIdToStop);
+          await api.sendHeartbeat(false);
+        } catch (apiError: any) {
+          logger.warn('STOP', 'API failed (background), queue will retry', apiError);
+          invoke('show_notification', {
+            title: 'Sync',
+            body: 'Timer stopped, but could not sync with server',
+          }).catch(() => {});
+        }
+      })();
     } catch (error: any) {
       const msg = error.message || 'Failed to stop tracking';
       const alreadyStopped = typeof msg === 'string' && msg.includes('already stopped');
@@ -1732,7 +1694,9 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           set({
             isPaused: currentTimerState === 'PAUSED',
             isTracking: currentTimerState === 'PAUSED', // true if PAUSED (timer is active, just paused)
-            ...(currentTimerState === 'STOPPED' ? { currentTimeEntry: null } : {}),
+            ...(currentTimerState === 'STOPPED'
+              ? { currentTimeEntry: null, idlePauseStartTime: null }
+              : {}),
           });
           return;
         }
@@ -1767,7 +1731,9 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           set({
             isPaused: timerStateForSync.state === 'PAUSED',
             isTracking: timerStateForSync.state === 'PAUSED' || timerStateForSync.state === 'RUNNING',
-            ...(timerStateForSync.state === 'STOPPED' ? { currentTimeEntry: null } : {}),
+            ...(timerStateForSync.state === 'STOPPED'
+              ? { currentTimeEntry: null, idlePauseStartTime: null }
+              : {}),
           });
         } catch (e) {
           // BUG FIX: If can't get Timer Engine state, don't assume paused
@@ -1854,8 +1820,8 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           
           // Send notification
           await invoke('show_notification', {
-            title: 'Трекер приостановлен',
-            body: `Нет активности более ${idleThreshold} минут`,
+            title: 'Tracker paused',
+            body: `No activity for more than ${idleThreshold} minutes`,
           });
         } else {
           logger.warn('IDLE_CHECK', 'Pause function returned but isPaused is still false!');
@@ -2066,6 +2032,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       idlePauseStartTime: null,
       urlActivities: [],
       localTimerStartTime: null,
+      lastResumeTime: null,
     });
   },
 
@@ -2092,16 +2059,38 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
     set({
       isTracking: state.state === 'RUNNING' || state.state === 'PAUSED',
       isPaused: state.state === 'PAUSED',
-      ...(state.state === 'STOPPED' ? { currentTimeEntry: null } : {}),
+      ...(state.state === 'STOPPED'
+        ? { currentTimeEntry: null, idlePauseStartTime: null }
+        : {}),
     });
     return state;
   },
 
   clearTrackingStateFromServer: async () => {
+    // BUG FIX: Check Timer Engine state before stopping to avoid "already stopped" warning
     try {
-      await TimerEngineAPI.stop();
-    } catch (_) {
-      // ignore
+      const timerState = await TimerEngineAPI.getState();
+      // Only stop if Timer Engine is not already STOPPED
+      if (timerState.state !== 'STOPPED') {
+        try {
+          await TimerEngineAPI.stop();
+        } catch (stopError: any) {
+          // Ignore "already stopped" errors - this is normal
+          if (!stopError?.message?.includes('already stopped')) {
+            logger.debug('CLEAR', 'Failed to stop Timer Engine (non-critical)', stopError);
+          }
+        }
+      }
+    } catch (stateError) {
+      // If we can't check state, try to stop anyway (better to try than skip)
+      try {
+        await TimerEngineAPI.stop();
+      } catch (stopError: any) {
+        // Ignore "already stopped" errors - this is normal
+        if (!stopError?.message?.includes('already stopped')) {
+          logger.debug('CLEAR', 'Failed to stop Timer Engine after state check error (non-critical)', stopError);
+        }
+      }
     }
     try {
       await invoke('stop_activity_monitoring');
@@ -2198,8 +2187,12 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         set({
           isTracking: expectedTracking,
           isPaused: expectedPaused,
-          // Если Timer Engine остановлен, очищаем currentTimeEntry
-          ...(timerState.state === 'STOPPED' && storeState.currentTimeEntry ? { currentTimeEntry: null } : {}),
+          ...(timerState.state === 'STOPPED'
+            ? {
+                currentTimeEntry: null,
+                idlePauseStartTime: null,
+              }
+            : {}),
         });
         
         await logger.safeLogToRust(`[STATE_INVARIANT] Auto-synced: isTracking=${expectedTracking}, isPaused=${expectedPaused}`).catch((e) => {
