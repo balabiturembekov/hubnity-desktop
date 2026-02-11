@@ -998,6 +998,10 @@ function App() {
   useEffect(() => {
     if (!isAuthenticated) return;
 
+    // BUG FIX: Use ref to track if component is mounted and store cleanup function
+    const isMountedRef = useRef(true);
+    const cleanupRef = useRef<(() => void) | null>(null);
+
     const setupIdleWindowListeners = async () => {
       try {
         // Listen for resume event from idle window
@@ -1040,20 +1044,20 @@ function App() {
       }
     };
 
-    let cleanupFn: (() => void) | null = null;
-    
     setupIdleWindowListeners().then((cleanup) => {
-      if (cleanup) {
-        cleanupFn = cleanup;
+      if (cleanup && isMountedRef.current) {
+        cleanupRef.current = cleanup;
       }
     }).catch((e) => {
       logger.error('APP', 'Failed to setup idle window listeners (cleanup)', e);
     });
     
     return () => {
+      isMountedRef.current = false;
       // Synchronous cleanup if available
-      if (cleanupFn) {
-        cleanupFn();
+      if (cleanupRef.current) {
+        cleanupRef.current();
+        cleanupRef.current = null;
       }
     };
   }, [isAuthenticated]);
@@ -1061,6 +1065,10 @@ function App() {
   // Listen for state request from idle window
   useEffect(() => {
     if (!isAuthenticated) return;
+
+    // BUG FIX: Use ref to track if component is mounted and store cleanup function
+    const isMountedRef = useRef(true);
+    const cleanupRef = useRef<(() => void) | null>(null);
 
     const setupStateRequestListener = async () => {
       try {
@@ -1111,20 +1119,20 @@ function App() {
       }
     };
 
-    let cleanupFn: (() => void) | null = null;
-    
     setupStateRequestListener().then((cleanup) => {
-      if (cleanup) {
-        cleanupFn = cleanup;
+      if (cleanup && isMountedRef.current) {
+        cleanupRef.current = cleanup;
       }
     }).catch((e) => {
       logger.error('APP', 'Failed to setup state request listener (cleanup)', e);
     });
     
     return () => {
+      isMountedRef.current = false;
       // Synchronous cleanup if available
-      if (cleanupFn) {
-        cleanupFn();
+      if (cleanupRef.current) {
+        cleanupRef.current();
+        cleanupRef.current = null;
       }
     };
   }, [isAuthenticated]);
