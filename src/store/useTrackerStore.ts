@@ -45,6 +45,8 @@ export interface TrackerState {
   resetDay: () => Promise<TimerStateResponse>;
   /** Сбрасывает трекинг в сторе и Rust, когда на сервере нет активных записей (синхронизация). */
   clearTrackingStateFromServer: () => Promise<void>;
+  /** Проверяет инварианты состояния и автоматически синхронизирует при рассинхронизации. */
+  assertStateInvariant: () => Promise<void>;
 }
 
 export const useTrackerStore = create<TrackerState>((set, get) => ({
@@ -95,6 +97,19 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       
       const activeEntries = await api.getActiveTimeEntries();
       if (activeEntries.length === 0) {
+        // BUG FIX: Don't auto-stop timer if it's PAUSED after system wake
+        // Check Timer Engine state before clearing - if PAUSED, allow user to resume manually
+        try {
+          const timerState = await TimerEngineAPI.getState();
+          if (timerState.state === 'PAUSED') {
+            logger.info('LOAD', 'No active entries on server, but Timer Engine is PAUSED after wake - allowing user to resume manually');
+            // Don't clear - user should be able to resume
+            return;
+          }
+        } catch (error) {
+          logger.warn('LOAD', 'Failed to check Timer Engine state before clearing', error);
+          // Continue with clear if we can't check state
+        }
         await get().clearTrackingStateFromServer();
         return;
       }
@@ -108,6 +123,19 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       }
 
       if (userEntries.length === 0) {
+        // No entries for current user - check Timer Engine state before clearing
+        // BUG FIX: Don't auto-stop timer if it's PAUSED after system wake
+        try {
+          const timerState = await TimerEngineAPI.getState();
+          if (timerState.state === 'PAUSED') {
+            logger.info('LOAD', 'No entries for current user, but Timer Engine is PAUSED after wake - allowing user to resume manually');
+            // Don't clear - user should be able to resume
+            return;
+          }
+        } catch (error) {
+          logger.warn('LOAD', 'Failed to check Timer Engine state before clearing', error);
+          // Continue with clear if we can't check state
+        }
         // No entries for current user - clear state
         await get().clearTrackingStateFromServer();
         return;
@@ -1097,7 +1125,6 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
 
   resumeTracking: async (_fromIdleWindow: boolean = false) => {
     const { currentTimeEntry: initialTimeEntry, isLoading: currentLoading } = get();
-    if (!initialTimeEntry) return;
     
     // Prevent multiple simultaneous calls
     if (currentLoading) {
@@ -1132,6 +1159,36 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       await logger.safeLogToRust('[RESUME] Already running, skipping').catch((e) => {
         logger.debug('RESUME', 'Failed to log (non-critical)', e);
       });
+      return;
+    }
+
+    // BUG FIX: Allow resuming Timer Engine even without currentTimeEntry
+    // Timer Engine is the source of truth - if it's PAUSED, user should be able to resume
+    // This handles cases like system wake when timer was paused but entry wasn't loaded
+    if (!initialTimeEntry) {
+      logger.info('RESUME', 'No currentTimeEntry, but Timer Engine is PAUSED - resuming Timer Engine only');
+      set({ isLoading: true, error: null });
+      try {
+        // Resume Timer Engine directly
+        await TimerEngineAPI.resume();
+        // Update store state
+        const newTimerState = await TimerEngineAPI.getState();
+        set({
+          isPaused: false,
+          isTracking: newTimerState.state === 'RUNNING',
+          isLoading: false,
+          error: null,
+          idlePauseStartTime: null,
+        });
+        // Try to load active time entry after resume
+        await get().loadActiveTimeEntry();
+      } catch (error: any) {
+        logger.error('RESUME', 'Failed to resume Timer Engine without entry', error);
+        set({
+          isLoading: false,
+          error: error?.message || 'Failed to resume timer',
+        });
+      }
       return;
     }
 
@@ -1417,9 +1474,13 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
     // Если нет currentTimeEntry, но таймер работает - просто останавливаем движок
     // Это может произойти при синхронизации после того, как запись уже остановлена
     if (!timeEntryToStop) {
-      // Останавливаем только Timer Engine, без API вызова и без логирования
+      // Проверяем текущее состояние таймера перед остановкой
       try {
-        await TimerEngineAPI.stop();
+        const timerState = await TimerEngineAPI.getState();
+        // Останавливаем только если таймер не в состоянии STOPPED
+        if (timerState.state !== 'STOPPED') {
+          await TimerEngineAPI.stop();
+        }
         await invoke('stop_activity_monitoring');
         set({
           isTracking: false,
@@ -1430,9 +1491,12 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           localTimerStartTime: null, // Clear local timer start time on stop
           lastResumeTime: null, // Clear resume time on stop
         });
-      } catch (e) {
+      } catch (e: any) {
         // BUG FIX: Log error instead of silently ignoring (already logging, but ensure isLoading is reset)
-        logger.debug('STOP', 'Failed to stop timer engine (non-critical)', e);
+        // Игнорируем ошибку "already stopped" - это нормально
+        if (!e?.message?.includes('already stopped')) {
+          logger.debug('STOP', 'Failed to stop timer engine (non-critical)', e);
+        }
         // BUG FIX: Always reset isLoading even on error
         set({ isLoading: false });
       }
@@ -2058,6 +2122,94 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       await invoke('hide_idle_window');
     } catch (_) {
       // ignore
+    }
+  },
+
+  assertStateInvariant: async () => {
+    // Проверка инвариантов состояния: Store должен быть синхронизирован с Timer Engine
+    // Эта функция вызывается периодически для обнаружения и исправления рассинхронизации
+    
+    try {
+      const storeState = get();
+      
+      // Не проверяем инварианты во время операций (isLoading = true)
+      // Это предотвращает ложные срабатывания во время переходов состояния
+      if (storeState.isLoading) {
+        return;
+      }
+      
+      // Получаем состояние Timer Engine (источник истины)
+      const timerState = await TimerEngineAPI.getState();
+      
+      // Инвариант 1: isTracking должен соответствовать Timer Engine
+      // isTracking = true если Timer Engine в состоянии RUNNING или PAUSED
+      const expectedTracking = timerState.state === 'RUNNING' || timerState.state === 'PAUSED';
+      const isTrackingDesync = storeState.isTracking !== expectedTracking;
+      
+      // Инвариант 2: isPaused должен соответствовать Timer Engine
+      // isPaused = true только если Timer Engine в состоянии PAUSED
+      const expectedPaused = timerState.state === 'PAUSED';
+      const isPausedDesync = storeState.isPaused !== expectedPaused;
+      
+      // Если обнаружена рассинхронизация, логируем и исправляем
+      if (isTrackingDesync || isPausedDesync) {
+        // BUG FIX: Don't auto-sync if Timer Engine is PAUSED without currentTimeEntry
+        // This handles case when timer was restored after wake and is PAUSED
+        // User should be able to resume manually, not have it auto-stopped
+        if (timerState.state === 'PAUSED' && !storeState.currentTimeEntry) {
+          logger.debug('STATE_INVARIANT', 'Timer Engine is PAUSED without currentTimeEntry (likely after wake) - syncing store only, allowing user to resume');
+          // Only sync store state, don't clear currentTimeEntry or stop timer
+          set({
+            isTracking: expectedTracking,
+            isPaused: expectedPaused,
+          });
+          return;
+        }
+        
+        logger.warn('STATE_INVARIANT', 'State desync detected, auto-syncing', {
+          store: {
+            isTracking: storeState.isTracking,
+            isPaused: storeState.isPaused,
+          },
+          timerEngine: {
+            state: timerState.state,
+            expectedTracking,
+            expectedPaused,
+          },
+        });
+        
+        // Отправляем в Sentry для мониторинга (если доступно)
+        try {
+          const { captureMessage, setSentryContext } = await import('../lib/sentry');
+          setSentryContext('state_desync', {
+            storeState: {
+              isTracking: storeState.isTracking,
+              isPaused: storeState.isPaused,
+            },
+            timerEngineState: timerState.state,
+          });
+          captureMessage('State desync detected and auto-fixed', 'warning');
+        } catch (e) {
+          // Sentry может быть недоступен в dev режиме
+          logger.debug('STATE_INVARIANT', 'Sentry not available', e);
+        }
+        
+        // Автоматически синхронизируем состояние с Timer Engine
+        set({
+          isTracking: expectedTracking,
+          isPaused: expectedPaused,
+          // Если Timer Engine остановлен, очищаем currentTimeEntry
+          ...(timerState.state === 'STOPPED' && storeState.currentTimeEntry ? { currentTimeEntry: null } : {}),
+        });
+        
+        await logger.safeLogToRust(`[STATE_INVARIANT] Auto-synced: isTracking=${expectedTracking}, isPaused=${expectedPaused}`).catch((e) => {
+          logger.debug('STATE_INVARIANT', 'Failed to log (non-critical)', e);
+        });
+      }
+    } catch (error) {
+      // Если не удалось проверить инварианты (например, Timer Engine недоступен),
+      // логируем ошибку, но не паникуем
+      logger.warn('STATE_INVARIANT', 'Failed to check state invariants', error);
     }
   },
 }));

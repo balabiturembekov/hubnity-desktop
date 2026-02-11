@@ -333,6 +333,15 @@ function App() {
           
           const timerState = await getTimerState();
           if (timerState.state !== 'STOPPED') {
+            // BUG FIX: Don't auto-stop timer if it's PAUSED after system wake
+            // PAUSED state after wake means timer was restored and user should be able to resume it
+            // Only auto-stop if timer is RUNNING (which shouldn't happen without server entry)
+            if (timerState.state === 'PAUSED') {
+              logger.info('APP', 'Syncing timer: timer is PAUSED after wake, allowing user to resume manually');
+              // Don't stop - user should be able to resume
+              return;
+            }
+            
             logger.info('APP', 'Syncing timer: no active entries on server, stopping local timer');
             const { stopTracking } = useTrackerStore.getState();
             await stopTracking().catch((e) => {
@@ -354,6 +363,31 @@ function App() {
     const initialTimeout = setTimeout(syncTimerState, 30000);
     // Затем каждые 10 секунд
     const interval = setInterval(syncTimerState, 10000);
+
+    return () => {
+      clearTimeout(initialTimeout);
+      clearInterval(interval);
+    };
+  }, [isAuthenticated]);
+
+  // Периодическая проверка инвариантов состояния (каждые 5 секунд)
+  // Автоматически обнаруживает и исправляет рассинхронизацию между Timer Engine и Store
+  useEffect(() => {
+    if (!isAuthenticated) return;
+
+    const checkStateInvariant = async () => {
+      try {
+        const { assertStateInvariant } = useTrackerStore.getState();
+        await assertStateInvariant();
+      } catch (error) {
+        logger.debug('APP', 'Failed to check state invariant (non-critical)', error);
+      }
+    };
+
+    // Первая проверка через 5 секунд после загрузки
+    const initialTimeout = setTimeout(checkStateInvariant, 5000);
+    // Затем каждые 5 секунд
+    const interval = setInterval(checkStateInvariant, 5000);
 
     return () => {
       clearTimeout(initialTimeout);

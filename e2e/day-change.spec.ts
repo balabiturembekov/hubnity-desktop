@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { setupTest, selectProject } from './helpers';
 
 /**
  * E2E тесты для проверки смены дня
@@ -11,78 +12,11 @@ import { test, expect } from '@playwright/test';
 
 test.describe('Смена дня и ежедневный сброс', () => {
   test.beforeEach(async ({ page }) => {
-    // Мокируем Tauri команды
-    await page.addInitScript(() => {
-      (window as any).__TAURI_INTERNALS__ = {
-        invoke: async (cmd: string, args?: any) => {
-          if (cmd === 'log_message') return Promise.resolve();
-          if (cmd === 'plugin:tray|new') return Promise.resolve();
-          if (cmd === 'plugin:tray|set_tooltip') return Promise.resolve();
-          if (cmd === 'request_screenshot_permission') return Promise.resolve(true);
-          if (cmd === 'start_activity_monitoring') return Promise.resolve();
-          if (cmd === 'stop_activity_monitoring') return Promise.resolve();
-          if (cmd === 'get_active_window_info') {
-            return Promise.resolve({
-              app_name: 'Google Chrome',
-              window_title: 'Test Page',
-              url: 'https://example.com',
-              domain: 'example.com',
-            });
-          }
-          return Promise.resolve(null);
-        },
-      };
-    });
+    await setupTest(page, { projectName: 'Test Project' });
   });
 
   test('Проверка сброса таймера при смене дня (симуляция)', async ({ page, context }) => {
-    // Мокируем API
-    await page.route('**/api/auth/login', async route => {
-      await route.fulfill({
-        status: 200,
-        contentType: 'application/json',
-        body: JSON.stringify({
-          user: { id: 'test-user', name: 'Test', email: 'test@test.com', role: 'user', status: 'active', avatar: '', hourlyRate: 0, companyId: 'test', company: { id: 'test', name: 'Test' } },
-          access_token: 'token',
-          refresh_token: 'refresh',
-        }),
-      });
-    });
-
-    await page.route('**/api/projects', async route => {
-      await route.fulfill({
-        status: 200,
-        contentType: 'application/json',
-        body: JSON.stringify([{
-          id: 'test-project',
-          name: 'Test Project',
-          description: '',
-          color: '#FF5733',
-          clientName: '',
-          budget: 0,
-          status: 'ACTIVE',
-          companyId: 'test',
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-        }]),
-      });
-    });
-
-    await page.route('**/api/time-entries/active', async route => {
-      await route.fulfill({
-        status: 200,
-        contentType: 'application/json',
-        body: JSON.stringify([]),
-      });
-    });
-
-    // Логин
-    await page.goto('/');
-    await page.fill('input[type="email"]', 'test@example.com');
-    await page.fill('input[type="password"]', 'password');
-    await page.click('button:has-text("Войти")');
-    
-    await expect(page.locator('text=Выберите проект для начала отслеживания')).toBeVisible({ timeout: 5000 });
+    // Логин и выбор проекта уже выполнены в beforeEach
 
     // Выбираем проект и стартуем
     await page.route('**/api/time-entries', async route => {
@@ -126,13 +60,13 @@ test.describe('Смена дня и ежедневный сброс', () => {
       });
     });
     
-    await page.click('button:has-text("Старт")');
+    await page.click('button:has-text("Start")');
     
     // Ждем обновления состояния
     await page.waitForFunction(
       () => {
         const startButton = Array.from(document.querySelectorAll('button')).find(
-          btn => btn.textContent?.includes('Старт')
+          btn => btn.textContent?.includes('Start')
         );
         return !startButton || startButton.hasAttribute('disabled');
       },
@@ -140,10 +74,10 @@ test.describe('Смена дня и ежедневный сброс', () => {
     );
     
     // Проверяем наличие кнопок управления
-    await expect(page.locator('button:has-text("Пауза")')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('button:has-text("Pause")')).toBeVisible({ timeout: 10000 });
     
     // Проверяем, что таймер показывает время
-    const timerDisplay = page.locator('.text-4xl.font-mono, [class*="text-4xl"]').first();
+    const timerDisplay = page.locator('.text-6xl.font-mono, [class*="text-6xl"]').first();
     await expect(timerDisplay).toBeVisible({ timeout: 10000 });
     
     // Симулируем смену дня через изменение Date в контексте страницы
@@ -247,21 +181,44 @@ test.describe('Смена дня и ежедневный сброс', () => {
       });
     });
 
-    // Логин
-    await page.goto('/');
-    await page.fill('input[type="email"]', 'test@example.com');
-    await page.fill('input[type="password"]', 'password');
-    await page.click('button:has-text("Войти")');
+    // Логин и выбор проекта уже выполнены в beforeEach
     
-    // Ждем загрузки активного entry
+    // Устанавливаем Timer Engine в состояние RUNNING, соответствующее активному time entry
+    await page.evaluate(() => {
+      const originalInvoke = (window as any).__TAURI_INTERNALS__.invoke;
+      (window as any).__TAURI_INTERNALS__.invoke = async (cmd: string) => {
+        if (cmd === 'get_timer_state') {
+          // Возвращаем RUNNING состояние, соответствующее активному time entry
+          return Promise.resolve({
+            state: 'RUNNING',
+            started_at: Date.now() / 1000 - 3600, // 1 час назад
+            elapsed_seconds: 3600, // 1 час
+            accumulated_seconds: 0,
+            session_start: Date.now() / 1000 - 3600,
+            day_start: Math.floor(Date.now() / 1000),
+          });
+        }
+        return originalInvoke(cmd);
+      };
+    });
+    
+    // Ждем загрузки активного time entry и синхронизации состояния
     await page.waitForTimeout(2000);
     
-    // Проверяем, что entry загружен и таймер показывает время с полуночи
-    // (в реальном приложении это будет проверяться через проверку sessionStartTime)
-    const timerDisplay = page.locator('.text-4xl.font-mono');
-    await expect(timerDisplay).toBeVisible();
+    // Проверяем, что entry загружен и таймер показывает время
+    const timerDisplay = page.locator('.text-6xl.font-mono, [class*="text-6xl"]').first();
+    await expect(timerDisplay).toBeVisible({ timeout: 10000 });
     
-    // Проверяем, что трекинг активен
-    await expect(page.locator('text=Отслеживается')).toBeVisible({ timeout: 5000 });
+    // Проверяем, что трекинг активен - проверяем наличие кнопки Pause
+    await page.waitForFunction(
+      () => {
+        const pauseButton = Array.from(document.querySelectorAll('button')).find(
+          btn => btn.textContent?.includes('Pause')
+        );
+        return pauseButton !== undefined;
+      },
+      { timeout: 10000 }
+    );
+    await expect(page.locator('button:has-text("Pause")')).toBeVisible({ timeout: 5000 });
   });
 });
