@@ -55,7 +55,7 @@ export function ProjectSelector() {
           onValueChange={handleSelect}
         >
           <SelectTrigger className="h-auto w-auto min-w-[180px] border-none shadow-none bg-transparent hover:bg-muted/30 hover:underline px-1.5 py-0.5 -ml-1 rounded transition-colors duration-300">
-            <SelectValue placeholder="Выберите проект">
+            <SelectValue placeholder="Select project">
               {selectedProject && (
                 <div className="flex items-center gap-2 group">
                   <div

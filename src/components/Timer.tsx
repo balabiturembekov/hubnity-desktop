@@ -52,15 +52,12 @@ export function Timer() {
         const isPaused = state.state === 'PAUSED';
         
         const store = useTrackerStore.getState();
-        const { isTracking: currentIsTracking, isPaused: currentIsPaused, currentTimeEntry, isLoading } = store;
+        const { isTracking: currentIsTracking, isPaused: currentIsPaused, currentTimeEntry } = store;
         
-        // BUG FIX: Don't update store if an operation is in progress to prevent race conditions
-        // Operations like startTracking/pauseTracking set isLoading and update state themselves
-        if (isLoading) {
-          return; // Skip update during operations to prevent conflicts
-        }
-        
-        const trackingChanged = currentIsTracking !== isRunning || currentIsPaused !== isPaused;
+        // BUG FIX: Always update store if state changed, even if isLoading is true
+        // This prevents store from being stale when isLoading gets stuck or operations complete
+        // The isLoading check was preventing sync when operations finished but isLoading wasn't cleared
+        const trackingChanged = currentIsTracking !== (isRunning || isPaused) || currentIsPaused !== isPaused;
         const needClearEntry = state.state === 'STOPPED' && currentTimeEntry !== null;
         if (trackingChanged || needClearEntry) {
           useTrackerStore.setState({

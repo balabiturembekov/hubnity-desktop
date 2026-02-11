@@ -330,10 +330,30 @@ describe('useTrackerStore', () => {
       
       const currentEntry = useTrackerStore.getState().currentTimeEntry;
       
+      // BUG FIX: Mock Timer Engine state to return PAUSED before resume
+      // resumeTracking now checks Timer Engine state directly
+      mockGetTimerState.mockResolvedValueOnce({
+        state: 'PAUSED',
+        elapsed_seconds: 100,
+        accumulated_seconds: 0,
+        session_start: Date.now() / 1000,
+        day_start: Math.floor(Date.now() / 1000),
+      });
+      
       // Mock resume API
       mockResumeTimeEntry.mockResolvedValueOnce({
         ...currentEntry,
         status: 'RUNNING',
+      });
+      
+      // Mock Timer Engine resume response
+      mockResumeTimer.mockResolvedValueOnce({
+        state: 'RUNNING',
+        started_at: Date.now() / 1000,
+        elapsed_seconds: 100,
+        accumulated_seconds: 0,
+        session_start: Date.now() / 1000,
+        day_start: Math.floor(Date.now() / 1000),
       });
       
       await useTrackerStore.getState().resumeTracking();
@@ -402,7 +422,39 @@ describe('useTrackerStore', () => {
       expect(useTrackerStore.getState().currentTimeEntry).toBeTruthy();
 
       const currentEntry = useTrackerStore.getState().currentTimeEntry;
+      
+      // BUG FIX: Mock Timer Engine state to return RUNNING before stop
+      // selectProject -> stopTracking now checks Timer Engine state directly
+      // First call: for selectProject check
+      mockGetTimerState.mockResolvedValueOnce({
+        state: 'RUNNING',
+        started_at: Date.now() / 1000,
+        elapsed_seconds: 100,
+        accumulated_seconds: 0,
+        session_start: Date.now() / 1000,
+        day_start: Math.floor(Date.now() / 1000),
+      });
+      
+      // Second call: for stopTracking check (inside selectProject -> stopTracking)
+      mockGetTimerState.mockResolvedValueOnce({
+        state: 'RUNNING',
+        started_at: Date.now() / 1000,
+        elapsed_seconds: 100,
+        accumulated_seconds: 0,
+        session_start: Date.now() / 1000,
+        day_start: Math.floor(Date.now() / 1000),
+      });
+      
       mockStopTimeEntry.mockResolvedValueOnce({ ...currentEntry, status: 'STOPPED' });
+      
+      // Mock Timer Engine stop response
+      mockStopTimer.mockResolvedValueOnce({
+        state: 'STOPPED',
+        elapsed_seconds: 0,
+        accumulated_seconds: 100,
+        session_start: null,
+        day_start: Math.floor(Date.now() / 1000),
+      });
 
       await useTrackerStore.getState().selectProject(project2);
 
@@ -434,10 +486,30 @@ describe('useTrackerStore', () => {
       
       const currentEntry = useTrackerStore.getState().currentTimeEntry;
       
+      // BUG FIX: Mock Timer Engine state to return RUNNING before stop
+      // stopTracking now checks Timer Engine state directly
+      mockGetTimerState.mockResolvedValueOnce({
+        state: 'RUNNING',
+        started_at: Date.now() / 1000,
+        elapsed_seconds: 100,
+        accumulated_seconds: 0,
+        session_start: Date.now() / 1000,
+        day_start: Math.floor(Date.now() / 1000),
+      });
+      
       // Mock stop API
       mockStopTimeEntry.mockResolvedValueOnce({
         ...currentEntry,
         status: 'STOPPED',
+      });
+      
+      // Mock Timer Engine stop response
+      mockStopTimer.mockResolvedValueOnce({
+        state: 'STOPPED',
+        elapsed_seconds: 0,
+        accumulated_seconds: 100,
+        session_start: null,
+        day_start: Math.floor(Date.now() / 1000),
       });
       
       await useTrackerStore.getState().stopTracking();

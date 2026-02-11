@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useAuthStore } from './store/useAuthStore';
 import { useTrackerStore } from './store/useTrackerStore';
+import type { TimerStateResponse } from './lib/timer-engine';
 import { Login } from './components/Login';
 import { ProjectSelector } from './components/ProjectSelector';
 import { TimerWithScreenshots } from './components/Timer';
@@ -215,7 +216,7 @@ function App() {
 
     const syncTimerState = async () => {
       try {
-        const { currentTimeEntry, isTracking, isPaused, idlePauseStartTime, isLoading } = useTrackerStore.getState();
+        const { currentTimeEntry, idlePauseStartTime, isLoading, getTimerState } = useTrackerStore.getState();
         
         // BUG FIX: Don't sync if another operation is in progress
         // This prevents sync from interfering with user actions or other operations
@@ -223,6 +224,19 @@ function App() {
           logger.debug('APP', 'Skipping sync: operation in progress');
           return;
         }
+        
+        // BUG FIX: Check actual Timer Engine state instead of store cache
+        // Store cache can be stale if updateTimerState was skipped
+        let timerState: TimerStateResponse | null = null;
+        try {
+          timerState = await getTimerState();
+        } catch (error) {
+          logger.warn('APP', 'Failed to get Timer Engine state for sync', error);
+          return; // Can't sync without timer state
+        }
+        
+        const isTracking = timerState.state === 'RUNNING' || timerState.state === 'PAUSED';
+        const isPaused = timerState.state === 'PAUSED';
         
         // Если локально нет активной записи и таймер остановлен, не нужно синхронизировать
         if (!currentTimeEntry && !isTracking) {
@@ -241,14 +255,14 @@ function App() {
         
         if (activeEntries.length > 0) {
           const activeEntry = activeEntries[0];
-          const { getTimerState, currentTimeEntry: currentEntry } = useTrackerStore.getState();
+          const { currentTimeEntry: currentEntry } = useTrackerStore.getState();
           
           // Если нет currentTimeEntry, не синхронизируем остановку (уже остановлено локально)
           if (!currentEntry) {
             return;
           }
           
-          const timerState = await getTimerState();
+          // timerState already fetched above
           
           // Синхронизируем состояние таймера с сервером
           if (activeEntry.status === 'RUNNING' && timerState.state !== 'RUNNING') {
@@ -272,6 +286,7 @@ function App() {
           } else if (activeEntry.status === 'PAUSED' && timerState.state === 'RUNNING') {
             // На сервере PAUSED, но локально RUNNING - ставим на паузу
             // Но не паузим если локально на паузе из-за idle (пользователь должен решить через idle окно)
+            // BUG FIX: Use actual timerState.isPaused instead of store cache
             if (isPaused && idlePauseStartTime !== null) {
               logger.debug('APP', 'Skipping sync pause: timer paused due to idle, user must decide via idle window');
               return;
