@@ -3,7 +3,6 @@ import { Button } from './ui/button';
 import { useTrackerStore, type TimerStateResponse } from '../store/useTrackerStore';
 import { Play, Pause, Square, RotateCcw, Camera } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
-import { ScreenshotsView } from './ScreenshotsView';
 import { logger } from '../lib/logger';
 import { cn } from '../lib/utils';
 
@@ -343,16 +342,12 @@ export function Timer() {
   );
 }
 
-// Компонент с таймером и скриншотами
+// Компонент с таймером (скриншоты делаются автоматически, но не отображаются в UI)
 export function TimerWithScreenshots() {
-  const { currentTimeEntry } = useTrackerStore();
-
   return (
     <div className="space-y-6">
       <Timer />
-      {currentTimeEntry?.id && (
-        <ScreenshotsView timeEntryId={currentTimeEntry.id} />
-      )}
+      {/* Screenshots are captured automatically but not displayed in UI */}
     </div>
   );
 }

@@ -9,7 +9,21 @@ const mockGetScreenshots = vi.fn();
 
 vi.mock('../../store/useTrackerStore', () => ({
   useTrackerStore: {
-    getState: () => ({ getScreenshots: mockGetScreenshots }),
+    getState: () => ({ 
+      getScreenshots: mockGetScreenshots,
+      currentTimeEntry: {
+        id: 'te-1',
+        userId: 'user1', // Must match current user id
+        projectId: 'p1',
+        startTime: '2024-01-01T00:00:00Z',
+        endTime: null,
+        duration: 0,
+        description: '',
+        status: 'RUNNING' as const,
+        createdAt: '2024-01-01T00:00:00Z',
+        updatedAt: '2024-01-01T00:00:00Z',
+      },
+    }),
   },
 }));
 

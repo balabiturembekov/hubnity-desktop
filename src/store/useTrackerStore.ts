@@ -71,6 +71,13 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
 
   loadActiveTimeEntry: async () => {
     try {
+      // SECURITY: Get current user first to verify ownership
+      const currentUser = getCurrentUser();
+      if (!currentUser) {
+        logger.warn('LOAD', 'Cannot load active time entry: no current user');
+        return;
+      }
+
       // FIX: Загружаем проекты перед восстановлением active entry, чтобы можно было найти проект по projectId
       const { projects: currentProjects } = get();
       if (currentProjects.length === 0) {
@@ -87,15 +94,31 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         await get().clearTrackingStateFromServer();
         return;
       }
+
+      // SECURITY: Filter out entries that don't belong to current user
+      const userEntries = activeEntries.filter(entry => entry.userId === currentUser.id);
+      const foreignEntries = activeEntries.filter(entry => entry.userId !== currentUser.id);
+      
+      if (foreignEntries.length > 0) {
+        logger.error('LOAD', `SECURITY: Found ${foreignEntries.length} active time entries belonging to other users. Current user: ${currentUser.id}, Foreign entries: ${foreignEntries.map(e => `${e.id} (user: ${e.userId})`).join(', ')}`);
+      }
+
+      if (userEntries.length === 0) {
+        // No entries for current user - clear state
+        await get().clearTrackingStateFromServer();
+        return;
+      }
+
       {
         let activeEntry: TimeEntry;
         
         // FIX: Если несколько активных записей, выбираем самую свежую и останавливаем остальные
-        if (activeEntries.length > 1) {
-          logger.warn('LOAD', `Multiple active time entries found (${activeEntries.length}), resolving duplicates...`);
+        // NOTE: userEntries уже отфильтрованы по userId текущего пользователя
+        if (userEntries.length > 1) {
+          logger.warn('LOAD', `Multiple active time entries found (${userEntries.length}), resolving duplicates...`);
           
           // Сортируем по startTime (самая свежая первая)
-          const sortedEntries = [...activeEntries].sort((a, b) => 
+          const sortedEntries = [...userEntries].sort((a, b) => 
             new Date(b.startTime).getTime() - new Date(a.startTime).getTime()
           );
           
@@ -122,7 +145,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           }
         } else {
           // Только одна активная запись - используем её
-          activeEntry = activeEntries[0];
+          activeEntry = userEntries[0];
         }
         
         // Validate entry data

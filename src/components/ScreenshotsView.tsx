@@ -10,6 +10,7 @@ import {
   DialogTitle,
 } from './ui/dialog';
 import { logger } from '../lib/logger';
+import { getCurrentUser } from '../lib/current-user';
 
 /**
  * Скриншоты получаем по timeEntryId текущей записи.
@@ -40,6 +41,30 @@ export function ScreenshotsView({ timeEntryId }: ScreenshotsViewProps) {
       return;
     }
 
+    // SECURITY: Verify that timeEntry belongs to current user before loading screenshots
+    const currentUser = getCurrentUser();
+    const { currentTimeEntry } = useTrackerStore.getState();
+    
+    if (!currentUser) {
+      logger.warn('SCREENSHOTS_VIEW', 'Cannot load screenshots: no current user');
+      setScreenshots([]);
+      return;
+    }
+
+    // Check if timeEntryId matches currentTimeEntry and belongs to current user
+    if (!currentTimeEntry || currentTimeEntry.id !== timeEntryId) {
+      logger.warn('SCREENSHOTS_VIEW', `Cannot load screenshots: timeEntryId ${timeEntryId} does not match currentTimeEntry`);
+      setScreenshots([]);
+      return;
+    }
+
+    if (currentTimeEntry.userId !== currentUser.id) {
+      logger.error('SCREENSHOTS_VIEW', `SECURITY: Attempted to load screenshots for timeEntry ${timeEntryId} belonging to user ${currentTimeEntry.userId}, but current user is ${currentUser.id}`);
+      setScreenshots([]);
+      setError('Access denied: screenshots belong to another user');
+      return;
+    }
+
     setIsLoading(true);
     setError(null);
     try {
@@ -58,6 +83,20 @@ export function ScreenshotsView({ timeEntryId }: ScreenshotsViewProps) {
 
   const refreshScreenshots = useCallback(async (expandIfNew = false) => {
     if (!timeEntryId) return;
+    
+    // SECURITY: Verify that timeEntry belongs to current user before refreshing screenshots
+    const currentUser = getCurrentUser();
+    const { currentTimeEntry } = useTrackerStore.getState();
+    
+    if (!currentUser || !currentTimeEntry || currentTimeEntry.id !== timeEntryId) {
+      return; // Silently skip if security check fails
+    }
+
+    if (currentTimeEntry.userId !== currentUser.id) {
+      logger.error('SCREENSHOTS_VIEW', `SECURITY: Attempted to refresh screenshots for timeEntry ${timeEntryId} belonging to user ${currentTimeEntry.userId}, but current user is ${currentUser.id}`);
+      return;
+    }
+
     setIsRefreshing(true);
     try {
       const data = await useTrackerStore.getState().getScreenshots(timeEntryId);
