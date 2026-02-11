@@ -201,10 +201,17 @@ function App() {
 
     const syncTimerState = async () => {
       try {
-        const { currentTimeEntry, isTracking } = useTrackerStore.getState();
+        const { currentTimeEntry, isTracking, isPaused, idlePauseStartTime } = useTrackerStore.getState();
         
         // Если локально нет активной записи и таймер остановлен, не нужно синхронизировать
         if (!currentTimeEntry && !isTracking) {
+          return;
+        }
+        
+        // НЕ синхронизируем автоматически если локально на паузе из-за idle
+        // Пользователь должен сам решить возобновлять или останавливать через idle окно
+        if (isPaused && idlePauseStartTime !== null) {
+          logger.debug('APP', 'Skipping sync: timer paused due to idle, user must decide via idle window');
           return;
         }
         
@@ -390,25 +397,34 @@ function App() {
         });
       }
 
-      // Check idle status every 30 seconds
+      // Check idle status every 10 seconds for faster reaction (especially for low thresholds like 1 minute)
       idleCheckInterval = setInterval(() => {
         if (!isCleanedUp) {
           useTrackerStore.getState().checkIdleStatus();
         }
-      }, 30000);
+      }, 10000);
 
+      // Send idle detection heartbeat every 30-60 seconds (as per API docs)
+      // This updates user's last activity time on the server for idle detection
       heartbeatInterval = setInterval(async () => {
         if (!isCleanedUp) {
           try {
-            const timerState = await useTrackerStore.getState().getTimerState();
-            if (timerState.state === 'RUNNING') {
-              await useTrackerStore.getState().sendHeartbeat(true);
-            }
+            const store = useTrackerStore.getState();
+            const { lastActivityTime } = store;
+            
+            // Check if user was active in the last minute (60 seconds)
+            const now = Date.now();
+            const timeSinceActivity = (now - lastActivityTime) / 1000; // seconds
+            const isActive = timeSinceActivity < 60; // active if activity within last 60 seconds
+            
+            // Send heartbeat to update last activity time on server
+            // This is separate from time entry heartbeat - it's for idle detection
+            await store.sendHeartbeat(isActive);
           } catch (error) {
-            logger.error('APP', 'Failed to send heartbeat', error);
+            logger.error('APP', 'Failed to send idle heartbeat', error);
           }
         }
-      }, 60000);
+      }, 45000); // Every 45 seconds (between 30-60 as recommended)
     };
 
     setupActivityListeners();
@@ -965,7 +981,8 @@ function App() {
         const unlistenResume = await listen('resume-tracking', async () => {
           const { resumeTracking } = useTrackerStore.getState();
           try {
-            await resumeTracking();
+            // Pass fromIdleWindow=true to allow resume even if paused due to idle
+            await resumeTracking(true);
           } catch (error) {
             logger.error('APP', 'Failed to resume from idle window', error);
             await logger.safeLogToRust(`[APP] Failed to resume from idle window: ${error}`).catch((e) => {

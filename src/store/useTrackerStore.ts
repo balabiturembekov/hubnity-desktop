@@ -26,7 +26,7 @@ export interface TrackerState {
   selectProject: (project: Project) => Promise<void>;
   startTracking: (description?: string) => Promise<void>;
   pauseTracking: (isIdlePause?: boolean) => Promise<void>;
-  resumeTracking: () => Promise<void>;
+  resumeTracking: (fromIdleWindow?: boolean) => Promise<void>;
   stopTracking: () => Promise<void>;
   updateActivityTime: () => void;
   setIdleThreshold: (minutes: number) => void;
@@ -746,7 +746,21 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         });
         try { await invoke('hide_idle_window'); } catch (_) { /* ignore */ }
       } else {
-        set({ error: msg, isLoading: false });
+        // Проверяем реальное состояние Timer Engine при ошибке
+        try {
+          const timerState = await TimerEngineAPI.getState();
+          // Синхронизируем состояние с Timer Engine
+          set({
+            isPaused: timerState.state === 'PAUSED',
+            isTracking: timerState.state === 'RUNNING' || timerState.state === 'PAUSED',
+            isLoading: false,
+            error: msg,
+            ...(timerState.state === 'STOPPED' ? { currentTimeEntry: null, idlePauseStartTime: null } : {}),
+          });
+        } catch (e) {
+          // Если не удалось проверить Timer Engine, только устанавливаем ошибку
+          set({ error: msg, isLoading: false });
+        }
         try {
           await invoke('stop_activity_monitoring');
         } catch (e) {
@@ -756,12 +770,22 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
     }
   },
 
-  resumeTracking: async () => {
-    const { currentTimeEntry, isLoading: currentLoading, isPaused } = get();
+  resumeTracking: async (fromIdleWindow: boolean = false) => {
+    const { currentTimeEntry, isLoading: currentLoading, isPaused, idlePauseStartTime } = get();
     if (!currentTimeEntry) return;
     
     // Prevent multiple simultaneous calls
     if (currentLoading) {
+      return;
+    }
+    
+    // CRITICAL: Prevent auto-resume if paused due to idle - user must decide via idle window
+    // But allow resume if explicitly called from idle window (user clicked Resume button)
+    if (isPaused && idlePauseStartTime !== null && !fromIdleWindow) {
+      logger.warn('RESUME', 'Attempted to resume while paused due to idle - ignoring (user must decide via idle window)');
+      await logger.safeLogToRust('[RESUME] Blocked: timer paused due to idle, user must decide via idle window').catch((e) => {
+        logger.debug('RESUME', 'Failed to log (non-critical)', e);
+      });
       return;
     }
     
@@ -1179,11 +1203,21 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       
       // Also check if time entry is already paused on server
       if (currentState.currentTimeEntry?.status === 'PAUSED') {
-        await logger.safeLogToRust(`[IDLE CHECK] Time entry already paused on server, updating local state`).catch((e) => {
+        await logger.safeLogToRust(`[IDLE CHECK] Time entry already paused on server, syncing with Timer Engine`).catch((e) => {
           logger.debug('IDLE_CHECK', 'Failed to log (non-critical)', e);
         });
-        // Update local state to match server
-        set({ isPaused: true });
+        // Sync with Timer Engine state (source of truth)
+        try {
+          const timerState = await TimerEngineAPI.getState();
+          set({
+            isPaused: timerState.state === 'PAUSED',
+            isTracking: timerState.state === 'PAUSED' || timerState.state === 'RUNNING',
+            ...(timerState.state === 'STOPPED' ? { currentTimeEntry: null } : {}),
+          });
+        } catch (e) {
+          // If can't get Timer Engine state, just set isPaused from server
+          set({ isPaused: true });
+        }
         return;
       }
       
@@ -1191,17 +1225,12 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       // This prevents the "Already loading" check from blocking the pause
       
       try {
-        // Сразу помечаем паузу в сторе, чтобы скриншоты не делались в момент между решением о паузе и ответом API
-        const now = Date.now();
-        set({ isPaused: true, idlePauseStartTime: now });
-        await logger.safeLogToRust(`[IDLE CHECK] Set store to paused/idle before API call`).catch(() => {});
-
         // Get pauseTracking function directly from store
         const pauseFn = get().pauseTracking;
         await logger.safeLogToRust(`[IDLE CHECK] Calling pauseTracking function...`).catch((e) => {
           logger.debug('IDLE_CHECK', 'Failed to log (non-critical)', e);
         });
-        // Auto pause - pass isIdlePause=true so pauseTracking keeps idlePauseStartTime
+        // Auto pause - pass isIdlePause=true so pauseTracking sets idlePauseStartTime
         await pauseFn(true);
         
         // Wait a bit for state to update
@@ -1213,6 +1242,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           logger.debug('IDLE_CHECK', 'Failed to log (non-critical)', e);
         });
         
+        // Only show idle window if pause was successful AND idlePauseStartTime is set
         if (stateAfterPause.isPaused && stateAfterPause.idlePauseStartTime) {
           await logger.safeLogToRust(`[IDLE CHECK] Tracker paused successfully with idle pause start time`).catch((e) => {
             logger.debug('IDLE_CHECK', 'Failed to log (non-critical)', e);
@@ -1274,16 +1304,50 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           await logger.safeLogToRust(`[IDLE CHECK] WARNING: Pause function returned but isPaused is still false!`).catch((e) => {
             logger.debug('IDLE_CHECK', 'Failed to log (non-critical)', e);
           });
-          // Пауза не удалась — возвращаем store в согласованное состояние с Timer Engine
-          set({ isPaused: false, idlePauseStartTime: null });
+          // Проверяем реальное состояние Timer Engine перед очисткой
+          try {
+            const timerState = await TimerEngineAPI.getState();
+            if (timerState.state === 'PAUSED' || timerState.state === 'STOPPED') {
+              // Timer Engine на паузе/остановлен — синхронизируем состояние
+              set({
+                isPaused: timerState.state === 'PAUSED',
+                isTracking: timerState.state === 'PAUSED',
+                idlePauseStartTime: timerState.state === 'PAUSED' ? Date.now() : null,
+                ...(timerState.state === 'STOPPED' ? { currentTimeEntry: null } : {}),
+              });
+            } else {
+              // Timer Engine не на паузе — очищаем состояние
+              set({ isPaused: false, idlePauseStartTime: null });
+            }
+          } catch (e) {
+            // Если не удалось проверить Timer Engine, очищаем состояние
+            set({ isPaused: false, idlePauseStartTime: null });
+          }
         }
       } catch (error: any) {
         logger.error('IDLE_CHECK', 'Error pausing tracker', error);
         await logger.safeLogToRust(`[IDLE CHECK] Error pausing: ${error.message || 'Unknown error'}`).catch((e) => {
           logger.debug('IDLE_CHECK', 'Failed to log (non-critical)', e);
         });
-        // Пауза не удалась — возвращаем store в согласованное состояние с Timer Engine
-        set({ isPaused: false, idlePauseStartTime: null });
+        // Проверяем реальное состояние Timer Engine перед очисткой
+        try {
+          const timerState = await TimerEngineAPI.getState();
+          if (timerState.state === 'PAUSED' || timerState.state === 'STOPPED') {
+            // Timer Engine на паузе/остановлен — синхронизируем состояние
+            set({
+              isPaused: timerState.state === 'PAUSED',
+              isTracking: timerState.state === 'PAUSED',
+              idlePauseStartTime: timerState.state === 'PAUSED' ? Date.now() : null,
+              ...(timerState.state === 'STOPPED' ? { currentTimeEntry: null } : {}),
+            });
+          } else {
+            // Timer Engine не на паузе — очищаем состояние
+            set({ isPaused: false, idlePauseStartTime: null });
+          }
+        } catch (e) {
+          // Если не удалось проверить Timer Engine, очищаем состояние
+          set({ isPaused: false, idlePauseStartTime: null });
+        }
       }
     }
   },
