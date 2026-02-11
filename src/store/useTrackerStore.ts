@@ -41,6 +41,8 @@ export interface TrackerState {
   getAccessToken: () => string | null;
   getScreenshots: (timeEntryId: string) => Promise<Screenshot[]>;
   resetDay: () => Promise<TimerStateResponse>;
+  /** Сбрасывает трекинг в сторе и Rust, когда на сервере нет активных записей (синхронизация). */
+  clearTrackingStateFromServer: () => Promise<void>;
 }
 
 export const useTrackerStore = create<TrackerState>((set, get) => ({
@@ -81,7 +83,11 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       }
       
       const activeEntries = await api.getActiveTimeEntries();
-      if (activeEntries.length > 0) {
+      if (activeEntries.length === 0) {
+        await get().clearTrackingStateFromServer();
+        return;
+      }
+      {
         let activeEntry: TimeEntry;
         
         // FIX: Если несколько активных записей, выбираем самую свежую и останавливаем остальные
@@ -725,13 +731,27 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       });
     } catch (error: any) {
       logger.error('PAUSE', 'Failed to pause tracking', error);
-      await logger.safeLogToRust(`[PAUSE] Error: ${error.message || 'Unknown error'}`);
-      set({ error: error.message || 'Failed to pause tracking', isLoading: false });
-      // Try to stop monitoring even on error
-      try {
-        await invoke('stop_activity_monitoring');
-      } catch (e) {
-        // Ignore
+      const msg = error.message || 'Failed to pause tracking';
+      const alreadyStopped = typeof msg === 'string' && (msg.includes('already stopped') || msg.includes('not found'));
+      if (alreadyStopped) {
+        try { await TimerEngineAPI.stop(); } catch (_) { /* ignore */ }
+        try { await invoke('stop_activity_monitoring'); } catch (_) { /* ignore */ }
+        set({
+          currentTimeEntry: null,
+          isTracking: false,
+          isPaused: false,
+          isLoading: false,
+          error: null,
+          idlePauseStartTime: null,
+        });
+        try { await invoke('hide_idle_window'); } catch (_) { /* ignore */ }
+      } else {
+        set({ error: msg, isLoading: false });
+        try {
+          await invoke('stop_activity_monitoring');
+        } catch (e) {
+          // Ignore
+        }
       }
     }
   },
@@ -882,8 +902,44 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         // Ignore errors
       }
     } catch (error: any) {
-      set({ error: error.message || 'Failed to resume tracking', isLoading: false });
-      // Try to stop monitoring on error to prevent inconsistent state
+      const msg = error.message || 'Failed to resume tracking';
+      const needSyncFromServer = typeof msg === 'string' && (msg.includes('already running') || msg.includes('Only paused entries can be resumed'));
+      const entryStoppedOrGone = typeof msg === 'string' && (msg.includes('already stopped') || msg.includes('not found') || msg.includes('Invalid resume') || msg.includes('Only paused entries can be resumed'));
+      if (needSyncFromServer) {
+        try {
+          const activeEntries = await api.getActiveTimeEntries();
+          const serverEntry = activeEntries.find(e => e.id === currentTimeEntry.id);
+          if (serverEntry?.status === 'RUNNING') {
+            try { await TimerEngineAPI.resume(); } catch (_) { /* already running */ }
+            set({
+              currentTimeEntry: serverEntry,
+              isPaused: false,
+              isTracking: true,
+              isLoading: false,
+              error: null,
+              idlePauseStartTime: null,
+            });
+            return;
+          }
+        } catch (_) {
+          // fetch failed — don't assume state, fall through to generic error
+        }
+      }
+      if (entryStoppedOrGone) {
+        try { await TimerEngineAPI.stop(); } catch (_) { /* ignore */ }
+        try { await invoke('stop_activity_monitoring'); } catch (_) { /* ignore */ }
+        set({
+          currentTimeEntry: null,
+          isTracking: false,
+          isPaused: false,
+          isLoading: false,
+          error: null,
+          idlePauseStartTime: null,
+        });
+        try { await invoke('hide_idle_window'); } catch (_) { /* ignore */ }
+        return;
+      }
+      set({ error: msg, isLoading: false });
       try {
         await invoke('stop_activity_monitoring');
       } catch (e) {
@@ -1103,9 +1159,10 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
             logger.debug('IDLE_CHECK', 'Failed to log (non-critical)', e);
           });
           const currentState = timerState.state;
-          set({ 
+          set({
             isPaused: currentState === 'PAUSED',
-            isTracking: currentState === 'PAUSED' // Если PAUSED или STOPPED, то isTracking = только для PAUSED
+            isTracking: currentState === 'PAUSED',
+            ...(currentState === 'STOPPED' ? { currentTimeEntry: null } : {}),
           });
           return;
         }
@@ -1344,15 +1401,22 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
   },
 
   reset: async () => {
-    // Stop activity monitoring
+    try {
+      await TimerEngineAPI.stop();
+    } catch (_) {
+      // ignore
+    }
     try {
       await invoke('stop_activity_monitoring');
     } catch (e) {
       // Ignore errors
     }
-    
+    try {
+      await invoke('hide_idle_window');
+    } catch (_) {
+      // ignore
+    }
     // Очистка localStorage больше не нужна - время хранится в Rust Timer Engine
-    
     // Reset all state
     set({
       projects: [],
@@ -1387,7 +1451,39 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
   getScreenshots: async (timeEntryId: string) => api.getScreenshots(timeEntryId),
   resetDay: async () => {
     await TimerEngineAPI.resetDay();
-    return TimerEngineAPI.getState();
+    const state = await TimerEngineAPI.getState();
+    set({
+      isTracking: state.state === 'RUNNING' || state.state === 'PAUSED',
+      isPaused: state.state === 'PAUSED',
+      ...(state.state === 'STOPPED' ? { currentTimeEntry: null } : {}),
+    });
+    return state;
+  },
+
+  clearTrackingStateFromServer: async () => {
+    try {
+      await TimerEngineAPI.stop();
+    } catch (_) {
+      // ignore
+    }
+    try {
+      await invoke('stop_activity_monitoring');
+    } catch (_) {
+      // ignore
+    }
+    set({
+      currentTimeEntry: null,
+      isTracking: false,
+      isPaused: false,
+      isLoading: false,
+      error: null,
+      idlePauseStartTime: null,
+    });
+    try {
+      await invoke('hide_idle_window');
+    } catch (_) {
+      // ignore
+    }
   },
 }));
 

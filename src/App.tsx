@@ -247,9 +247,8 @@ function App() {
             });
           }
         } else {
-          // Нет активных записей на сервере, но локально таймер работает - останавливаем
-          // Проверяем, что есть currentTimeEntry перед остановкой
-          const { currentTimeEntry: currentEntry, getTimerState } = useTrackerStore.getState();
+          // Нет активных записей на сервере — приводим стор и Rust к состоянию «остановлено»
+          const { currentTimeEntry: currentEntry, getTimerState, clearTrackingStateFromServer } = useTrackerStore.getState();
           if (!currentEntry) {
             return; // Уже остановлено локально
           }
@@ -260,6 +259,10 @@ function App() {
             await stopTracking().catch((e) => {
               logger.warn('APP', 'Failed to stop timer on sync', e);
             });
+          } else {
+            // Rust уже STOPPED, но в сторе ещё есть currentTimeEntry — очищаем стор
+            logger.info('APP', 'Syncing timer: no active entries on server, clearing store');
+            await clearTrackingStateFromServer();
           }
         }
       } catch (error) {

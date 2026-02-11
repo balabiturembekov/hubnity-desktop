@@ -43,11 +43,15 @@ export function Timer() {
         const isRunning = state.state === 'RUNNING';
         const isPaused = state.state === 'PAUSED';
         
-        const { isTracking: currentIsTracking, isPaused: currentIsPaused } = useTrackerStore.getState();
-        if (currentIsTracking !== isRunning || currentIsPaused !== isPaused) {
+        const store = useTrackerStore.getState();
+        const { isTracking: currentIsTracking, isPaused: currentIsPaused, currentTimeEntry } = store;
+        const trackingChanged = currentIsTracking !== isRunning || currentIsPaused !== isPaused;
+        const needClearEntry = state.state === 'STOPPED' && currentTimeEntry !== null;
+        if (trackingChanged || needClearEntry) {
           useTrackerStore.setState({
             isTracking: isRunning || isPaused,
             isPaused: isPaused,
+            ...(state.state === 'STOPPED' ? { currentTimeEntry: null } : {}),
           });
         }
         
