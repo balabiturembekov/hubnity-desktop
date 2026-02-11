@@ -201,7 +201,14 @@ function App() {
 
     const syncTimerState = async () => {
       try {
-        const { currentTimeEntry, isTracking, isPaused, idlePauseStartTime } = useTrackerStore.getState();
+        const { currentTimeEntry, isTracking, isPaused, idlePauseStartTime, isLoading } = useTrackerStore.getState();
+        
+        // BUG FIX: Don't sync if another operation is in progress
+        // This prevents sync from interfering with user actions or other operations
+        if (isLoading) {
+          logger.debug('APP', 'Skipping sync: operation in progress');
+          return;
+        }
         
         // Если локально нет активной записи и таймер остановлен, не нужно синхронизировать
         if (!currentTimeEntry && !isTracking) {
@@ -232,11 +239,22 @@ function App() {
           // Синхронизируем состояние таймера с сервером
           if (activeEntry.status === 'RUNNING' && timerState.state !== 'RUNNING') {
             // На сервере RUNNING, но локально не RUNNING - запускаем
-            logger.info('APP', 'Syncing timer: server is RUNNING, starting local timer');
-            const { resumeTracking } = useTrackerStore.getState();
-            await resumeTracking().catch((e) => {
-              logger.warn('APP', 'Failed to resume timer on sync', e);
-            });
+            // BUG FIX: Check if timer is paused before resuming (resumeTracking requires isPaused=true)
+            const currentStoreState = useTrackerStore.getState();
+            if (currentStoreState.isPaused || timerState.state === 'PAUSED') {
+              logger.info('APP', 'Syncing timer: server is RUNNING, resuming local timer');
+              const { resumeTracking } = useTrackerStore.getState();
+              await resumeTracking().catch((e) => {
+                logger.warn('APP', 'Failed to resume timer on sync', e);
+              });
+            } else if (timerState.state === 'STOPPED') {
+              // Timer is stopped, need to start instead of resume
+              logger.info('APP', 'Syncing timer: server is RUNNING, starting local timer');
+              const { startTracking } = useTrackerStore.getState();
+              await startTracking().catch((e) => {
+                logger.warn('APP', 'Failed to start timer on sync', e);
+              });
+            }
           } else if (activeEntry.status === 'PAUSED' && timerState.state === 'RUNNING') {
             // На сервере PAUSED, но локально RUNNING - ставим на паузу
             // Но не паузим если локально на паузе из-за idle (пользователь должен решить через idle окно)
