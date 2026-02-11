@@ -199,8 +199,8 @@ export function IdleWindow() {
       }
       try {
         await invoke('show_notification', {
-          title: 'Ошибка',
-          body: 'Не удалось возобновить трекинг',
+          title: 'Error',
+          body: 'Could not resume tracking',
         });
       } catch (notifError) {
         // Ignore notification errors
@@ -223,8 +223,8 @@ export function IdleWindow() {
       }
       try {
         await invoke('show_notification', {
-          title: 'Ошибка',
-          body: 'Не удалось остановить трекинг',
+          title: 'Error',
+          body: 'Could not stop tracking',
         });
       } catch (notifError) {
         // Ignore notification errors
@@ -233,53 +233,47 @@ export function IdleWindow() {
   };
 
   return (
-    <div className="h-screen bg-background flex flex-col items-center justify-center px-6 py-10">
-      {/* Main Timer - главный визуальный якорь */}
-      <div className="flex flex-col items-center space-y-6 mb-10 flex-1 justify-center">
-        {/* Таймер - самый крупный элемент */}
-        <div className="text-6xl font-mono font-bold text-muted-foreground/90 tracking-tight transition-colors duration-300 leading-none">
+    <div className="h-screen bg-background flex flex-col items-center justify-center px-5 py-6">
+      <div className="flex flex-col items-center space-y-4 mb-6 flex-1 justify-center">
+        <div className="text-5xl font-mono font-bold text-primary tracking-tight leading-none">
           {formatTime(idleTime)}
         </div>
-        
-        {/* Статус - вторичный, приглушенный */}
-        <div className="flex items-center gap-1.5 text-xs text-muted-foreground/60">
-          <div className="w-1.5 h-1.5 rounded-full bg-muted-foreground/30" />
-          <span>Приостановлено (нет активности)</span>
+        <div className="flex flex-col items-center gap-1">
+          <div className="flex items-center gap-1.5 text-xs text-muted-foreground/60">
+            <div className="w-1.5 h-1.5 rounded-full bg-muted-foreground/30" />
+            <span>Paused (no activity)</span>
+          </div>
+          <span className="text-[11px] text-muted-foreground/50">
+            Return to continue tracking
+          </span>
         </div>
       </div>
-      
-      {/* Кнопки управления - macOS-native стиль */}
-      <div className="flex gap-3 w-full max-w-sm pb-2">
-        {/* Primary: Возобновить */}
+      <div className="flex gap-2 w-full max-w-sm pb-2">
         <Button
           onClick={handleResume}
           disabled={isLoading}
           size="default"
           variant="default"
-          className="gap-2 flex-1 h-10 transition-colors duration-300"
+          className="gap-2 flex-1 h-10 text-sm rounded-md"
         >
           <RotateCcw className="h-4 w-4" />
           Resume
         </Button>
-        
-        {/* Secondary: Стоп */}
         <Button
           onClick={handleStop}
           disabled={isLoading}
           size="default"
-          variant="destructive"
-          className="gap-2 h-10 px-4 bg-destructive-soft hover:bg-destructive-soft-hover transition-colors duration-300"
+          variant="outline"
+          className="gap-2 h-10 px-4 text-sm rounded-md"
         >
           <Square className="h-4 w-4" />
           Stop
         </Button>
       </div>
-      
-      {/* Debug info - только в development режиме */}
-      {process.env.NODE_ENV === 'development' && idlePauseStartTime && (
-        <div className="mt-4 text-[10px] text-muted-foreground/40 font-mono max-w-md break-all text-center">
-          pauseStart: {new Date(idlePauseStartTime).toLocaleTimeString()}, 
-          diff: {Math.floor((Date.now() - idlePauseStartTime) / 1000)}s
+      {import.meta.env.DEV && idlePauseStartTime && (
+        <div className="mt-3 text-[10px] text-muted-foreground/40 font-mono max-w-md break-all text-center">
+          pauseStart: {new Date(idlePauseStartTime).toLocaleTimeString()}, diff:{' '}
+          {Math.floor((Date.now() - idlePauseStartTime) / 1000)}s
         </div>
       )}
     </div>
