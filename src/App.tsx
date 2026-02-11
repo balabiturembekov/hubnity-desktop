@@ -277,11 +277,20 @@ function App() {
             });
           }
         } else {
-          // Нет активных записей на сервере — приводим стор и Rust к состоянию «остановлено»
-          const { currentTimeEntry: currentEntry, getTimerState, clearTrackingStateFromServer } = useTrackerStore.getState();
+          // Нет активных записей на сервере — проверяем, нужно ли останавливать таймер
+          const { currentTimeEntry: currentEntry, getTimerState, clearTrackingStateFromServer, localTimerStartTime } = useTrackerStore.getState();
           if (!currentEntry) {
             return; // Уже остановлено локально
           }
+          
+          // BUG FIX: Don't auto-stop timer if it was started locally recently (< 2 minutes ago)
+          // This protects against stopping timer when API call failed but Timer Engine is running
+          const TWO_MINUTES = 2 * 60 * 1000; // 2 minutes in milliseconds
+          if (localTimerStartTime && (Date.now() - localTimerStartTime) < TWO_MINUTES) {
+            logger.debug('APP', 'Syncing timer: timer started locally recently, skipping auto-stop (API may still be syncing)');
+            return; // Don't stop timer if it was started locally recently
+          }
+          
           const timerState = await getTimerState();
           if (timerState.state !== 'STOPPED') {
             logger.info('APP', 'Syncing timer: no active entries on server, stopping local timer');

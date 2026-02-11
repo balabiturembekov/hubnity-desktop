@@ -19,6 +19,7 @@ export interface TrackerState {
   isTakingScreenshot: boolean; // Indicates if screenshot is being taken
   idlePauseStartTime: number | null; // Timestamp when paused due to inactivity
   urlActivities: UrlActivity[]; // Accumulated URL activities waiting to be sent
+  localTimerStartTime: number | null; // Timestamp when timer was started locally (for sync protection)
 
   // Actions
   loadProjects: () => Promise<void>;
@@ -58,6 +59,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
   isTakingScreenshot: false,
   idlePauseStartTime: null,
   urlActivities: [], // Accumulated URL activities
+  localTimerStartTime: null, // Track when timer was started locally
 
   loadProjects: async () => {
     try {
@@ -550,9 +552,23 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         }
       }
       
+      // BUG FIX: Set local timer start time BEFORE API call
+      // This protects against syncTimerState stopping the timer if API fails
+      const localStartTime = Date.now();
+      set({ localTimerStartTime: localStartTime });
+      
       // Прямой вызов API для немедленного обновления UI
       // Если API недоступен, данные останутся в очереди и синхронизируются позже
-      const timeEntry = await api.startTimeEntry(requestData);
+      let timeEntry: TimeEntry;
+      try {
+        timeEntry = await api.startTimeEntry(requestData);
+      } catch (apiError: any) {
+        // BUG FIX: If API fails but Timer Engine will start, keep localTimerStartTime
+        // This prevents syncTimerState from stopping the timer
+        logger.warn('START', 'API call failed, but Timer Engine will start locally', apiError);
+        // Re-throw to handle in outer catch block
+        throw apiError;
+      }
       
       // Запускаем Timer Engine в Rust (единственный source of truth для времени)
       let timerState;
@@ -639,6 +655,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         lastActivityTime: Date.now(),
         isLoading: false,
         error: null,
+        localTimerStartTime: null, // Clear local timer start time when entry is created on server
       });
     } catch (error: any) {
       // BUG FIX: При ошибке API нужно проверить, была ли запись создана
@@ -1185,6 +1202,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           isLoading: false,
           error: null,
           idlePauseStartTime: null,
+          localTimerStartTime: null, // Clear local timer start time on stop
         });
       } catch (e) {
         // Игнорируем ошибки - это нормально если таймер уже остановлен
@@ -1726,6 +1744,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       error: null,
       idlePauseStartTime: null,
       urlActivities: [],
+      localTimerStartTime: null,
     });
   },
 
@@ -1775,6 +1794,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       isLoading: false,
       error: null,
       idlePauseStartTime: null,
+      localTimerStartTime: null, // Clear local timer start time
     });
     try {
       await invoke('hide_idle_window');
