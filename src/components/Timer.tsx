@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import { Button } from './ui/button';
 import { useTrackerStore, type TimerStateResponse } from '../store/useTrackerStore';
 import { Play, Pause, Square, RotateCcw, Camera } from 'lucide-react';
@@ -34,9 +34,18 @@ export function Timer() {
 
   // Получаем состояние таймера из Rust каждую секунду
   useEffect(() => {
+    let isMounted = true;
+    
     const updateTimerState = async () => {
+      // BUG FIX: Check if component is still mounted before updating state
+      if (!isMounted) return;
+      
       try {
         const state = await useTrackerStore.getState().getTimerState();
+        
+        // Check again after async operation
+        if (!isMounted) return;
+        
         setTimerState(state);
         
         const isRunning = state.state === 'RUNNING';
@@ -75,13 +84,18 @@ export function Timer() {
 
     updateTimerState();
     const interval = setInterval(updateTimerState, 1000);
-    return () => clearInterval(interval);
+    return () => {
+      isMounted = false;
+      clearInterval(interval);
+    };
   }, []);
 
   // Проверка смены дня (локальная дата — как в Rust ensure_correct_day)
   useEffect(() => {
+    let isMounted = true;
+    
     const checkDayChange = async () => {
-      if (!timerState?.day_start) return;
+      if (!timerState?.day_start || !isMounted) return;
 
       const dayStartTimestamp = timerState.day_start;
       const today = new Date();
@@ -91,9 +105,13 @@ export function Timer() {
 
       const isDifferentDay = todayLocal !== dayStartLocal;
 
-      if (isDifferentDay) {
+      if (isDifferentDay && isMounted) {
         try {
           const newState = await useTrackerStore.getState().resetDay();
+          
+          // BUG FIX: Check if component is still mounted before updating state
+          if (!isMounted) return;
+          
           setTimerState(newState);
         } catch (error) {
           logger.error('TIMER', 'Failed to reset day', error);
@@ -103,13 +121,21 @@ export function Timer() {
 
     const dayCheckInterval = setInterval(checkDayChange, 60000);
     checkDayChange();
-    return () => clearInterval(dayCheckInterval);
+    return () => {
+      isMounted = false;
+      clearInterval(dayCheckInterval);
+    };
   }, [timerState?.day_start]);
 
   // Обновление idle time
   useEffect(() => {
+    let isMounted = true;
+    
     if (timerState?.state === 'PAUSED' && idlePauseStartTime) {
       const updateIdleTime = () => {
+        // BUG FIX: Check if component is still mounted before updating state
+        if (!isMounted) return;
+        
         const now = Date.now();
         const idleSeconds = Math.floor((now - idlePauseStartTime) / 1000);
         const validIdleSeconds = isNaN(idleSeconds) ? 0 : Math.max(0, idleSeconds);
@@ -118,11 +144,27 @@ export function Timer() {
       
       updateIdleTime();
       const interval = setInterval(updateIdleTime, 1000);
-      return () => clearInterval(interval);
+      return () => {
+        isMounted = false;
+        clearInterval(interval);
+      };
     } else {
       setIdleTime(0);
+      return () => {
+        isMounted = false;
+      };
     }
   }, [timerState?.state, idlePauseStartTime]);
+
+  // BUG FIX: Track component mount state to prevent setState after unmount
+  const isMountedRef = useRef(true);
+  
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
 
   const handleStart = async () => {
     if (!selectedProject || isProcessing) return;
@@ -132,7 +174,10 @@ export function Timer() {
     } catch (error: any) {
       // Error is already set in store
     } finally {
-      setIsProcessing(false);
+      // BUG FIX: Only update state if component is still mounted
+      if (isMountedRef.current) {
+        setIsProcessing(false);
+      }
     }
   };
 
@@ -144,7 +189,10 @@ export function Timer() {
     } catch (error) {
       logger.error('TIMER', 'Failed to pause tracking', error);
     } finally {
-      setIsProcessing(false);
+      // BUG FIX: Only update state if component is still mounted
+      if (isMountedRef.current) {
+        setIsProcessing(false);
+      }
     }
   };
 
@@ -158,7 +206,10 @@ export function Timer() {
     } catch (error) {
       logger.error('TIMER', 'Failed to resume tracking', error);
     } finally {
-      setIsProcessing(false);
+      // BUG FIX: Only update state if component is still mounted
+      if (isMountedRef.current) {
+        setIsProcessing(false);
+      }
     }
   };
 
@@ -170,7 +221,10 @@ export function Timer() {
     } catch (error) {
       logger.error('TIMER', 'Failed to stop tracking', error);
     } finally {
-      setIsProcessing(false);
+      // BUG FIX: Only update state if component is still mounted
+      if (isMountedRef.current) {
+        setIsProcessing(false);
+      }
     }
   };
 
