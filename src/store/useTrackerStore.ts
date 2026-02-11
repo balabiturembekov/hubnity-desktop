@@ -1010,12 +1010,40 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         // Ignore errors
       }
     } catch (error: any) {
-      set({ error: error.message || 'Failed to stop tracking', isLoading: false });
-      // Try to stop monitoring even on error
-      try {
-        await invoke('stop_activity_monitoring');
-      } catch (e) {
-        // Ignore
+      const msg = error.message || 'Failed to stop tracking';
+      const alreadyStopped = typeof msg === 'string' && msg.includes('already stopped');
+      if (alreadyStopped) {
+        // Запись уже остановлена на бэкенде — приводим UI и движок к состоянию «остановлено»
+        try {
+          await TimerEngineAPI.stop();
+        } catch (_) {
+          // ignore
+        }
+        try {
+          await invoke('stop_activity_monitoring');
+        } catch (_) {
+          // ignore
+        }
+        set({
+          currentTimeEntry: null,
+          isTracking: false,
+          isPaused: false,
+          isLoading: false,
+          error: null,
+          idlePauseStartTime: null,
+        });
+        try {
+          await invoke('hide_idle_window');
+        } catch (_) {
+          // ignore
+        }
+      } else {
+        set({ error: msg, isLoading: false });
+        try {
+          await invoke('stop_activity_monitoring');
+        } catch (e) {
+          // Ignore
+        }
       }
     }
   },
