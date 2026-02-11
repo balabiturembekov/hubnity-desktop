@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
 import { Button } from './ui/button';
@@ -17,6 +17,16 @@ export function IdleWindow() {
   const [idleTime, setIdleTime] = useState(0);
   const [isLoading, setIsLoading] = useState(false);
   const [idlePauseStartTime, setIdlePauseStartTime] = useState<number | null>(null);
+  
+  // BUG FIX: Track component mount state to prevent setState after unmount
+  const isMountedRef = useRef(true);
+  
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
 
   // Log when component mounts
   useEffect(() => {
@@ -25,6 +35,8 @@ export function IdleWindow() {
 
   // Listen for state updates from main window via Tauri events
   useEffect(() => {
+    let isMounted = true;
+    
     logger.debug('IDLE_WINDOW', 'Setting up event listeners...');
     let unlistenState: (() => void) | null = null;
     let pollInterval: NodeJS.Timeout | null = null;
@@ -32,6 +44,9 @@ export function IdleWindow() {
     const MAX_IDLE_SECONDS = 24 * 60 * 60; // 24 hours = 86400 seconds
     
     const updateState = (pauseTime: number | null, loading: boolean) => {
+      // BUG FIX: Check if component is still mounted before updating state
+      if (!isMounted) return;
+      
       logger.debug('IDLE_WINDOW', 'Updating state', { pauseTime, isLoading: loading, pauseTimeType: typeof pauseTime });
       
       // Validate pauseTime before setting
@@ -45,6 +60,9 @@ export function IdleWindow() {
           logger.warn('IDLE_WINDOW', `Invalid pause time: ${numValue} (isNaN: ${isNaN(numValue)}, isFinite: ${isFinite(numValue)})`);
         }
       }
+      
+      // Check again before setState
+      if (!isMounted) return;
       
       setIdlePauseStartTime(validPauseTime);
       // Only set isLoading if it's actually a loading operation (not from screenshots)
@@ -116,6 +134,7 @@ export function IdleWindow() {
     setupListener();
 
     return () => {
+      isMounted = false;
       logger.debug('IDLE_WINDOW', 'Cleaning up listeners...');
       if (unlistenState) unlistenState();
       if (pollInterval) clearInterval(pollInterval);
@@ -125,10 +144,15 @@ export function IdleWindow() {
   // Local timer that updates every second if we have pause start time
   // Timer resets to 0 after 24 hours (86400 seconds)
   useEffect(() => {
+    let isMounted = true;
+    
     if (idlePauseStartTime !== null && idlePauseStartTime > 0 && !isNaN(idlePauseStartTime) && isFinite(idlePauseStartTime)) {
       const MAX_IDLE_SECONDS = 24 * 60 * 60; // 24 hours = 86400 seconds
       
       const updateTime = () => {
+        // BUG FIX: Check if component is still mounted before updating state
+        if (!isMounted) return;
+        
         const now = Date.now();
         const idleSeconds = Math.floor((now - idlePauseStartTime) / 1000);
         
@@ -149,10 +173,14 @@ export function IdleWindow() {
       }, 1000);
       
       return () => {
+        isMounted = false;
         clearInterval(interval);
       };
     } else {
       setIdleTime(0);
+      return () => {
+        isMounted = false;
+      };
     }
   }, [idlePauseStartTime]);
   
@@ -165,7 +193,10 @@ export function IdleWindow() {
       // Window will be closed automatically by main window
     } catch (error) {
       logger.error('IDLE_WINDOW', 'Failed to resume', error);
-      setIsLoading(false);
+      // BUG FIX: Only update state if component is still mounted
+      if (isMountedRef.current) {
+        setIsLoading(false);
+      }
       try {
         await invoke('show_notification', {
           title: 'Ошибка',
@@ -186,7 +217,10 @@ export function IdleWindow() {
       // Window will be closed automatically by main window
     } catch (error) {
       logger.error('IDLE_WINDOW', 'Failed to stop', error);
-      setIsLoading(false);
+      // BUG FIX: Only update state if component is still mounted
+      if (isMountedRef.current) {
+        setIsLoading(false);
+      }
       try {
         await invoke('show_notification', {
           title: 'Ошибка',

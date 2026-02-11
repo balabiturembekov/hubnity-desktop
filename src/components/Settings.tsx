@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from './ui/card';
 import { Label } from './ui/label';
 import { Input } from './ui/input';
@@ -23,6 +23,16 @@ export function Settings() {
   const [threshold, setThreshold] = useState(idleThreshold);
   const [isSaving, setIsSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  
+  // BUG FIX: Track component mount state to prevent setState after unmount
+  const isMountedRef = useRef(true);
+  
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
   const [queueStats, setQueueStats] = useState<QueueStats | null>(null);
   const [isLoadingStats, setIsLoadingStats] = useState(false);
 
@@ -51,6 +61,9 @@ export function Settings() {
 
   // Загрузить статистику очереди; при нажатии «Обновить» — восстановить токены и запустить синхронизацию
   const loadQueueStats = async (runSync = false) => {
+    // BUG FIX: Check if component is still mounted before updating state
+    if (!isMountedRef.current) return;
+    
     setIsLoadingStats(true);
     try {
       // Токен: сначала из API (in-memory), потом из localStorage — иначе Rust sync не видит токен
@@ -77,11 +90,18 @@ export function Settings() {
         }
       }
       const stats = await invoke<QueueStats>('get_sync_queue_stats');
+      
+      // BUG FIX: Check again after async operations
+      if (!isMountedRef.current) return;
+      
       setQueueStats(stats);
     } catch (error) {
       logger.error('SETTINGS', 'Failed to load queue stats', error);
     } finally {
-      setIsLoadingStats(false);
+      // BUG FIX: Only update state if component is still mounted
+      if (isMountedRef.current) {
+        setIsLoadingStats(false);
+      }
     }
   };
 
@@ -93,6 +113,8 @@ export function Settings() {
   }, []);
 
   const handleSave = async () => {
+    if (!isMountedRef.current) return;
+    
     setIsSaving(true);
     setSaved(false);
     
@@ -115,10 +137,16 @@ export function Settings() {
         logger.warn('SETTINGS', 'Failed to show notification (non-critical)', e);
       });
       
+      // BUG FIX: Check if component is still mounted before updating state
+      if (!isMountedRef.current) return;
+      
       setSaved(true);
       // Hide saved indicator after 2 seconds
       setTimeout(() => {
-        setSaved(false);
+        // BUG FIX: Check if component is still mounted before updating state
+        if (isMountedRef.current) {
+          setSaved(false);
+        }
       }, 2000);
     } catch (error) {
       logger.error('SETTINGS', 'Failed to save settings', error);
@@ -129,7 +157,10 @@ export function Settings() {
         logger.warn('SETTINGS', 'Failed to show error notification (non-critical)', e);
       });
     } finally {
-      setIsSaving(false);
+      // BUG FIX: Only update state if component is still mounted
+      if (isMountedRef.current) {
+        setIsSaving(false);
+      }
     }
   };
 
