@@ -150,6 +150,7 @@ impl SyncManager {
 
     /// Добавить time entry операцию в очередь синхронизации
     /// PRODUCTION: Токены НЕ сохраняются в payload, получаются через AuthManager при синхронизации
+    /// FIX: Отменяет противоположные операции (resume <-> pause) перед добавлением новой
     pub fn enqueue_time_entry(
         &self,
         operation: &str,
@@ -159,6 +160,22 @@ impl SyncManager {
     ) -> Result<i64, String> {
         // PRODUCTION: Токены НЕ сохраняются в payload
         // Они будут получаться через AuthManager.get_fresh_token() при синхронизации
+        
+        // FIX: Отменяем противоположные операции (resume <-> pause) перед добавлением новой
+        // Это предотвращает конфликты когда пользователь быстро нажимает resume/pause
+        if operation == "resume" || operation == "pause" {
+            // Для операций resume/pause payload содержит {"id": "timeEntryId"}
+            if let Some(time_entry_id) = payload.get("id").and_then(|v| v.as_str()) {
+                if let Err(e) = self.db.cancel_opposite_time_entry_operations(operation, time_entry_id) {
+                    warn!(
+                        "[SYNC] Failed to cancel opposite operations for {}: {}",
+                        operation, e
+                    );
+                    // Продолжаем - это не критично, синхронизация обработает конфликт
+                }
+            }
+        }
+        
         let payload_str = serde_json::to_string(&payload)
             .map_err(|e| format!("Failed to serialize payload: {}", e))?;
 

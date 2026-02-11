@@ -239,6 +239,11 @@ function App() {
             });
           } else if (activeEntry.status === 'PAUSED' && timerState.state === 'RUNNING') {
             // На сервере PAUSED, но локально RUNNING - ставим на паузу
+            // Но не паузим если локально на паузе из-за idle (пользователь должен решить через idle окно)
+            if (isPaused && idlePauseStartTime !== null) {
+              logger.debug('APP', 'Skipping sync pause: timer paused due to idle, user must decide via idle window');
+              return;
+            }
             logger.info('APP', 'Syncing timer: server is PAUSED, pausing local timer');
             const { pauseTracking } = useTrackerStore.getState();
             await pauseTracking().catch((e) => {

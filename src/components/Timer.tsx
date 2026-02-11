@@ -152,7 +152,9 @@ export function Timer() {
     if (isProcessing) return;
     setIsProcessing(true);
     try {
-      await resumeTracking();
+      // Pass fromIdleWindow=false but allow resume - this is explicit user action
+      // The idlePauseStartTime check should not block explicit user actions
+      await resumeTracking(false);
     } catch (error) {
       logger.error('TIMER', 'Failed to resume tracking', error);
     } finally {

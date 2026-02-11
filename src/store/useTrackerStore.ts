@@ -556,16 +556,62 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       
       // Обновляем UI state на основе Timer Engine
       // FIX: Используем state напрямую (не state.state.state) из-за #[serde(flatten)] в Rust
+      // BUG FIX: Если Timer Engine не запустился, но API запись создана, синхронизируем состояние
+      if (!timerState || timerState.state === 'STOPPED') {
+        logger.warn('START', 'Timer Engine not started but API entry created - syncing state');
+        // Пытаемся запустить Timer Engine еще раз
+        try {
+          timerState = await TimerEngineAPI.start();
+        } catch (retryError: any) {
+          logger.error('START', 'Failed to start Timer Engine after API success', retryError);
+          // Если не удалось запустить Timer Engine, но запись создана, показываем ошибку
+          set({
+            currentTimeEntry: timeEntry,
+            isTracking: false,
+            isPaused: false,
+            isLoading: false,
+            error: 'Запись создана, но таймер не запущен. Попробуйте возобновить вручную.',
+          });
+          return;
+        }
+      }
+      
       set({
         currentTimeEntry: timeEntry,
-        isTracking: timerState?.state === 'RUNNING' || false,
+        isTracking: timerState?.state === 'RUNNING' || timerState?.state === 'PAUSED' || false, // BUG FIX: isTracking should be true if RUNNING or PAUSED
         isPaused: timerState?.state === 'PAUSED' || false,
         lastActivityTime: Date.now(),
         isLoading: false,
         error: null,
       });
     } catch (error: any) {
-      set({ error: error.message || 'Failed to start tracking', isLoading: false });
+      // BUG FIX: При ошибке API нужно проверить, была ли запись создана
+      // Если запись создана, но произошла ошибка, нужно синхронизировать состояние
+      const errorMsg = error.message || 'Failed to start tracking';
+      const entryCreated = errorMsg.includes('already running') || errorMsg.includes('User already has');
+      
+      if (entryCreated) {
+        // Запись уже существует - пытаемся синхронизировать состояние
+        try {
+          const activeEntries = await api.getActiveTimeEntries();
+          if (activeEntries.length > 0) {
+            const activeEntry = activeEntries[0];
+            const timerState = await TimerEngineAPI.getState();
+            set({
+              currentTimeEntry: activeEntry,
+              isTracking: timerState.state === 'RUNNING' || timerState.state === 'PAUSED',
+              isPaused: timerState.state === 'PAUSED',
+              isLoading: false,
+              error: null,
+            });
+            return;
+          }
+        } catch (syncError) {
+          logger.error('START', 'Failed to sync state after API error', syncError);
+        }
+      }
+      
+      set({ error: errorMsg, isLoading: false });
       throw error;
     }
   },
@@ -802,15 +848,10 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       return;
     }
     
-    // CRITICAL: Prevent auto-resume if paused due to idle - user must decide via idle window
-    // But allow resume if explicitly called from idle window (user clicked Resume button)
-    if (isPaused && idlePauseStartTime !== null && !fromIdleWindow) {
-      logger.warn('RESUME', 'Attempted to resume while paused due to idle - ignoring (user must decide via idle window)');
-      await logger.safeLogToRust('[RESUME] Blocked: timer paused due to idle, user must decide via idle window').catch((e) => {
-        logger.debug('RESUME', 'Failed to log (non-critical)', e);
-      });
-      return;
-    }
+    // NOTE: We removed the idlePauseStartTime check here because:
+    // 1. Automatic resume from syncTimerState is already protected by a check in App.tsx (line 213)
+    // 2. Explicit user actions (clicking Resume button) should always be allowed
+    // 3. The fromIdleWindow parameter is still used for clarity/logging but doesn't block resume
     
     // Prevent resuming if already running (not paused)
     if (!isPaused) {
@@ -1094,7 +1135,13 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         }
       }
       
-      await invoke('stop_activity_monitoring');
+      // Stop activity monitoring (don't fail if this fails)
+      try {
+        await invoke('stop_activity_monitoring');
+      } catch (monitoringError) {
+        logger.warn('STOP', 'Failed to stop activity monitoring', monitoringError);
+        // Continue anyway - timer is stopped
+      }
       
       // Обновляем UI state на основе Timer Engine
       set({
@@ -1141,7 +1188,21 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           // ignore
         }
       } else {
-        set({ error: msg, isLoading: false });
+        // Проверяем реальное состояние Timer Engine при ошибке для синхронизации
+        try {
+          const timerState = await TimerEngineAPI.getState();
+          // Синхронизируем состояние с Timer Engine
+          set({
+            isPaused: timerState.state === 'PAUSED',
+            isTracking: timerState.state === 'RUNNING' || timerState.state === 'PAUSED',
+            isLoading: false,
+            error: msg,
+            ...(timerState.state === 'STOPPED' ? { currentTimeEntry: null, idlePauseStartTime: null } : {}),
+          });
+        } catch (e) {
+          // Если не удалось проверить Timer Engine, только устанавливаем ошибку
+          set({ error: msg, isLoading: false });
+        }
         try {
           await invoke('stop_activity_monitoring');
         } catch (e) {
@@ -1208,7 +1269,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           const currentState = timerState.state;
           set({
             isPaused: currentState === 'PAUSED',
-            isTracking: currentState === 'PAUSED',
+            isTracking: currentState === 'PAUSED' || currentState === 'RUNNING', // BUG FIX: isTracking should be true if PAUSED or RUNNING
             ...(currentState === 'STOPPED' ? { currentTimeEntry: null } : {}),
           });
           return;
@@ -1334,7 +1395,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
               // Timer Engine на паузе/остановлен — синхронизируем состояние
               set({
                 isPaused: timerState.state === 'PAUSED',
-                isTracking: timerState.state === 'PAUSED',
+                isTracking: timerState.state === 'PAUSED' || timerState.state === 'RUNNING', // BUG FIX: isTracking should be true if PAUSED or RUNNING
                 idlePauseStartTime: timerState.state === 'PAUSED' ? Date.now() : null,
                 ...(timerState.state === 'STOPPED' ? { currentTimeEntry: null } : {}),
               });
@@ -1359,7 +1420,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
             // Timer Engine на паузе/остановлен — синхронизируем состояние
             set({
               isPaused: timerState.state === 'PAUSED',
-              isTracking: timerState.state === 'PAUSED',
+              isTracking: timerState.state === 'PAUSED' || timerState.state === 'RUNNING', // BUG FIX: isTracking should be true if PAUSED or RUNNING
               idlePauseStartTime: timerState.state === 'PAUSED' ? Date.now() : null,
               ...(timerState.state === 'STOPPED' ? { currentTimeEntry: null } : {}),
             });
