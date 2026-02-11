@@ -1211,18 +1211,39 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       }
       
       // Останавливаем Timer Engine в Rust
+      let timerState: import('../lib/timer-engine').TimerStateResponse | null = null;
       try {
-        await TimerEngineAPI.stop();
+        timerState = await TimerEngineAPI.stop();
       } catch (timerError: any) {
-        // Если таймер уже остановлен, это нормально
-        if (!timerError.message?.includes('already stopped')) {
-          // Другая ошибка - показываем toast
+        // Если таймер уже остановлен, получаем текущее состояние
+        if (timerError.message?.includes('already stopped')) {
+          timerState = await TimerEngineAPI.getState();
+        } else {
+          // Другая ошибка - показываем toast, но пытаемся получить состояние
           await invoke('show_notification', {
             title: 'Ошибка таймера',
             body: 'Не удалось остановить таймер, но запись времени завершена',
           }).catch((e) => {
             logger.warn('STOP', 'Failed to show notification (non-critical)', e);
           });
+          // Пытаемся получить текущее состояние Timer Engine
+          timerState = await TimerEngineAPI.getState().catch(() => null);
+        }
+      }
+      
+      // BUG FIX: Если Timer Engine не остановился, но API запись остановлена, синхронизируем состояние
+      if (timerState && timerState.state !== 'STOPPED') {
+        logger.warn('STOP', 'Timer Engine not stopped but API entry stopped - retrying stop');
+        // Пытаемся остановить Timer Engine еще раз
+        try {
+          timerState = await TimerEngineAPI.stop();
+        } catch (retryError: any) {
+          logger.error('STOP', 'Failed to stop Timer Engine after API success', retryError);
+          // Если не удалось остановить Timer Engine, но запись остановлена, синхронизируем состояние
+          const currentTimerState = await TimerEngineAPI.getState().catch(() => null);
+          if (currentTimerState) {
+            timerState = currentTimerState;
+          }
         }
       }
       
@@ -1234,13 +1255,13 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         // Continue anyway - timer is stopped
       }
       
-      // Обновляем UI state на основе Timer Engine
+      // Обновляем UI state на основе Timer Engine (source of truth)
       set({
         currentTimeEntry: null,
-        isTracking: false,
-        isPaused: false,
+        isTracking: timerState?.state === 'RUNNING' || timerState?.state === 'PAUSED' ? true : false,
+        isPaused: timerState?.state === 'PAUSED' || false,
         isLoading: false,
-        error: null,
+        error: timerState && timerState.state !== 'STOPPED' ? 'Запись остановлена, но таймер не остановлен. Попробуйте остановить вручную.' : null,
         idlePauseStartTime: null,
       });
       
