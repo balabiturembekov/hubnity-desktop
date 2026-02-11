@@ -1411,8 +1411,11 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
             ...(timerState.state === 'STOPPED' ? { currentTimeEntry: null } : {}),
           });
         } catch (e) {
-          // If can't get Timer Engine state, just set isPaused from server
-          set({ isPaused: true });
+          // BUG FIX: If can't get Timer Engine state, don't assume paused
+          // Server state might be stale, so we should not set isPaused without Timer Engine confirmation
+          logger.warn('IDLE_CHECK', 'Cannot get Timer Engine state, cannot confirm pause status', e);
+          // Don't set isPaused - let syncTimerState handle it later
+          // Setting isPaused: true without Timer Engine confirmation can cause desync
         }
         return;
       }
