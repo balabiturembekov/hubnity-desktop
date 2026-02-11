@@ -917,8 +917,8 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
     }
   },
 
-  resumeTracking: async (fromIdleWindow: boolean = false) => {
-    const { currentTimeEntry, isLoading: currentLoading, isPaused, idlePauseStartTime } = get();
+  resumeTracking: async (_fromIdleWindow: boolean = false) => {
+    const { currentTimeEntry, isLoading: currentLoading, isPaused } = get();
     if (!currentTimeEntry) return;
     
     // Prevent multiple simultaneous calls
@@ -1415,7 +1415,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           const currentState = timerState.state;
           set({
             isPaused: currentState === 'PAUSED',
-            isTracking: currentState === 'PAUSED' || currentState === 'RUNNING', // BUG FIX: isTracking should be true if PAUSED or RUNNING
+            isTracking: currentState === 'PAUSED', // currentState can only be 'PAUSED' or 'STOPPED' here
             ...(currentState === 'STOPPED' ? { currentTimeEntry: null } : {}),
           });
           return;
@@ -1544,7 +1544,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
               // Timer Engine на паузе/остановлен — синхронизируем состояние
               set({
                 isPaused: timerState.state === 'PAUSED',
-                isTracking: timerState.state === 'PAUSED' || timerState.state === 'RUNNING', // BUG FIX: isTracking should be true if PAUSED or RUNNING
+                isTracking: timerState.state === 'PAUSED', // timerState.state can only be 'PAUSED' or 'STOPPED' here
                 idlePauseStartTime: timerState.state === 'PAUSED' ? Date.now() : null,
                 ...(timerState.state === 'STOPPED' ? { currentTimeEntry: null } : {}),
               });
@@ -1569,7 +1569,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
             // Timer Engine на паузе/остановлен — синхронизируем состояние
             set({
               isPaused: timerState.state === 'PAUSED',
-              isTracking: timerState.state === 'PAUSED' || timerState.state === 'RUNNING', // BUG FIX: isTracking should be true if PAUSED or RUNNING
+              isTracking: timerState.state === 'PAUSED', // timerState.state can only be 'PAUSED' or 'STOPPED' here
               idlePauseStartTime: timerState.state === 'PAUSED' ? Date.now() : null,
               ...(timerState.state === 'STOPPED' ? { currentTimeEntry: null } : {}),
             });
