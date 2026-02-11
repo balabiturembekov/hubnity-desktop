@@ -10,7 +10,7 @@ use crate::extract_url_from_title;
 use std::sync::Arc;
 use std::time::Instant;
 #[allow(unused_imports)] // Emitter used in #[cfg(not(target_os = "macos"))] activity branch
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 #[allow(unused_imports)]
 use tracing::{debug, info, warn};
 
@@ -128,7 +128,10 @@ pub async fn start_activity_monitoring(
                                 }
                             }
                             // Emit event (ignore errors)
-                            app_clone.emit("activity-detected", ()).ok();
+                            // BUG FIX: Log error if emit fails instead of silently ignoring
+                            if let Err(e) = app_clone.emit("activity-detected", ()) {
+                                warn!("[ACTIVITY] Failed to emit activity-detected event: {:?}", e);
+                            }
                             last_emit_time = now;
                         }
                     }
@@ -162,7 +165,10 @@ pub async fn start_activity_monitoring(
                     }
                 }
 
-                app_clone.emit("activity-detected", ()).ok();
+                // BUG FIX: Log error if emit fails instead of silently ignoring
+                if let Err(e) = app_clone.emit("activity-detected", ()) {
+                    warn!("[ACTIVITY] Failed to emit activity-detected event: {:?}", e);
+                }
 
                 {
                     if let Ok(mut last) = last_activity_clone.lock() {
@@ -220,10 +226,16 @@ pub async fn request_screenshot_permission() -> Result<bool, String> {
                 if screens.is_empty() {
                     Ok(false)
                 } else {
-                    // Try to capture a small test screenshot to ensure permissions are working
-                    match screens[0].capture() {
-                        Ok(_) => Ok(true),
-                        Err(_) => Ok(false),
+                    // BUG FIX: Use safe access method instead of indexing to prevent panic
+                    // This should never fail because we check is_empty above, but defensive programming
+                    match screens.first() {
+                        Some(screen) => {
+                            match screen.capture() {
+                                Ok(_) => Ok(true),
+                                Err(_) => Ok(false),
+                            }
+                        }
+                        None => Ok(false),
                     }
                 }
             }
@@ -562,6 +574,12 @@ pub async fn stop_tracking_from_idle(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub fn get_app_version(app: AppHandle) -> Result<String, String> {
+    let package_info = app.package_info();
+    Ok(package_info.version.to_string())
+}
+
+#[tauri::command]
 pub async fn update_idle_state(
     idle_pause_start_time: Option<u64>,
     is_loading: bool,
@@ -864,7 +882,10 @@ pub async fn retry_failed_tasks(
     info!("[SYNC] Reset {} failed tasks back to pending", count);
 
     // PRODUCTION: Запускаем синхронизацию через sync-lock
-    let _ = sync_manager.sync_queue(5).await;
+    // BUG FIX: Log error if sync fails instead of silently ignoring
+    if let Err(e) = sync_manager.sync_queue(5).await {
+        warn!("[RETRY] Failed to sync queue after retry (non-critical): {}", e);
+    }
 
     Ok(count)
 }

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import {
   Dialog,
@@ -38,42 +38,82 @@ export function FailedTasksDialog({
   const [isLoading, setIsLoading] = useState(false);
   const [isRetrying, setIsRetrying] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  
+  // BUG FIX: Track component mount state to prevent setState after unmount
+  const isMountedRef = useRef(true);
+  
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
 
-  const loadFailedTasks = async () => {
+  // BUG FIX: Use useCallback to ensure stable function reference for useEffect dependencies
+  const loadFailedTasks = useCallback(async () => {
+    // BUG FIX: Check if component is still mounted before updating state
+    if (!isMountedRef.current) return;
+    
     setIsLoading(true);
     setError(null);
     try {
       const result = await invoke<FailedTask[]>('get_failed_tasks', {
         limit: 50,
       });
+      
+      // BUG FIX: Check again after async operation
+      if (!isMountedRef.current) return;
+      
       setTasks(result);
     } catch (err: any) {
+      // BUG FIX: Check if component is still mounted before updating state
+      if (!isMountedRef.current) return;
+      
       setError(err.message || 'Не удалось загрузить список ошибок');
       logger.error('FAILED_TASKS', 'Failed to load failed tasks', err);
     } finally {
-      setIsLoading(false);
+      // BUG FIX: Only update state if component is still mounted
+      if (isMountedRef.current) {
+        setIsLoading(false);
+      }
     }
-  };
+  }, []);
 
   const handleRetry = async () => {
+    // BUG FIX: Check if component is still mounted before updating state
+    if (!isMountedRef.current) return;
+    
     setIsRetrying(true);
     setError(null);
     try {
       const count = await invoke<number>('retry_failed_tasks', {
         limit: 100,
       });
+      
+      // BUG FIX: Check if component is still mounted before continuing
+      if (!isMountedRef.current) return;
+      
       await loadFailedTasks(); // Обновляем список
       onRetry(); // Обновляем индикатор синхронизации
       // Показываем уведомление
       await invoke('show_notification', {
         title: 'Retry synchronization',
         body: `Сброшено ${count} задач для повторной попытки`,
+      }).catch((e) => {
+        // BUG FIX: Log error instead of silently ignoring
+        logger.debug('FAILED_TASKS', 'Failed to show notification (non-critical)', e);
       });
     } catch (err: any) {
+      // BUG FIX: Check if component is still mounted before updating state
+      if (!isMountedRef.current) return;
+      
       setError(err.message || 'Не удалось повторить синхронизацию');
       logger.error('FAILED_TASKS', 'Failed to retry failed tasks', err);
     } finally {
-      setIsRetrying(false);
+      // BUG FIX: Only update state if component is still mounted
+      if (isMountedRef.current) {
+        setIsRetrying(false);
+      }
     }
   };
 
@@ -81,7 +121,7 @@ export function FailedTasksDialog({
     if (open) {
       loadFailedTasks();
     }
-  }, [open]);
+  }, [open, loadFailedTasks]);
 
   const formatDate = (timestamp: number) => {
     return new Date(timestamp * 1000).toLocaleString('ru-RU');

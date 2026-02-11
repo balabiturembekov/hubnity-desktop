@@ -20,6 +20,7 @@ export interface TrackerState {
   idlePauseStartTime: number | null; // Timestamp when paused due to inactivity
   urlActivities: UrlActivity[]; // Accumulated URL activities waiting to be sent
   localTimerStartTime: number | null; // Timestamp when timer was started locally (for sync protection)
+  lastResumeTime: number | null; // Timestamp when timer was last resumed (for sync protection)
 
   // Actions
   loadProjects: () => Promise<void>;
@@ -60,6 +61,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
   idlePauseStartTime: null,
   urlActivities: [], // Accumulated URL activities
   localTimerStartTime: null, // Track when timer was started locally
+  lastResumeTime: null, // Track when timer was last resumed (for sync protection)
 
   loadProjects: async () => {
     try {
@@ -663,6 +665,12 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       const errorMsg = error.message || 'Failed to start tracking';
       const entryCreated = errorMsg.includes('already running') || errorMsg.includes('User already has');
       
+      // BUG FIX: Clear localTimerStartTime if API failed and entry was not created
+      // This prevents syncTimerState from incorrectly protecting a timer that shouldn't be running
+      if (!entryCreated) {
+        set({ localTimerStartTime: null });
+      }
+      
       if (entryCreated) {
         // Запись уже существует - пытаемся синхронизировать состояние
         try {
@@ -844,14 +852,16 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       try {
         await invoke('stop_activity_monitoring');
       } catch (monitoringError) {
-        // Continue anyway
+        // BUG FIX: Log error instead of silently ignoring
+        logger.debug('PAUSE', 'Failed to stop activity monitoring (non-critical)', monitoringError);
       }
       
       // Send heartbeat
       try {
         await api.sendHeartbeat(false);
       } catch (heartbeatError) {
-        // Continue anyway
+        // BUG FIX: Log error instead of silently ignoring
+        logger.debug('PAUSE', 'Failed to send heartbeat (non-critical)', heartbeatError);
       }
       
       // Set idlePauseStartTime only if this is an idle pause
@@ -898,8 +908,18 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       const msg = error.message || 'Failed to pause tracking';
       const alreadyStopped = typeof msg === 'string' && (msg.includes('already stopped') || msg.includes('not found'));
       if (alreadyStopped) {
-        try { await TimerEngineAPI.stop(); } catch (_) { /* ignore */ }
-        try { await invoke('stop_activity_monitoring'); } catch (_) { /* ignore */ }
+        try { 
+          await TimerEngineAPI.stop(); 
+        } catch (stopError) { 
+          // BUG FIX: Log error instead of silently ignoring
+          logger.debug('PAUSE', 'Timer Engine already stopped (non-critical)', stopError);
+        }
+        try { 
+          await invoke('stop_activity_monitoring'); 
+        } catch (monitoringError) { 
+          // BUG FIX: Log error instead of silently ignoring
+          logger.debug('PAUSE', 'Activity monitoring already stopped (non-critical)', monitoringError);
+        }
         set({
           currentTimeEntry: null,
           isTracking: false,
@@ -908,7 +928,12 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           error: null,
           idlePauseStartTime: null,
         });
-        try { await invoke('hide_idle_window'); } catch (_) { /* ignore */ }
+        try { 
+          await invoke('hide_idle_window'); 
+        } catch (hideError) { 
+          // BUG FIX: Log error instead of silently ignoring
+          logger.debug('PAUSE', 'Idle window already hidden (non-critical)', hideError);
+        }
       } else {
         // Проверяем реальное состояние Timer Engine при ошибке
         try {
@@ -928,7 +953,8 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         try {
           await invoke('stop_activity_monitoring');
         } catch (e) {
-          // Ignore
+          // BUG FIX: Log error instead of silently ignoring
+          logger.debug('PAUSE', 'Failed to stop activity monitoring in error handler (non-critical)', e);
         }
       }
     }
@@ -1111,6 +1137,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         isLoading: false,
         error: null,
         idlePauseStartTime: null, // Clear idle pause time on resume
+        lastResumeTime: Date.now(), // BUG FIX: Track resume time to prevent sync from pausing immediately after resume
       });
       
       // Hide idle window on resume
@@ -1136,6 +1163,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
               isLoading: false,
               error: null,
               idlePauseStartTime: null,
+              lastResumeTime: Date.now(), // BUG FIX: Track resume time to prevent sync from pausing immediately after resume
             });
             return;
           }
@@ -1161,7 +1189,8 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       try {
         await invoke('stop_activity_monitoring');
       } catch (e) {
-        // Ignore
+        // BUG FIX: Log error instead of silently ignoring
+        logger.debug('RESUME', 'Failed to stop activity monitoring in error handler (non-critical)', e);
       }
     }
   },
@@ -1203,9 +1232,10 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           error: null,
           idlePauseStartTime: null,
           localTimerStartTime: null, // Clear local timer start time on stop
+          lastResumeTime: null, // Clear resume time on stop
         });
       } catch (e) {
-        // Игнорируем ошибки - это нормально если таймер уже остановлен
+        // BUG FIX: Log error instead of silently ignoring (already logging, but ensure isLoading is reset)
         logger.debug('STOP', 'Failed to stop timer engine (non-critical)', e);
         // BUG FIX: Always reset isLoading even on error
         set({ isLoading: false });
@@ -1330,13 +1360,15 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         // Запись уже остановлена на бэкенде — приводим UI и движок к состоянию «остановлено»
         try {
           await TimerEngineAPI.stop();
-        } catch (_) {
-          // ignore
+        } catch (stopError) {
+          // BUG FIX: Log error instead of silently ignoring
+          logger.debug('STOP', 'Timer Engine already stopped (non-critical)', stopError);
         }
         try {
           await invoke('stop_activity_monitoring');
-        } catch (_) {
-          // ignore
+        } catch (monitoringError) {
+          // BUG FIX: Log error instead of silently ignoring
+          logger.debug('STOP', 'Activity monitoring already stopped (non-critical)', monitoringError);
         }
         set({
           currentTimeEntry: null,
@@ -1348,8 +1380,9 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         });
         try {
           await invoke('hide_idle_window');
-        } catch (_) {
-          // ignore
+        } catch (hideError) {
+          // BUG FIX: Log error instead of silently ignoring
+          logger.debug('STOP', 'Idle window already hidden (non-critical)', hideError);
         }
       } else {
         // Проверяем реальное состояние Timer Engine при ошибке для синхронизации
@@ -1568,7 +1601,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
               });
             } else {
               // Timer Engine не на паузе — очищаем состояние
-              set({ isPaused: false, idlePauseStartTime: null });
+              set({ isPaused: false, idlePauseStartTime: null, lastResumeTime: Date.now() });
             }
           } catch (e) {
             // Если не удалось проверить Timer Engine, очищаем состояние
@@ -1795,6 +1828,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       error: null,
       idlePauseStartTime: null,
       localTimerStartTime: null, // Clear local timer start time
+      lastResumeTime: null, // Clear resume time on stop
     });
     try {
       await invoke('hide_idle_window');

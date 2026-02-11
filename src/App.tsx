@@ -26,6 +26,7 @@ function App() {
   const { loadActiveTimeEntry } = useTrackerStore();
   const [updateAvailable, setUpdateAvailable] = useState<{ version: string; body?: string } | null>(null);
   const pendingUpdateRef = useRef<Update | null>(null);
+  const [appVersion, setAppVersion] = useState<string | null>(null);
 
   // Восстанавливаем токены в Rust AuthManager — иначе фоновая синхронизация всегда получает "token not set" и Синхронизировано = 0
   const restoreTokens = useCallback(async () => {
@@ -61,6 +62,19 @@ function App() {
     const t = setTimeout(restoreTokens, 2000);
     return () => clearTimeout(t);
   }, [restoreTokens]);
+
+  // Load app version
+  useEffect(() => {
+    invoke<string>('get_app_version')
+      .then(version => {
+        setAppVersion(version);
+      })
+      .catch(error => {
+        logger.debug('APP', 'Failed to get app version', error);
+        // Fallback to package.json version if available
+        setAppVersion('0.1.7'); // Fallback version
+      });
+  }, []);
 
   // Критично: каждые 30 с передаём токены в Rust (если есть) и запускаем синхронизацию.
   // Не полагаемся на isAuthenticated — токен может быть в localStorage до регидрации Zustand.
@@ -262,6 +276,17 @@ function App() {
               logger.debug('APP', 'Skipping sync pause: timer paused due to idle, user must decide via idle window');
               return;
             }
+            
+            // BUG FIX: Don't auto-pause if resume was just called (< 5 seconds ago)
+            // This prevents sync from pausing timer immediately after user resumes it
+            // Server may not have updated yet, causing false sync pause
+            const { lastResumeTime } = useTrackerStore.getState();
+            const FIVE_SECONDS = 5 * 1000; // 5 seconds in milliseconds
+            if (lastResumeTime && (Date.now() - lastResumeTime) < FIVE_SECONDS) {
+              logger.debug('APP', 'Skipping sync pause: timer was just resumed (< 5s ago), server may not have updated yet');
+              return;
+            }
+            
             logger.info('APP', 'Syncing timer: server is PAUSED, pausing local timer');
             const { pauseTracking } = useTrackerStore.getState();
             await pauseTracking().catch((e) => {
@@ -1158,50 +1183,57 @@ function App() {
     };
   }, [isAuthenticated]);
 
+  // BUG FIX: Use refs to store previous values so they persist across re-renders
+  // This ensures the subscribe callback always has access to the latest previous values
+  const prevIdlePauseStartTimeRef = useRef<number | null>(null);
+  const prevIsLoadingRef = useRef<boolean>(false);
+  
+  // BUG FIX: Use useCallback to ensure stable function reference for subscribe callback
+  // This prevents stale closures where subscribe callback uses old version of sendStateUpdate
+  const sendStateUpdate = useCallback(async () => {
+    // Get fresh state each time
+    const { idlePauseStartTime, isLoading, isTakingScreenshot } = useTrackerStore.getState();
+    // Don't block idle window buttons during screenshots
+    // Only send isLoading=true if it's actually a loading operation, not a screenshot
+    const effectiveIsLoading = isLoading && !isTakingScreenshot;
+    logger.debug('APP', 'Sending state update to idle window', { 
+      idlePauseStartTime, 
+      isLoading, 
+      isTakingScreenshot,
+      effectiveIsLoading 
+    });
+    try {
+      // FIX: Убеждаемся, что передаем правильное значение
+      // Rust Option<u64> принимает null как None
+      const pauseTimeForRust = idlePauseStartTime !== null && idlePauseStartTime !== undefined && idlePauseStartTime > 0 
+        ? Number(idlePauseStartTime) 
+        : null; // Используем null для Rust Option<u64> (None)
+      
+      logger.debug('APP', 'Sending state to idle window', { 
+        idlePauseStartTime, 
+        pauseTimeForRust,
+        type: typeof pauseTimeForRust 
+      });
+      
+      await invoke('update_idle_state', {
+        idlePauseStartTime: pauseTimeForRust,
+        isLoading: effectiveIsLoading, // Don't block buttons during screenshots
+      });
+      logger.debug('APP', 'State update sent successfully');
+    } catch (error) {
+      logger.error('APP', 'Failed to send state update to idle window', error);
+      // Ignore errors - idle window might not be open
+    }
+  }, []);
+
   // Send state updates to idle window when it changes
   useEffect(() => {
     if (!isAuthenticated) return;
-
-    const sendStateUpdate = async () => {
-      // Get fresh state each time
-      const { idlePauseStartTime, isLoading, isTakingScreenshot } = useTrackerStore.getState();
-      // Don't block idle window buttons during screenshots
-      // Only send isLoading=true if it's actually a loading operation, not a screenshot
-      const effectiveIsLoading = isLoading && !isTakingScreenshot;
-      logger.debug('APP', 'Sending state update to idle window', { 
-        idlePauseStartTime, 
-        isLoading, 
-        isTakingScreenshot,
-        effectiveIsLoading 
-      });
-      try {
-        // FIX: Убеждаемся, что передаем правильное значение
-        // Rust Option<u64> принимает null как None
-        const pauseTimeForRust = idlePauseStartTime !== null && idlePauseStartTime !== undefined && idlePauseStartTime > 0 
-          ? Number(idlePauseStartTime) 
-          : null; // Используем null для Rust Option<u64> (None)
-        
-        logger.debug('APP', 'Sending state to idle window', { 
-          idlePauseStartTime, 
-          pauseTimeForRust,
-          type: typeof pauseTimeForRust 
-        });
-        
-        await invoke('update_idle_state', {
-          idlePauseStartTime: pauseTimeForRust,
-          isLoading: effectiveIsLoading, // Don't block buttons during screenshots
-        });
-        logger.debug('APP', 'State update sent successfully');
-      } catch (error) {
-        logger.error('APP', 'Failed to send state update to idle window', error);
-        // Ignore errors - idle window might not be open
-      }
-    };
-
+    
     // Initialize previous values from current state
     const initialState = useTrackerStore.getState();
-    let prevIdlePauseStartTime: number | null = initialState.idlePauseStartTime;
-    let prevIsLoading = initialState.isLoading;
+    prevIdlePauseStartTimeRef.current = initialState.idlePauseStartTime;
+    prevIsLoadingRef.current = initialState.isLoading;
     
     // Send initial state
     sendStateUpdate();
@@ -1213,21 +1245,21 @@ function App() {
       // Only send update if idlePauseStartTime or isLoading changed
       // But ignore isLoading if it's only due to screenshot (isTakingScreenshot)
       const shouldUpdate = 
-        state.idlePauseStartTime !== prevIdlePauseStartTime ||
-        (state.isLoading !== prevIsLoading && !state.isTakingScreenshot); // Don't block buttons during screenshots
+        state.idlePauseStartTime !== prevIdlePauseStartTimeRef.current ||
+        (state.isLoading !== prevIsLoadingRef.current && !state.isTakingScreenshot); // Don't block buttons during screenshots
       
       if (shouldUpdate) {
       logger.debug('APP', 'Store changed', {
-        oldIdlePauseStartTime: prevIdlePauseStartTime,
+        oldIdlePauseStartTime: prevIdlePauseStartTimeRef.current,
           newIdlePauseStartTime: state.idlePauseStartTime,
-          oldIsLoading: prevIsLoading,
+          oldIsLoading: prevIsLoadingRef.current,
           newIsLoading: state.isLoading,
           isTakingScreenshot: state.isTakingScreenshot,
         });
-        prevIdlePauseStartTime = state.idlePauseStartTime;
+        prevIdlePauseStartTimeRef.current = state.idlePauseStartTime;
         // Only update prevIsLoading if it's not due to screenshot
         if (!state.isTakingScreenshot) {
-          prevIsLoading = state.isLoading;
+          prevIsLoadingRef.current = state.isLoading;
         }
         sendStateUpdate();
       }
@@ -1236,7 +1268,7 @@ function App() {
     return () => {
       unsubscribe();
     };
-  }, [isAuthenticated]);
+  }, [isAuthenticated, sendStateUpdate]);
 
   if (!isAuthenticated) {
     return (
@@ -1333,9 +1365,14 @@ function App() {
             </TabsContent>
           )}
           
-          {/* Footer - Синхронизация (ненавязчиво) */}
+          {/* Footer - Синхронизация и версия (ненавязчиво) */}
           <div className="px-6 py-3 border-t bg-muted/30">
-            <div className="flex items-center justify-end">
+            <div className="flex items-center justify-between">
+              {appVersion && (
+                <span className="text-xs text-muted-foreground/60">
+                  v{appVersion}
+                </span>
+              )}
               <SyncIndicator />
             </div>
           </div>

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { CheckCircle2, Loader2, WifiOff, AlertCircle } from 'lucide-react';
 import { cn } from '../lib/utils';
@@ -17,14 +17,36 @@ export function SyncIndicator() {
   const [status, setStatus] = useState<SyncStatus | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [showFailedDialog, setShowFailedDialog] = useState(false);
+  
+  // BUG FIX: Track component mount state to prevent setState after unmount
+  const isMountedRef = useRef(true);
+  
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
 
-  const fetchSyncStatus = async () => {
+  // BUG FIX: Use useCallback to ensure stable function reference for useEffect dependencies
+  const fetchSyncStatus = useCallback(async () => {
+    // BUG FIX: Check if component is still mounted before updating state
+    if (!isMountedRef.current) return;
+    
     try {
       const result = await invoke<SyncStatus>('get_sync_status');
+      
+      // BUG FIX: Check again after async operation
+      if (!isMountedRef.current) return;
+      
       setStatus(result);
       setIsLoading(false);
     } catch (error) {
       logger.error('SYNC_INDICATOR', 'Failed to get sync status', error);
+      
+      // BUG FIX: Check if component is still mounted before updating state
+      if (!isMountedRef.current) return;
+      
       setIsLoading(false);
       // При ошибке считаем, что офлайн
       setStatus({
@@ -33,7 +55,7 @@ export function SyncIndicator() {
         is_online: false,
       });
     }
-  };
+  }, []);
 
   useEffect(() => {
     // Загружаем статус сразу
@@ -43,7 +65,7 @@ export function SyncIndicator() {
     const interval = setInterval(fetchSyncStatus, 5000);
 
     return () => clearInterval(interval);
-  }, []);
+  }, [fetchSyncStatus]);
 
   if (isLoading || !status) {
     return (

@@ -72,7 +72,12 @@ pub fn run() {
     builder
         .setup(|app| {
             #[cfg(desktop)]
-            let _ = app.handle().plugin(tauri_plugin_updater::Builder::new().build());
+            {
+                // BUG FIX: Log error if plugin fails to load instead of silently ignoring
+                if let Err(e) = app.handle().plugin(tauri_plugin_updater::Builder::new().build()) {
+                    warn!("[SETUP] Failed to load updater plugin (non-critical): {:?}", e);
+                }
+            }
             // Инициализация базы данных в setup hook
             let app_data_dir = app.path().app_data_dir().map_err(|e| {
                 std::io::Error::new(
@@ -273,6 +278,7 @@ pub fn run() {
             resume_tracking_from_idle,
             stop_tracking_from_idle,
             update_idle_state,
+            get_app_version,
             request_idle_state
         ])
         .run(tauri::generate_context!())

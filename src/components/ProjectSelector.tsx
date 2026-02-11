@@ -1,6 +1,7 @@
 import { useEffect } from 'react';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
 import { useTrackerStore } from '../store/useTrackerStore';
+import { logger } from '../lib/logger';
 
 /**
  * PRODUCTION: Упрощенный ProjectSelector
@@ -19,9 +20,14 @@ export function ProjectSelector() {
   const handleSelect = (projectId: string) => {
     const project = projects.find((p) => p.id === projectId);
     if (project) {
-      selectProject(project).catch(() => {
-        // Ошибка уже в store (error), UI покажет
+      selectProject(project).catch((error) => {
+        // BUG FIX: Log error instead of silently ignoring
+        // Ошибка уже в store (error), UI покажет, но логируем для отладки
+        logger.debug('PROJECT_SELECTOR', 'Failed to select project (error shown in UI)', error);
       });
+    } else {
+      // BUG FIX: Log warning if project not found
+      logger.warn('PROJECT_SELECTOR', `Project with id ${projectId} not found in projects list`);
     }
   };
 

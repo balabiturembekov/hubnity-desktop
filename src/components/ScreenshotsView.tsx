@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { useTrackerStore, type Screenshot } from '../store/useTrackerStore';
 import { Loader2, Eye, ChevronDown, ChevronUp, Camera } from 'lucide-react';
 import { Button } from './ui/button';
@@ -34,6 +34,20 @@ export function ScreenshotsView({ timeEntryId }: ScreenshotsViewProps) {
   const [selectedScreenshot, setSelectedScreenshot] = useState<Screenshot | null>(null);
   const [isExpanded, setIsExpanded] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  
+  // BUG FIX: Use ref to store timeout IDs so they persist across re-renders
+  // This allows cleanup function to properly clear timeouts from previous renders
+  const timeoutIdsRef = useRef<NodeJS.Timeout[]>([]);
+  
+  // BUG FIX: Track component mount state to prevent setState after unmount
+  const isMountedRef = useRef(true);
+  
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
 
   const loadScreenshots = useCallback(async () => {
     if (!timeEntryId) {
@@ -65,19 +79,32 @@ export function ScreenshotsView({ timeEntryId }: ScreenshotsViewProps) {
       return;
     }
 
+    // BUG FIX: Check if component is still mounted before updating state
+    if (!isMountedRef.current) return;
+    
     setIsLoading(true);
     setError(null);
     try {
       const data = await useTrackerStore.getState().getScreenshots(timeEntryId);
+      
+      // BUG FIX: Check if component is still mounted before updating state
+      if (!isMountedRef.current) return;
+      
       setScreenshots(data);
       if (data.length > 0) {
         setIsExpanded(true);
       }
     } catch (err: any) {
+      // BUG FIX: Check if component is still mounted before updating state
+      if (!isMountedRef.current) return;
+      
       setError(err.message || 'Не удалось загрузить скриншоты');
       setScreenshots([]);
     } finally {
-      setIsLoading(false);
+      // BUG FIX: Only update state if component is still mounted
+      if (isMountedRef.current) {
+        setIsLoading(false);
+      }
     }
   }, [timeEntryId]);
 
@@ -97,9 +124,16 @@ export function ScreenshotsView({ timeEntryId }: ScreenshotsViewProps) {
       return;
     }
 
+    // BUG FIX: Check if component is still mounted before updating state
+    if (!isMountedRef.current) return;
+    
     setIsRefreshing(true);
     try {
       const data = await useTrackerStore.getState().getScreenshots(timeEntryId);
+      
+      // BUG FIX: Check again after async operation
+      if (!isMountedRef.current) return;
+      
       setScreenshots(data);
       if (expandIfNew && data.length > 0) {
         setIsExpanded(true);
@@ -107,15 +141,19 @@ export function ScreenshotsView({ timeEntryId }: ScreenshotsViewProps) {
     } catch (err: any) {
       logger.error('SCREENSHOTS_VIEW', 'Failed to refresh screenshots', err);
     } finally {
-      setIsRefreshing(false);
+      // BUG FIX: Only update state if component is still mounted
+      if (isMountedRef.current) {
+        setIsRefreshing(false);
+      }
     }
   }, [timeEntryId]);
 
   useEffect(() => {
     if (!timeEntryId) return;
 
-    // BUG FIX: Store timeout IDs to clean them up on unmount
-    const timeoutIds: NodeJS.Timeout[] = [];
+    // BUG FIX: Clear any existing timeouts before setting up new ones
+    timeoutIdsRef.current.forEach(id => clearTimeout(id));
+    timeoutIdsRef.current = [];
 
     const handleScreenshotUploaded = () => {
       console.log('[Screenshots] screenshot:uploaded received, scheduling refetch');
@@ -125,16 +163,16 @@ export function ScreenshotsView({ timeEntryId }: ScreenshotsViewProps) {
         const timeoutId = setTimeout(() => {
           refreshScreenshots(true);
         }, delayMs);
-        timeoutIds.push(timeoutId);
+        timeoutIdsRef.current.push(timeoutId);
       });
     };
 
     window.addEventListener('screenshot:uploaded', handleScreenshotUploaded);
     return () => {
       window.removeEventListener('screenshot:uploaded', handleScreenshotUploaded);
-      // BUG FIX: Clean up all timeouts when component unmounts to prevent memory leaks
-      timeoutIds.forEach(id => clearTimeout(id));
-      timeoutIds.length = 0; // Clear array
+      // BUG FIX: Clean up all timeouts when component unmounts or effect re-runs to prevent memory leaks
+      timeoutIdsRef.current.forEach(id => clearTimeout(id));
+      timeoutIdsRef.current = [];
     };
   }, [timeEntryId, refreshScreenshots]);
 

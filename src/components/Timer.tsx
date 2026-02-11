@@ -52,7 +52,14 @@ export function Timer() {
         const isPaused = state.state === 'PAUSED';
         
         const store = useTrackerStore.getState();
-        const { isTracking: currentIsTracking, isPaused: currentIsPaused, currentTimeEntry } = store;
+        const { isTracking: currentIsTracking, isPaused: currentIsPaused, currentTimeEntry, isLoading } = store;
+        
+        // BUG FIX: Don't update store if an operation is in progress to prevent race conditions
+        // Operations like startTracking/pauseTracking set isLoading and update state themselves
+        if (isLoading) {
+          return; // Skip update during operations to prevent conflicts
+        }
+        
         const trackingChanged = currentIsTracking !== isRunning || currentIsPaused !== isPaused;
         const needClearEntry = state.state === 'STOPPED' && currentTimeEntry !== null;
         if (trackingChanged || needClearEntry) {
@@ -74,8 +81,9 @@ export function Timer() {
         invoke('plugin:tray|set_tooltip', {
           id: 'main',
           tooltip,
-        }).catch(() => {
-          // Silently fail if tray is not available
+        }).catch((error) => {
+          // BUG FIX: Log error instead of silently ignoring (tray might not be available, but log for debugging)
+          logger.debug('TIMER', 'Failed to set tray tooltip (non-critical)', error);
         });
       } catch (error) {
         logger.error('TIMER', 'Failed to get timer state', error);
