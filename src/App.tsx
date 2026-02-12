@@ -74,7 +74,7 @@ function App() {
       .catch(error => {
         logger.debug('APP', 'Failed to get app version', error);
         // Fallback to package.json version if available
-        setAppVersion('0.1.11'); // Fallback version
+        setAppVersion('0.1.12'); // Fallback version
       });
   }, []);
 
@@ -602,75 +602,56 @@ function App() {
   useEffect(() => {
     if (!isAuthenticated) return;
 
-    let unlistenActivity: (() => void) | null = null;
-    let idleCheckInterval: NodeJS.Timeout | null = null;
-    let heartbeatInterval: NodeJS.Timeout | null = null;
     let isCleanedUp = false;
+    const unlistenRef = { current: null as (() => void) | null };
 
-    const setupActivityListeners = async () => {
-      // Listen for activity events from Rust
+    // FIX: Create intervals synchronously so cleanup can clear them (prevents leak on unmount before async)
+    const idleCheckInterval = setInterval(() => {
+      if (!isCleanedUp) {
+        useTrackerStore.getState().checkIdleStatus();
+      }
+    }, 10000);
+
+    const heartbeatInterval = setInterval(async () => {
+      if (!isCleanedUp) {
+        try {
+          const store = useTrackerStore.getState();
+          const { lastActivityTime } = store;
+          const now = Date.now();
+          const timeSinceActivity = (now - lastActivityTime) / 1000;
+          const isActive = timeSinceActivity < 60;
+          await store.sendHeartbeat(isActive);
+        } catch (error) {
+          logger.error('APP', 'Failed to send idle heartbeat', error);
+        }
+      }
+    }, 45000);
+
+    (async () => {
       try {
-        unlistenActivity = await listen('activity-detected', () => {
+        const unlisten = await listen('activity-detected', () => {
+          if (isCleanedUp) return;
           logger.safeLogToRust('[ACTIVITY] Event received from Rust').catch((e) => {
             logger.debug('ACTIVITY', 'Failed to log (non-critical)', e);
           });
           useTrackerStore.getState().updateActivityTime();
         });
-        await logger.safeLogToRust('[ACTIVITY] Activity listener set up successfully').catch((e) => {
-          logger.debug('ACTIVITY', 'Failed to log (non-critical)', e);
-        });
+        unlistenRef.current = unlisten;
+        if (isCleanedUp) unlisten();
+        await logger.safeLogToRust('[ACTIVITY] Activity listener set up successfully').catch(() => {});
       } catch (error) {
         logger.error('ACTIVITY', 'Failed to setup activity listener', error);
-        await logger.safeLogToRust(`[ACTIVITY] Failed to setup listener: ${error}`).catch((e) => {
-          logger.debug('ACTIVITY', 'Failed to log (non-critical)', e);
-        });
       }
-
-      // Check idle status every 10 seconds for faster reaction (especially for low thresholds like 1 minute)
-      idleCheckInterval = setInterval(() => {
-        if (!isCleanedUp) {
-          useTrackerStore.getState().checkIdleStatus();
-        }
-      }, 10000);
-
-      // Send idle detection heartbeat every 30-60 seconds (as per API docs)
-      // This updates user's last activity time on the server for idle detection
-      heartbeatInterval = setInterval(async () => {
-        if (!isCleanedUp) {
-          try {
-            const store = useTrackerStore.getState();
-            const { lastActivityTime } = store;
-            
-            // Check if user was active in the last minute (60 seconds)
-            const now = Date.now();
-            const timeSinceActivity = (now - lastActivityTime) / 1000; // seconds
-            const isActive = timeSinceActivity < 60; // active if activity within last 60 seconds
-            
-            // Send heartbeat to update last activity time on server
-            // This is separate from time entry heartbeat - it's for idle detection
-            await store.sendHeartbeat(isActive);
-          } catch (error) {
-            logger.error('APP', 'Failed to send idle heartbeat', error);
-          }
-        }
-      }, 45000); // Every 45 seconds (between 30-60 as recommended)
-    };
-
-    setupActivityListeners();
+    })();
 
     return () => {
       isCleanedUp = true;
-      if (idleCheckInterval) {
-        clearInterval(idleCheckInterval);
-      }
-      if (heartbeatInterval) {
-        clearInterval(heartbeatInterval);
-      }
-      if (unlistenActivity) {
-        unlistenActivity();
-      }
+      clearInterval(idleCheckInterval);
+      clearInterval(heartbeatInterval);
+      unlistenRef.current?.();
+      unlistenRef.current = null;
     };
-  }, [isAuthenticated]); // Removed checkIdleStatus and updateActivityTime from dependencies
+  }, [isAuthenticated]);
 
   // Setup URL activity tracking
   useEffect(() => {
@@ -1215,6 +1196,8 @@ function App() {
       try {
         // Listen for resume event from idle window
         const unlistenResume = await listen('resume-tracking', async () => {
+          // FIX: Update lastActivityTime immediately — prevents checkIdleStatus from re-pausing during async resume (Windows)
+          useTrackerStore.getState().updateActivityTime();
           const { resumeTracking } = useTrackerStore.getState();
           try {
             // Pass fromIdleWindow=true to allow resume even if paused due to idle
@@ -1229,6 +1212,8 @@ function App() {
 
         // Listen for stop event from idle window
         const unlistenStop = await listen('stop-tracking', async () => {
+          // FIX: Update lastActivityTime immediately — prevents checkIdleStatus from re-pausing during async stop (Windows)
+          useTrackerStore.getState().updateActivityTime();
           const { stopTracking } = useTrackerStore.getState();
           try {
             await stopTracking();
@@ -1254,9 +1239,13 @@ function App() {
     };
 
     setupIdleWindowListeners().then((cleanup) => {
-      if (cleanup && idleWindowMountedRef.current) {
-        idleWindowCleanupRef.current = cleanup;
+      if (!cleanup) return;
+      // FIX: If unmounted while listeners were pending, clean up immediately to avoid leak
+      if (!idleWindowMountedRef.current) {
+        cleanup();
+        return;
       }
+      idleWindowCleanupRef.current = cleanup;
     }).catch((e) => {
       logger.error('APP', 'Failed to setup idle window listeners (cleanup)', e);
     });
@@ -1335,9 +1324,13 @@ function App() {
     };
 
     setupStateRequestListener().then((cleanup) => {
-      if (cleanup && stateRequestMountedRef.current) {
-        stateRequestCleanupRef.current = cleanup;
+      if (!cleanup) return;
+      // FIX: If unmounted while listener was pending, clean up immediately to avoid leak
+      if (!stateRequestMountedRef.current) {
+        cleanup();
+        return;
       }
+      stateRequestCleanupRef.current = cleanup;
     }).catch((e) => {
       logger.error('APP', 'Failed to setup state request listener (cleanup)', e);
     });
