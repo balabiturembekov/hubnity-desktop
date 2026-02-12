@@ -6,6 +6,9 @@ import { getCurrentUser } from '../lib/current-user';
 import { TimerEngineAPI, type TimerStateResponse } from '../lib/timer-engine';
 import { logger } from '../lib/logger';
 
+// Prevents concurrent checkIdleStatus pause flows (multiple intervals / React Strict Mode)
+let isIdleCheckPausing = false;
+
 export interface TrackerState {
   projects: Project[];
   selectedProject: Project | null;
@@ -274,6 +277,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
                 // Таймер работает, но entry на паузе - паузим таймер
                 logger.info('LOAD', 'Timer Engine is RUNNING but entry is PAUSED, pausing timer');
                 await TimerEngineAPI.pause();
+                try { await invoke('stop_activity_monitoring'); } catch (_) { /* ignore */ } // FIX: Sync with pause — stop monitoring
               }
             } else if (timerState.state === 'STOPPED') {
               // Таймер остановлен, но entry на паузе - запускаем и сразу паузим
@@ -347,6 +351,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           isPaused: isPaused,
           lastActivityTime: Date.now(),
           selectedProject: restoredProject,
+          idlePauseStartTime: null, // FIX: Restoring from server — not idle state
         });
       }
     } catch (error: any) {
@@ -560,6 +565,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
             selectedProject: restoredProject,
             isLoading: false,
             error: null,
+            idlePauseStartTime: null, // FIX: Restoring from server — not idle
           });
           
           // Start activity monitoring
@@ -642,6 +648,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
             selectedProject: restoredProject,
             isLoading: false,
             error: null, // Убираем error - состояние восстановлено, пользователь видит кнопки
+            idlePauseStartTime: null, // FIX: Restoring from server — not idle
           });
           
           return; // Exit - don't create new entry
@@ -727,6 +734,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         isLoading: false,
         error: !isStarted ? 'Could not start timer' : null,
         localTimerStartTime: isStarted ? now : null,
+        idlePauseStartTime: null, // FIX: Starting — not idle
       });
       
       invoke('start_activity_monitoring').catch((e) => {
@@ -769,6 +777,8 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
                   currentTimeEntry: activeEntry,
                   localTimerStartTime: null,
                   error: null,
+                  idlePauseStartTime: null, // FIX: Syncing to existing entry — not idle
+                  lastActivityTime: Date.now(), // FIX: Prevent immediate idle after sync
                 });
                 return;
               }
@@ -787,6 +797,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
             idlePauseStartTime: null,
             error: 'Could not create entry (will sync later)',
           });
+          invoke('hide_idle_window').catch(() => {}); // FIX: Ensure idle window hidden on API failure
           invoke('show_notification', {
             title: 'Sync',
             body: 'Timer started, but could not sync with server',
@@ -824,6 +835,8 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
               isPaused: timerState.state === 'PAUSED',
               isLoading: false,
               error: null,
+              idlePauseStartTime: null, // FIX: Syncing to existing entry — not idle
+              lastActivityTime: Date.now(), // FIX: Prevent immediate idle after sync
             });
             return;
           }
@@ -857,7 +870,8 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
     try {
       timerState = await TimerEngineAPI.getState();
       if (timerState.state === 'PAUSED' && !isIdlePause) {
-        set({ isLoading: false });
+        set({ isLoading: false, idlePauseStartTime: null }); // FIX: Manual pause — not idle
+        invoke('hide_idle_window').catch(() => {});
         invoke('log_message', { message: '[PAUSE] Already paused (Timer Engine check), skipping' }).catch((e) => {
           logger.debug('PAUSE', 'Failed to log message (non-critical)', e);
         });
@@ -873,6 +887,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           lastResumeTime: null,
           localTimerStartTime: null,
         });
+        invoke('hide_idle_window').catch(() => {}); // FIX: Idle window must be hidden when STOPPED
         await logger.safeLogToRust('[PAUSE] Timer Engine is STOPPED, syncing store').catch((e) => {
           logger.debug('PAUSE', 'Failed to log (non-critical)', e);
         });
@@ -1200,7 +1215,8 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         await logger.safeLogToRust('[RESUME] Already running, skipping (using store cache)').catch((e) => {
           logger.debug('RESUME', 'Failed to log (non-critical)', e);
         });
-        set({ isLoading: false });
+        set({ isLoading: false, idlePauseStartTime: null }); // FIX: Clear idle — we're running
+        invoke('hide_idle_window').catch(() => {});
         return;
       }
     }
@@ -1211,7 +1227,8 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       await logger.safeLogToRust('[RESUME] Already running, skipping').catch((e) => {
         logger.debug('RESUME', 'Failed to log (non-critical)', e);
       });
-      set({ isLoading: false });
+      set({ isLoading: false, idlePauseStartTime: null }); // FIX: Clear idle — we're running
+      invoke('hide_idle_window').catch(() => {});
       return;
     }
 
@@ -1232,9 +1249,14 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           isLoading: false,
           error: null,
           idlePauseStartTime: null,
+          lastActivityTime: resumeTimeNoEntry, // FIX: Prevent immediate idle re-trigger (Windows)
           lastResumeTime: resumeTimeNoEntry, // BUG FIX: Track resume time to prevent sync from pausing immediately after resume
           localTimerStartTime: resumeTimeNoEntry, // BUG FIX: Track local resume time to prevent auto-pause from syncTimerState
         });
+        invoke('start_activity_monitoring').catch((e) => {
+          logger.error('RESUME', 'Failed to start activity monitoring on resume (no entry)', e);
+        });
+        invoke('hide_idle_window').catch(() => {});
         // Try to load active time entry after resume
         await get().loadActiveTimeEntry();
       } catch (error: any) {
@@ -1287,6 +1309,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
                 }
               }
             }
+            const syncResumeTime = Date.now();
             set({
               currentTimeEntry: serverEntry,
               isPaused: false,
@@ -1294,7 +1317,14 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
               isLoading: false,
               error: null,
               idlePauseStartTime: null,
+              lastActivityTime: syncResumeTime, // FIX: Prevent immediate idle re-trigger (Windows)
+              lastResumeTime: syncResumeTime,
+              localTimerStartTime: syncResumeTime,
             });
+            invoke('start_activity_monitoring').catch((e) => {
+              logger.error('RESUME', 'Failed to start activity monitoring on sync resume', e);
+            });
+            invoke('hide_idle_window').catch(() => {});
             return;
           } else if (serverEntry.status === 'STOPPED') {
             // Entry остановлен на сервере - синхронизируем локальное состояние и Timer Engine
@@ -1317,6 +1347,8 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
               lastResumeTime: null,
               localTimerStartTime: null,
             });
+            invoke('hide_idle_window').catch(() => {}); // FIX: Entry stopped on server — sync state
+            try { await invoke('stop_activity_monitoring'); } catch (_) { /* ignore */ }
             return;
           } else if (serverEntry.status !== 'PAUSED') {
             // Entry в неожиданном статусе
@@ -1350,24 +1382,25 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       const isResumed = timerState?.state === 'RUNNING' || false;
       const resumeTime = Date.now();
       
-      // OPTIMISTIC: Обновляем UI сразу
+      // OPTIMISTIC: Обновляем UI сразу (sync with Timer Engine when resume failed)
+      const isPausedActual = timerState?.state === 'PAUSED' || false;
+      const isTrackingActual = timerState?.state === 'RUNNING' || timerState?.state === 'PAUSED' || false;
       set({
         currentTimeEntry: timeEntryToResume,
-        isPaused: false,
-        isTracking: isResumed,
+        isPaused: isResumed ? false : isPausedActual,
+        isTracking: isResumed ? true : isTrackingActual,
         lastActivityTime: resumeTime,
         isLoading: false,
         error: !isResumed ? 'Could not resume timer' : null,
-        idlePauseStartTime: null,
-        lastResumeTime: resumeTime,
-        localTimerStartTime: resumeTime,
-      });
-      
-      invoke('start_activity_monitoring').catch((e) => {
-        logger.error('RESUME', 'Failed to start activity monitoring on resume', e);
+        idlePauseStartTime: isResumed ? null : (get().idlePauseStartTime ?? null), // FIX: Preserve idle when resume failed
+        lastResumeTime: isResumed ? resumeTime : get().lastResumeTime,
+        localTimerStartTime: isResumed ? resumeTime : get().localTimerStartTime,
       });
       
       if (isResumed) {
+        invoke('start_activity_monitoring').catch((e) => {
+          logger.error('RESUME', 'Failed to start activity monitoring on resume', e);
+        });
         invoke('hide_idle_window').catch(() => {});
       }
       
@@ -1424,6 +1457,8 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
               lastResumeTime: resumeTimeForSync, // BUG FIX: Track resume time to prevent sync from pausing immediately after resume
               localTimerStartTime: resumeTimeForSync, // BUG FIX: Track local resume time to prevent auto-pause from syncTimerState
             });
+            invoke('start_activity_monitoring').catch(() => {}); // FIX: Sync to RUNNING — start monitoring
+            invoke('hide_idle_window').catch(() => {});
             return;
           }
         } catch (_) {
@@ -1542,6 +1577,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           localTimerStartTime: null,
           lastResumeTime: null,
         });
+        invoke('hide_idle_window').catch(() => {}); // FIX: No entry — ensure idle window hidden
       } catch (e: any) {
         // BUG FIX: Log error instead of silently ignoring (already logging, but ensure isLoading is reset)
         // Игнорируем ошибку "already stopped" - это нормально
@@ -1670,6 +1706,9 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
             error: msg,
             ...(timerState.state === 'STOPPED' ? { currentTimeEntry: null, idlePauseStartTime: null, lastResumeTime: null, localTimerStartTime: null } : {}),
           });
+          if (timerState.state === 'STOPPED') {
+            invoke('hide_idle_window').catch(() => {}); // FIX: Sync to STOPPED — ensure idle window hidden
+          }
         } catch (e) {
           // Если не удалось проверить Timer Engine, только устанавливаем ошибку
           set({ error: msg, isLoading: false });
@@ -1699,7 +1738,16 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
   },
 
   checkIdleStatus: async () => {
-    const { lastActivityTime, idleThreshold, isLoading } = get();
+    const { lastActivityTime, idleThreshold, isLoading, idlePauseStartTime } = get();
+    
+    // FIX: Skip immediately if already in idle state (idle window shown, user hasn't resumed/stopped)
+    // Prevents repeated pause calls every 10s when Timer Engine/store race causes isPaused to be stale
+    if (idlePauseStartTime !== null && idlePauseStartTime > 0) {
+      logger.safeLogToRust(`[IDLE CHECK] Skipped: already in idle state (idlePauseStartTime set)`).catch((e) => {
+        logger.debug('IDLE_CHECK', 'Failed to log (non-critical)', e);
+      });
+      return;
+    }
     
     // BUG FIX: Check actual Timer Engine state instead of relying on store cache
     // Store cache (isTracking) can be stale if updateTimerState was skipped due to isLoading
@@ -1746,10 +1794,12 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           set({
             isPaused: currentTimerState === 'PAUSED',
             isTracking: currentTimerState === 'PAUSED', // true if PAUSED (timer is active, just paused)
+            idlePauseStartTime: null, // FIX: Syncing to Timer Engine — not idle (store had stale RUNNING)
             ...(currentTimerState === 'STOPPED'
-              ? { currentTimeEntry: null, idlePauseStartTime: null, lastResumeTime: null, localTimerStartTime: null }
+              ? { currentTimeEntry: null, lastResumeTime: null, localTimerStartTime: null }
               : {}),
           });
+          invoke('hide_idle_window').catch(() => {}); // FIX: Ensure idle window hidden when syncing
           return;
         }
         // Если Timer Engine RUNNING, продолжаем с паузой
@@ -1783,10 +1833,12 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           set({
             isPaused: timerStateForSync.state === 'PAUSED',
             isTracking: timerStateForSync.state === 'PAUSED' || timerStateForSync.state === 'RUNNING',
+            idlePauseStartTime: null, // FIX: Syncing to Timer Engine — not idle
             ...(timerStateForSync.state === 'STOPPED'
-              ? { currentTimeEntry: null, idlePauseStartTime: null, lastResumeTime: null, localTimerStartTime: null }
+              ? { currentTimeEntry: null, lastResumeTime: null, localTimerStartTime: null }
               : {}),
           });
+          invoke('hide_idle_window').catch(() => {}); // FIX: Ensure idle window hidden when syncing
         } catch (e) {
           // BUG FIX: If can't get Timer Engine state, don't assume paused
           // Server state might be stale, so we should not set isPaused without Timer Engine confirmation
@@ -1799,6 +1851,23 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       
       // Don't set isLoading here - let pauseTracking manage it
       // This prevents the "Already loading" check from blocking the pause
+      
+      // FIX: Re-check idlePauseStartTime before pause — concurrent checkIdleStatus may have completed
+      if (get().idlePauseStartTime !== null) {
+        await logger.safeLogToRust(`[IDLE CHECK] Skipped: another pause already in progress (idlePauseStartTime set)`).catch((e) => {
+          logger.debug('IDLE_CHECK', 'Failed to log (non-critical)', e);
+        });
+        return;
+      }
+      
+      // FIX: Mutex — only one pause flow at a time (prevents overlapping intervals / React Strict Mode)
+      if (isIdleCheckPausing) {
+        await logger.safeLogToRust(`[IDLE CHECK] Skipped: pause already in progress (mutex)`).catch((e) => {
+          logger.debug('IDLE_CHECK', 'Failed to log (non-critical)', e);
+        });
+        return;
+      }
+      isIdleCheckPausing = true;
       
       try {
         // Get pauseTracking function directly from store
@@ -1924,6 +1993,8 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           // Если не удалось проверить Timer Engine, очищаем состояние
           set({ isPaused: false, idlePauseStartTime: null });
         }
+      } finally {
+        isIdleCheckPausing = false;
       }
     }
   },
@@ -2115,6 +2186,9 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         ? { currentTimeEntry: null, idlePauseStartTime: null, lastResumeTime: null, localTimerStartTime: null }
         : {}),
     });
+    if (state.state === 'STOPPED') {
+      invoke('hide_idle_window').catch(() => {}); // FIX: Idle window visible when day changed
+    }
     return state;
   },
 
@@ -2203,7 +2277,9 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           set({
             isTracking: expectedTracking,
             isPaused: expectedPaused,
+            idlePauseStartTime: null, // FIX: Wake restore — not idle
           });
+          invoke('hide_idle_window').catch(() => {}); // FIX: Ensure idle window hidden
           return;
         }
         
@@ -2246,12 +2322,20 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
                 lastResumeTime: null,
                 localTimerStartTime: null,
               }
-            : {}),
+            : timerState.state === 'RUNNING'
+              ? { idlePauseStartTime: null } // FIX: Clear idle — Timer Engine RUNNING means we're not idle
+              : {}),
         });
         
         await logger.safeLogToRust(`[STATE_INVARIANT] Auto-synced: isTracking=${expectedTracking}, isPaused=${expectedPaused}`).catch((e) => {
           logger.debug('STATE_INVARIANT', 'Failed to log (non-critical)', e);
         });
+        if (timerState.state === 'RUNNING' || timerState.state === 'STOPPED') {
+          invoke('hide_idle_window').catch(() => {}); // FIX: Idle window must be hidden when not in idle
+        }
+        if (timerState.state === 'RUNNING') {
+          invoke('start_activity_monitoring').catch(() => {}); // FIX: Sync to RUNNING — ensure monitoring
+        }
       }
     } catch (error) {
       // Если не удалось проверить инварианты (например, Timer Engine недоступен),

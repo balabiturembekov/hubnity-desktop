@@ -34,12 +34,15 @@ export function IdleWindow() {
   }, []);
 
   // Listen for state updates from main window via Tauri events
+  const unlistenRef = useRef<(() => void) | null>(null);
+  const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const cancelledRef = useRef(false);
+
   useEffect(() => {
     let isMounted = true;
+    cancelledRef.current = false;
     
     logger.debug('IDLE_WINDOW', 'Setting up event listeners...');
-    let unlistenState: (() => void) | null = null;
-    let pollInterval: NodeJS.Timeout | null = null;
     
     const MAX_IDLE_SECONDS = 24 * 60 * 60; // 24 hours = 86400 seconds
     
@@ -109,7 +112,13 @@ export function IdleWindow() {
           
           updateState(pauseTime, event.payload.isLoading);
         });
-        unlistenState = unlistenStateFn;
+        
+        // FIX: If unmounted while listen() was pending, clean up immediately
+        if (cancelledRef.current) {
+          unlistenStateFn();
+          return;
+        }
+        unlistenRef.current = unlistenStateFn;
         
         logger.debug('IDLE_WINDOW', 'State listener set up successfully');
         
@@ -125,7 +134,8 @@ export function IdleWindow() {
         setTimeout(requestState, 500);
         setTimeout(requestState, 1500);
         // Дальше — раз в 10 с, без спама
-        pollInterval = setInterval(requestState, 10000);
+        if (cancelledRef.current) return;
+        pollIntervalRef.current = setInterval(requestState, 10000);
       } catch (error) {
         logger.error('IDLE_WINDOW', 'Failed to setup listener', error);
       }
@@ -135,9 +145,16 @@ export function IdleWindow() {
 
     return () => {
       isMounted = false;
+      cancelledRef.current = true;
       logger.debug('IDLE_WINDOW', 'Cleaning up listeners...');
-      if (unlistenState) unlistenState();
-      if (pollInterval) clearInterval(pollInterval);
+      if (unlistenRef.current) {
+        unlistenRef.current();
+        unlistenRef.current = null;
+      }
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current);
+        pollIntervalRef.current = null;
+      }
     };
   }, []);
 

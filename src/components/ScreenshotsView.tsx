@@ -156,7 +156,7 @@ export function ScreenshotsView({ timeEntryId }: ScreenshotsViewProps) {
     timeoutIdsRef.current = [];
 
     const handleScreenshotUploaded = () => {
-      console.log('[Screenshots] screenshot:uploaded received, scheduling refetch');
+      logger.debug('SCREENSHOTS_VIEW', 'screenshot:uploaded received, scheduling refetch');
       // Сразу один запрос (если отправка была напрямую на сервер); затем — после sync (Rust кладёт в очередь).
       const delays = [500, 2000, 5000, 12000];
       delays.forEach((delayMs) => {

@@ -75,8 +75,17 @@ export function Timer() {
             isPaused: isPaused,
             ...(state.state === 'STOPPED'
               ? { currentTimeEntry: null, idlePauseStartTime: null, lastResumeTime: null, localTimerStartTime: null }
-              : {}),
+              : state.state === 'RUNNING'
+                ? { idlePauseStartTime: null } // FIX: Clear idle — Timer Engine RUNNING means we're not idle
+                : {}),
           });
+          // FIX: Hide idle window when Timer Engine is RUNNING or STOPPED — store/UI must stay in sync
+          if (state.state === 'RUNNING' || state.state === 'STOPPED') {
+            invoke('hide_idle_window').catch(() => {});
+          }
+          if (state.state === 'RUNNING') {
+            invoke('start_activity_monitoring').catch(() => {}); // FIX: Sync to RUNNING — ensure monitoring
+          }
         }
         
         // Обновляем tray tooltip
