@@ -628,6 +628,12 @@ pub async fn resume_tracking_from_idle(app: AppHandle) -> Result<(), String> {
             .map_err(|e| format!("Failed to emit resume event: {}", e))?;
     }
 
+    // Hide idle window immediately when user clicks Resume — main window handles resume in background
+    // Fixes: on Windows the window stayed visible when store's hide_idle_window wasn't reached
+    if let Some(idle_window) = app.get_webview_window("idle") {
+        let _ = idle_window.hide();
+    }
+
     Ok(())
 }
 
@@ -640,6 +646,11 @@ pub async fn stop_tracking_from_idle(app: AppHandle) -> Result<(), String> {
         main_window
             .emit("stop-tracking", ())
             .map_err(|e| format!("Failed to emit stop event: {}", e))?;
+    }
+
+    // Hide idle window immediately when user clicks Stop
+    if let Some(idle_window) = app.get_webview_window("idle") {
+        let _ = idle_window.hide();
     }
 
     Ok(())
