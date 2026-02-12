@@ -66,27 +66,28 @@ export function Settings() {
     
     setIsLoadingStats(true);
     try {
-      // Токен: сначала из API (in-memory), потом из localStorage — иначе Rust sync не видит токен
-      const accessToken = api.getAccessToken() || localStorage.getItem('access_token');
-      const refreshToken = localStorage.getItem('refresh_token');
-      if (accessToken) {
-        const user = useAuthStore.getState().user;
-        await invoke('set_auth_tokens', {
-          accessToken,
-          refreshToken,
-          userId: user ? String(user.id) : null,
-        });
-      } else {
-        logger.warn('SETTINGS', 'No access_token in api or localStorage — sync will skip until you log in again');
-      }
+      // set_auth_tokens только при runSync — иначе спам в логах каждые 10 сек
+      // get_sync_queue_stats читает из локальной БД, токены не нужны
       if (runSync) {
-        try {
-          const synced = await invoke<number>('sync_queue_now');
-          if (synced > 0) {
-            logger.info('SETTINGS', `Synced ${synced} task(s)`);
+        const accessToken = api.getAccessToken() || localStorage.getItem('access_token');
+        const refreshToken = localStorage.getItem('refresh_token');
+        if (accessToken) {
+          const user = useAuthStore.getState().user;
+          await invoke('set_auth_tokens', {
+            accessToken,
+            refreshToken,
+            userId: user ? String(user.id) : null,
+          });
+          try {
+            const synced = await invoke<number>('sync_queue_now');
+            if (synced > 0) {
+              logger.info('SETTINGS', `Synced ${synced} task(s)`);
+            }
+          } catch (e) {
+            logger.warn('SETTINGS', 'sync_queue_now failed', e);
           }
-        } catch (e) {
-          logger.warn('SETTINGS', 'sync_queue_now failed', e);
+        } else {
+          logger.warn('SETTINGS', 'No access_token — sync skipped');
         }
       }
       const stats = await invoke<QueueStats>('get_sync_queue_stats');

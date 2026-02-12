@@ -477,9 +477,17 @@ class ApiClient {
       });
     } catch (error: any) {
       // Log detailed error information
-      const errorDetails = error.response 
-        ? `Status: ${error.response.status}, Data: ${JSON.stringify(error.response.data).substring(0, 200)}`
-        : error.message || 'Unknown error';
+      let dataStr = 'N/A';
+      if (error.response?.data !== undefined) {
+        try {
+          dataStr = JSON.stringify(error.response.data).substring(0, 200);
+        } catch {
+          dataStr = String(error.response.data).substring(0, 200);
+        }
+      }
+      const errorDetails = error.response
+        ? `Status: ${error.response.status}, Data: ${dataStr}`
+        : (typeof error?.message === 'string' ? error.message : 'Unknown error');
       
       logger.error('API', 'Screenshot upload failed', error);
       await logger.safeLogToRust(`[API] Screenshot upload failed: ${errorDetails}`).catch((e) => {
@@ -487,12 +495,18 @@ class ApiClient {
       });
       
       if (error.request) {
-        await invoke('log_message', { 
-          message: `[API] Request was made but no response received. Request config: ${JSON.stringify({
+        let configStr = '{}';
+        try {
+          configStr = JSON.stringify({
             url: error.config?.url,
             method: error.config?.method,
             timeout: error.config?.timeout,
-          })}` 
+          });
+        } catch {
+          configStr = String(error.config ?? 'unknown');
+        }
+        await invoke('log_message', { 
+          message: `[API] Request was made but no response received. Request config: ${configStr}` 
         }).catch((e) => {
           logger.debug('API', 'Failed to log (non-critical)', e);
         });

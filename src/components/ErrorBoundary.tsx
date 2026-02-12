@@ -44,21 +44,20 @@ export class ErrorBoundary extends Component<Props, State> {
   }
 
   componentDidCatch(error: Error, errorInfo: ErrorInfo) {
+    const errName = typeof (error as any)?.name === 'string' ? (error as any).name : 'Error';
+    const errMessage = typeof (error as any)?.message === 'string' ? (error as any).message : String(error ?? 'Unknown error');
+    const errStack = (error as any)?.stack;
     // Логируем ошибку с полным контекстом
     logger.error('ERROR_BOUNDARY', 'React component error caught', {
-      error: {
-        message: error.message,
-        stack: error.stack,
-        name: error.name,
-      },
+      error: { message: errMessage, stack: errStack, name: errName },
       componentStack: errorInfo.componentStack,
     });
 
     // Отправляем ошибку в Sentry с контекстом
     setSentryContext('react_error_boundary', {
       componentStack: errorInfo.componentStack,
-      errorName: error.name,
-      errorMessage: error.message,
+      errorName: errName,
+      errorMessage: errMessage,
     });
     
     captureException(error, {
@@ -107,11 +106,13 @@ export class ErrorBoundary extends Component<Props, State> {
               {import.meta.env.DEV && this.state.error && (
                 <div className="mt-4 p-3 bg-red-50 border border-red-200 rounded text-xs font-mono overflow-auto max-h-40">
                   <div className="text-red-800 font-semibold mb-1">
-                    {this.state.error.name}: {this.state.error.message}
+                    {typeof this.state.error === 'object' && this.state.error !== null
+                      ? `${(this.state.error as Error).name ?? 'Error'}: ${(this.state.error as Error).message ?? String(this.state.error)}`
+                      : String(this.state.error)}
                   </div>
-                  {this.state.error.stack && (
+                  {typeof this.state.error === 'object' && this.state.error !== null && (this.state.error as Error).stack && (
                     <pre className="text-red-600 whitespace-pre-wrap break-words">
-                      {this.state.error.stack}
+                      {(this.state.error as Error).stack}
                     </pre>
                   )}
                   {this.state.errorInfo?.componentStack && (

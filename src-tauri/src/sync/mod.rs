@@ -472,6 +472,14 @@ impl SyncManager {
         info!("[SYNC] run_sync_internal: {} pending tasks", pending_count);
         if pending_count == 0 {
             debug!("[SYNC] No pending tasks, skipping sync");
+            // Обновляем last_sync_at даже при 0 задач — пользователь видит актуальное «Last sync»
+            // (операции могли идти через direct API, очередь пуста = всё синхронизировано)
+            if let Err(e) = self.db.set_app_meta(
+                "last_sync_at",
+                &chrono::Utc::now().timestamp().to_string(),
+            ) {
+                tracing::warn!("[SYNC] Failed to update last_sync_at (0 tasks): {}", e);
+            }
             return Ok(0);
         }
 
@@ -508,6 +516,12 @@ impl SyncManager {
 
         if tasks.is_empty() {
             eprintln!("[SYNC] No tasks ready for retry (backoff or empty), skipping");
+            if let Err(e) = self.db.set_app_meta(
+                "last_sync_at",
+                &chrono::Utc::now().timestamp().to_string(),
+            ) {
+                tracing::warn!("[SYNC] Failed to update last_sync_at (backoff): {}", e);
+            }
             return Ok(0);
         }
 

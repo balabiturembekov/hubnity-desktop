@@ -74,7 +74,7 @@ function App() {
       .catch(error => {
         logger.debug('APP', 'Failed to get app version', error);
         // Fallback to package.json version if available
-        setAppVersion('0.1.12'); // Fallback version
+        setAppVersion('0.1.13'); // Fallback version
       });
   }, []);
 
@@ -212,6 +212,7 @@ function App() {
   useEffect(() => {
     if (!isAuthenticated) return;
 
+    let syncSkippedDueToLoading = 0;
     const syncTimerState = async () => {
       try {
         const { currentTimeEntry, idlePauseStartTime, isLoading, getTimerState } = useTrackerStore.getState();
@@ -219,8 +220,17 @@ function App() {
         // BUG FIX: Don't sync if another operation is in progress
         // This prevents sync from interfering with user actions or other operations
         if (isLoading) {
-          logger.debug('APP', 'Skipping sync: operation in progress');
-          return;
+          syncSkippedDueToLoading++;
+          if (syncSkippedDueToLoading >= 6) {
+            logger.warn('APP', 'syncTimerState: isLoading stuck for 60s, forcing recovery');
+            useTrackerStore.setState({ isLoading: false });
+            syncSkippedDueToLoading = 0;
+          } else {
+            logger.debug('APP', 'Skipping sync: operation in progress');
+            return;
+          }
+        } else {
+          syncSkippedDueToLoading = 0;
         }
         
         // BUG FIX: Check actual Timer Engine state instead of store cache
@@ -251,11 +261,26 @@ function App() {
         const activeEntries = await api.getActiveTimeEntries();
         
         if (activeEntries.length > 0) {
-          const activeEntry = activeEntries[0];
-          const { currentTimeEntry: currentEntry } = useTrackerStore.getState();
+          // BUG FIX: Сортируем по startTime (самая свежая первая), как в loadActiveTimeEntry
+          const sortedEntries = [...activeEntries].sort((a, b) =>
+            new Date(b.startTime).getTime() - new Date(a.startTime).getTime()
+          );
+          const activeEntry = sortedEntries[0];
+          const { currentTimeEntry: currentEntry, loadActiveTimeEntry } = useTrackerStore.getState();
           
-          // Если нет currentTimeEntry, не синхронизируем остановку (уже остановлено локально)
+          // Если нет currentTimeEntry, но таймер работает — пробуем загрузить с сервера
           if (!currentEntry) {
+            if (isTracking) {
+              await loadActiveTimeEntry().catch((e) => logger.warn('APP', 'loadActiveTimeEntry failed during sync', e));
+            }
+            return;
+          }
+          
+          // BUG FIX: Проверяем соответствие ID — при расхождении (мультиустройство или temp vs server)
+          // загружаем состояние с сервера вместо применения действий к неверной записи
+          if (currentEntry.id !== activeEntry.id) {
+            logger.debug('APP', `Sync: currentEntry.id (${currentEntry.id}) !== activeEntry.id (${activeEntry.id}), loading from server`);
+            await loadActiveTimeEntry().catch((e) => logger.warn('APP', 'loadActiveTimeEntry failed during sync', e));
             return;
           }
           
@@ -322,7 +347,7 @@ function App() {
               if (syncStatus.pending_count > 0) {
                 // Check if there are any resume operations pending
                 const queueStats = await invoke<{ pending_by_type: Record<string, number> }>('get_sync_queue_stats').catch(() => null);
-                if (queueStats && queueStats.pending_by_type['time_entry_resume'] && queueStats.pending_by_type['time_entry_resume'] > 0) {
+                if (queueStats?.pending_by_type?.['time_entry_resume'] && queueStats.pending_by_type['time_entry_resume'] > 0) {
                   logger.info('APP', `Skipping sync pause: ${queueStats.pending_by_type['time_entry_resume']} pending resume operation(s) in queue, waiting for sync`);
                   return;
                 }
@@ -953,16 +978,19 @@ function App() {
         logger.debug('SCREENSHOT', 'Failed to log (non-critical)', e);
       });
       
+      let screenshotData: number[] | null = null;
+      let finalState = useTrackerStore.getState();
+      
       try {
         // Final state check before taking screenshot
-        const finalState = useTrackerStore.getState();
+        finalState = useTrackerStore.getState();
         if (!finalState.isTracking || finalState.isPaused || !finalState.currentTimeEntry || finalState.idlePauseStartTime !== null || isCleanedUp) {
           useTrackerStore.setState({ isTakingScreenshot: false });
           return; // State changed or idle, skip screenshot
         }
         
         // Take screenshot via Rust
-        const screenshotData = await invoke<number[]>('take_screenshot', {
+        screenshotData = await invoke<number[]>('take_screenshot', {
           timeEntryId: finalState.currentTimeEntry.id,
         });
         
@@ -1037,8 +1065,29 @@ function App() {
         // Don't show notification for every screenshot to avoid spam
         // Notification is only shown on errors
       } catch (error: any) {
-        // Show error notification only if not cleaned up
+        // FIX: Last resort — try to enqueue via Rust so screenshot syncs when online
+        // Both Rust and JS upload failed; enqueue preserves the screenshot for retry
         if (!isCleanedUp) {
+          try {
+            const accessToken = useTrackerStore.getState().getAccessToken();
+            const refreshToken = localStorage.getItem('refresh_token');
+            if (accessToken && screenshotData && screenshotData.length > 0 && finalState.currentTimeEntry) {
+              await invoke('upload_screenshot', {
+                pngData: Array.from(screenshotData),
+                timeEntryId: finalState.currentTimeEntry.id,
+                accessToken,
+                refreshToken: refreshToken || null,
+              });
+              await invoke('show_notification', {
+                title: 'Screenshot queued',
+                body: 'Will sync when connection is restored',
+              });
+              window.dispatchEvent(new CustomEvent('screenshot:uploaded'));
+              return;
+            }
+          } catch (enqueueErr: any) {
+            logger.warn('SCREENSHOT', 'Enqueue fallback failed', enqueueErr);
+          }
           await invoke('show_notification', {
             title: 'Screenshot error',
             body: error.message || 'Could not take screenshot',

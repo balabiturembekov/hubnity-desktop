@@ -86,6 +86,12 @@ export function Timer() {
           if (state.state === 'RUNNING') {
             invoke('start_activity_monitoring').catch(() => {}); // FIX: Sync to RUNNING — ensure monitoring
           }
+          // BUG FIX: Timer Engine RUNNING/PAUSED but currentTimeEntry null — restore from server
+          if ((isRunning || isPaused) && !currentTimeEntry) {
+            useTrackerStore.getState().loadActiveTimeEntry().catch((e) => {
+              logger.debug('TIMER', 'loadActiveTimeEntry failed (non-critical)', e);
+            });
+          }
         }
         
         // Обновляем tray tooltip

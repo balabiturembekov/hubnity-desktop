@@ -66,7 +66,8 @@ export function Login() {
       }
       
       // Sanitize error message to prevent XSS (basic protection)
-      errorMessage = errorMessage.replace(/<[^>]*>/g, '');
+      const msg = typeof errorMessage === 'string' ? errorMessage : String(errorMessage ?? 'Login error');
+      errorMessage = msg.replace(/<[^>]*>/g, '');
       
       setError(errorMessage);
     } finally {

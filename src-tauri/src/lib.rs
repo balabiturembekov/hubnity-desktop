@@ -252,6 +252,7 @@ pub fn run() {
             sync_queue_now,
             get_sync_status,
             get_sync_queue_stats,
+            mark_task_sent_by_id,
             get_failed_tasks,
             retry_failed_tasks,
             // Timer Engine commands

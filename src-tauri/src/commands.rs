@@ -870,11 +870,11 @@ pub async fn set_auth_tokens(
         .auth_manager
         .set_tokens(access_token.clone(), refresh_token.clone())
         .await;
-    // Логируем для диагностики
+    // debug вместо info — иначе спам в логах при частых вызовах (pushTokensAndSync, Settings)
     if let Some(token) = &access_token {
-        info!("[SYNC] Tokens set in AuthManager, token length: {}", token.len());
+        debug!("[SYNC] Tokens set in AuthManager, token length: {}", token.len());
     } else {
-        info!("[SYNC] Tokens cleared in AuthManager");
+        debug!("[SYNC] Tokens cleared in AuthManager");
     }
     Ok(())
 }
@@ -943,6 +943,22 @@ pub async fn get_sync_queue_stats(
         .db
         .get_queue_stats()
         .map_err(|e| format!("Failed to get queue stats: {}", e))
+}
+
+/// Пометить задачу как sent (успешно синхронизированную) — используется при прямом вызове API
+#[tauri::command]
+pub async fn mark_task_sent_by_id(
+    id: i64,
+    sync_manager: State<'_, SyncManager>,
+) -> Result<(), String> {
+    sync_manager.db.mark_task_sent(id).map_err(|e| {
+        format!("Failed to mark task sent: {}", e)
+    })?;
+    let _ = sync_manager.db.set_app_meta(
+        "last_sync_at",
+        &chrono::Utc::now().timestamp().to_string(),
+    );
+    Ok(())
 }
 
 /// Получить список failed задач с деталями
