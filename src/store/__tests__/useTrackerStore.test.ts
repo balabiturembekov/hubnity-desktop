@@ -332,6 +332,22 @@ describe('useTrackerStore', () => {
       useTrackerStore.getState().selectProject(project);
       await useTrackerStore.getState().startTracking();
       await new Promise(r => setTimeout(r, 80));
+      // pauseTracking calls getState - must return RUNNING so we actually pause (not STOPPED which would clear store)
+      mockGetTimerState.mockResolvedValueOnce({
+        state: 'RUNNING',
+        started_at: Date.now() / 1000,
+        elapsed_seconds: 0,
+        accumulated_seconds: 0,
+        session_start: Date.now() / 1000,
+        day_start: Math.floor(Date.now() / 1000),
+      });
+      mockGetTimerState.mockResolvedValueOnce({
+        state: 'PAUSED',
+        elapsed_seconds: 0,
+        accumulated_seconds: 0,
+        session_start: null,
+        day_start: Math.floor(Date.now() / 1000),
+      });
       await useTrackerStore.getState().pauseTracking();
       await new Promise(r => setTimeout(r, 50));
       

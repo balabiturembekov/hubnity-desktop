@@ -106,6 +106,10 @@ impl TimerEngine {
                 if let Err(e) = self.save_state() {
                     error!("[TIMER] Failed to save state after start: {}", e);
                 }
+                // Сбрасываем флаг восстановления после wake
+                if let Ok(mut f) = self.restored_from_running.lock() {
+                    *f = false;
+                }
 
                 Ok(())
             }
@@ -130,6 +134,10 @@ impl TimerEngine {
                         "[TIMER] Failed to save state after start (Paused→Running): {}",
                         e
                     );
+                }
+                // Сбрасываем флаг восстановления после wake — пользователь явно возобновил
+                if let Ok(mut f) = self.restored_from_running.lock() {
+                    *f = false;
                 }
 
                 Ok(())
@@ -254,6 +262,10 @@ impl TimerEngine {
                 if let Err(e) = self.save_state() {
                     error!("[TIMER] Failed to save state after resume: {}", e);
                 }
+                // Сбрасываем флаг восстановления после wake — пользователь явно возобновил
+                if let Ok(mut f) = self.restored_from_running.lock() {
+                    *f = false;
+                }
 
                 Ok(())
             }
@@ -315,6 +327,11 @@ impl TimerEngine {
                 *state = TimerState::Stopped;
                 drop(state); // Освобождаем lock перед сохранением
 
+                // Сбрасываем флаг восстановления после wake
+                if let Ok(mut f) = self.restored_from_running.lock() {
+                    *f = false;
+                }
+
                 // CRITICAL FIX: Сохраняем состояние с новым accumulated в одной транзакции
                 match self.save_state_with_accumulated_override(Some(new_accumulated)) {
                     Ok(_) => {
@@ -338,6 +355,11 @@ impl TimerEngine {
                 // Допустимый переход: Paused → Stopped (accumulated уже сохранен)
                 *state = TimerState::Stopped;
                 drop(state); // Освобождаем lock перед сохранением
+
+                // Сбрасываем флаг восстановления после wake
+                if let Ok(mut f) = self.restored_from_running.lock() {
+                    *f = false;
+                }
 
                 // Сохраняем состояние в БД
                 if let Err(e) = self.save_state() {
@@ -447,15 +469,13 @@ impl TimerEngine {
             TimerState::Paused => TimerStateForAPI::Paused,
         };
 
-        // Этап 4: прочитать и сбросить флаг «восстановлено из RUNNING» (показать уведомление один раз)
+        // Этап 4: прочитать флаг «восстановлено из RUNNING»
+        // НЕ сбрасываем здесь — сбрасываем только при resume/start (пользователь явно возобновил)
+        // Это позволяет loadActiveTimeEntry не авто-возобновлять таймер после wake
         let restored_from_running = self
             .restored_from_running
             .lock()
-            .map(|mut f| {
-                let v = *f;
-                *f = false;
-                v
-            })
+            .map(|f| *f)
             .unwrap_or(false);
 
         // today_seconds: для "Today" display. При rollover (started_at == day_start) — только время с полуночи.

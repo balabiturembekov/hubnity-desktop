@@ -74,7 +74,7 @@ export function Timer() {
             isTracking: isRunning || isPaused,
             isPaused: isPaused,
             ...(state.state === 'STOPPED'
-              ? { currentTimeEntry: null, idlePauseStartTime: null }
+              ? { currentTimeEntry: null, idlePauseStartTime: null, lastResumeTime: null, localTimerStartTime: null }
               : {}),
           });
         }

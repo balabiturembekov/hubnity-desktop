@@ -74,7 +74,7 @@ function App() {
       .catch(error => {
         logger.debug('APP', 'Failed to get app version', error);
         // Fallback to package.json version if available
-        setAppVersion('0.1.9'); // Fallback version
+        setAppVersion('0.1.10'); // Fallback version
       });
   }, []);
 
@@ -376,12 +376,10 @@ function App() {
           
           const timerState = await getTimerState();
           if (timerState.state !== 'STOPPED') {
-            // BUG FIX: Don't auto-stop timer if it's PAUSED after system wake
-            // PAUSED state after wake means timer was restored and user should be able to resume it
-            // Only auto-stop if timer is RUNNING (which shouldn't happen without server entry)
-            if (timerState.state === 'PAUSED') {
-              logger.info('APP', 'Syncing timer: timer is PAUSED after wake, allowing user to resume manually');
-              // Don't stop - user should be able to resume
+            // BUG FIX: Don't auto-stop timer if it's PAUSED after system wake (restored_from_running)
+            // User should be able to resume manually; only skip when we know it's wake-restore
+            if (timerState.state === 'PAUSED' && timerState.restored_from_running) {
+              logger.info('APP', 'Syncing timer: timer is PAUSED after wake (restored_from_running), allowing user to resume manually');
               return;
             }
             
@@ -1496,6 +1494,8 @@ function App() {
                     isLoading: false,
                     error: null,
                     idlePauseStartTime: null,
+                    lastResumeTime: null,
+                    localTimerStartTime: null,
                     lastActivityTime: Date.now(), // Reset to current time to prevent stale idle detection
                     urlActivities: [],
                   });

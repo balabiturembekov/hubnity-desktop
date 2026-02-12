@@ -47,6 +47,9 @@ tempfile = "3"
 core-graphics = "0.23"
 objc = "0.2"
 
+[target.'cfg(target_os = "windows")'.dependencies]
+mouse_position = "0.1"
+
 [lints.rust]
 # Suppress warning from objc crate's internal cfg(cargo-clippy) usage
 unexpected_cfgs = "allow"

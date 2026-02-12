@@ -145,9 +145,87 @@ pub async fn start_activity_monitoring(
         });
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     {
-        // For other platforms, implement similar logic
+        use mouse_position::mouse_position::Mouse;
+        use std::time::Duration;
+
+        let is_monitoring_clone = is_monitoring.clone();
+        let last_activity_clone = last_activity.clone();
+        let app_clone = app.clone();
+
+        tokio::spawn(async move {
+            use tauri::Emitter;
+            let mut last_mouse_pos: Option<(f64, f64)> = None;
+            let mut last_emit_time = Instant::now();
+            let min_emit_interval = Duration::from_secs(10);
+            let mut consecutive_movements = 0;
+
+            loop {
+                {
+                    let monitoring = match is_monitoring_clone.lock() {
+                        Ok(m) => m,
+                        Err(_) => break,
+                    };
+                    if !*monitoring {
+                        break;
+                    }
+                }
+
+                let current_mouse_pos = match Mouse::get_mouse_position() {
+                    mouse_position::mouse_position::Mouse::Position { x, y } => (x as f64, y as f64),
+                    _ => {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                };
+
+                let mut activity_detected = false;
+                if let Some((last_x, last_y)) = last_mouse_pos {
+                    let delta_x = (current_mouse_pos.0 - last_x).abs();
+                    let delta_y = (current_mouse_pos.1 - last_y).abs();
+                    let total_delta = (delta_x * delta_x + delta_y * delta_y).sqrt();
+
+                    if total_delta > 20.0 {
+                        activity_detected = true;
+                        consecutive_movements = 0;
+                    } else if total_delta > 1.0 {
+                        consecutive_movements += 1;
+                        if consecutive_movements >= 10 {
+                            activity_detected = true;
+                            consecutive_movements = 0;
+                        }
+                    } else {
+                        consecutive_movements = 0;
+                    }
+                } else {
+                    last_mouse_pos = Some(current_mouse_pos);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+
+                if activity_detected {
+                    let now = Instant::now();
+                    if now.duration_since(last_emit_time) >= min_emit_interval {
+                        if let Ok(mut last) = last_activity_clone.lock() {
+                            *last = Instant::now();
+                        }
+                        if let Err(e) = app_clone.emit("activity-detected", ()) {
+                            warn!("[ACTIVITY] Failed to emit activity-detected event: {:?}", e);
+                        }
+                        last_emit_time = now;
+                    }
+                }
+
+                last_mouse_pos = Some(current_mouse_pos);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        // Linux and other platforms: stub - emits every second (no real idle detection)
         let is_monitoring_clone = is_monitoring.clone();
         let last_activity_clone = last_activity.clone();
         let app_clone = app.clone();
@@ -155,26 +233,20 @@ pub async fn start_activity_monitoring(
         tokio::spawn(async move {
             loop {
                 {
-                    // Check if monitoring should continue
                     let monitoring = match is_monitoring_clone.lock() {
                         Ok(m) => m,
-                        Err(_) => break, // Mutex poisoned, exit loop
+                        Err(_) => break,
                     };
                     if !*monitoring {
                         break;
                     }
                 }
 
-                // BUG FIX: Log error if emit fails instead of silently ignoring
                 if let Err(e) = app_clone.emit("activity-detected", ()) {
                     warn!("[ACTIVITY] Failed to emit activity-detected event: {:?}", e);
                 }
-
-                {
-                    if let Ok(mut last) = last_activity_clone.lock() {
-                        *last = Instant::now();
-                    }
-                    // If mutex is poisoned, continue anyway
+                if let Ok(mut last) = last_activity_clone.lock() {
+                    *last = Instant::now();
                 }
 
                 tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
