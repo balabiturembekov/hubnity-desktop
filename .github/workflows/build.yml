@@ -15,6 +15,7 @@ jobs:
       contents: write
     outputs:
       release_id: ${{ steps.create_release.outputs.id }}
+      version: ${{ steps.read_version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -100,8 +101,8 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           releaseId: ${{ needs.create-release.outputs.release_id }}
-          tagName: ${{ github.event_name == 'push' && 'app-v__VERSION__' || '' }}
-          releaseName: ${{ github.event_name == 'push' && 'Hubnity v__VERSION__' || '' }}
+          tagName: ${{ needs.create-release.result == 'success' && format('app-v{0}', needs.create-release.outputs.version) || '' }}
+          releaseName: ${{ needs.create-release.result == 'success' && format('Hubnity v{0}', needs.create-release.outputs.version) || '' }}
           releaseBody: ${{ github.event_name == 'push' && 'See the assets to download this version and install.' || '' }}
           releaseDraft: true
           prerelease: false

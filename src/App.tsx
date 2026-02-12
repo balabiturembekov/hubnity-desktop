@@ -453,29 +453,26 @@ function App() {
     };
   }, []);
 
-  // Проверка обновлений (раз в 15 с после загрузки, затем не спамим)
-  // Примечание: ошибки updater (например, недоступный endpoint) не критичны и игнорируются
+  // Проверка обновлений: первая проверка через 15 с, затем каждые 30 мин
+  // Раньше проверяли только раз — пользователи с открытым приложением не видели новые релизы
   useEffect(() => {
     let cancelled = false;
-    const timeout = setTimeout(async () => {
+    const checkForUpdate = async () => {
       try {
         const { check } = await import('@tauri-apps/plugin-updater');
         const update = await check();
         if (cancelled || !update) return;
         pendingUpdateRef.current = update;
         setUpdateAvailable({ version: update.version, body: update.body ?? undefined });
+        logger.info('APP', `Update available: ${update.version}`);
         
-        // Уведомление о найденном обновлении
         await invoke('show_notification', {
           title: 'Hubnity',
           body: `New version ${update.version} available. Installation will start automatically...`,
         }).catch(() => {});
         
-        // Автоматическая установка обновления
-        // Небольшая задержка, чтобы пользователь успел увидеть уведомление
         autoInstallTimeoutRef.current = setTimeout(async () => {
           if (cancelled) return;
-          // Атомарная проверка и установка флага для предотвращения race condition
           if (isInstallingRef.current) return;
           isInstallingRef.current = true;
           
@@ -489,9 +486,10 @@ function App() {
             isInstallingRef.current = false;
             const err = e instanceof Error ? e : new Error(String(e));
             logger.error('APP', `Automatic update install failed: ${err.message}`, err);
+            await logger.safeLogToRust(`[UPDATE] Auto-install failed: ${err.message}`).catch(() => {});
             await invoke('show_notification', {
               title: 'Hubnity',
-              body: 'Could not install update automatically. Try downloading from the website.',
+              body: `Could not install update automatically. Try "Install update" button or download from the website.`,
             }).catch(() => {});
             try {
               const { openUrl } = await import('@tauri-apps/plugin-opener');
@@ -500,24 +498,53 @@ function App() {
               // ignore
             }
           }
-        }, 3000); // 3 секунды задержки перед началом установки
+        }, 5000); // 5 секунд — пользователь успевает увидеть уведомление
       } catch (e: any) {
-        // Игнорируем ошибки updater - они не критичны (endpoint может быть недоступен или не настроен)
-        // Rust плагин логирует ERROR, но это нормально если updater не настроен
         if (e?.message?.includes('update endpoint') || e?.message?.includes('status code')) {
-          logger.debug('APP', 'Update endpoint unavailable (non-critical, updater may not be configured)', e);
+          logger.debug('APP', 'Update endpoint unavailable (non-critical)', e);
         } else {
           logger.debug('APP', 'Update check failed (non-critical)', e);
         }
       }
-    }, 15000);
+    };
+
+    const initialTimeout = setTimeout(checkForUpdate, 15000);
+    const interval = setInterval(checkForUpdate, 30 * 60 * 1000); // каждые 30 мин
+
     return () => {
       cancelled = true;
-      clearTimeout(timeout);
+      clearTimeout(initialTimeout);
+      clearInterval(interval);
       if (autoInstallTimeoutRef.current) {
         clearTimeout(autoInstallTimeoutRef.current);
       }
     };
+  }, []);
+
+  const checkForUpdateManually = useCallback(async () => {
+    try {
+      const { check } = await import('@tauri-apps/plugin-updater');
+      const update = await check();
+      if (!update) {
+        await invoke('show_notification', {
+          title: 'Hubnity',
+          body: 'You are on the latest version.',
+        }).catch(() => {});
+        return;
+      }
+      pendingUpdateRef.current = update;
+      setUpdateAvailable({ version: update.version, body: update.body ?? undefined });
+      await invoke('show_notification', {
+        title: 'Hubnity',
+        body: `New version ${update.version} available.`,
+      }).catch(() => {});
+    } catch (e) {
+      logger.debug('APP', 'Update check failed', e);
+      await invoke('show_notification', {
+        title: 'Hubnity',
+        body: 'Could not check for updates. Check your internet connection.',
+      }).catch(() => {});
+    }
   }, []);
 
   const installUpdate = useCallback(async () => {
@@ -1532,11 +1559,20 @@ function App() {
           {/* Footer - Синхронизация и версия (ненавязчиво) */}
           <div className="px-4 py-2 border-t bg-muted/30">
             <div className="flex items-center justify-between">
-              {appVersion && (
-                <span className="text-xs text-muted-foreground/60">
-                  v{appVersion}
-                </span>
-              )}
+              <div className="flex items-center gap-2">
+                {appVersion && (
+                  <span className="text-xs text-muted-foreground/60">
+                    v{appVersion}
+                  </span>
+                )}
+                <button
+                  type="button"
+                  onClick={checkForUpdateManually}
+                  className="text-xs text-muted-foreground/60 hover:text-foreground/80 underline cursor-pointer"
+                >
+                  Check for updates
+                </button>
+              </div>
               <SyncIndicator />
             </div>
           </div>
