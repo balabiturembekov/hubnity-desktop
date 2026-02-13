@@ -43,103 +43,80 @@ pub async fn start_activity_monitoring(
 
     #[cfg(target_os = "macos")]
     {
-        use objc::runtime::Class;
-        use objc::{msg_send, sel, sel_impl};
         use std::time::Duration;
+        use system_idle_time::get_idle_time;
 
         let is_monitoring_clone = is_monitoring.clone();
         let last_activity_clone = last_activity.clone();
         let app_clone = app.clone();
 
-        // Spawn a thread for activity monitoring by checking mouse position
+        // Use system idle time instead of mouse position — more reliable, no false positives
+        // when user is away (NSEvent.mouseLocation could drift due to Retina scaling, etc.)
+        // Emit only when idle < 5s — user just moved mouse/keyboard; reduces false positives
+        let activity_threshold = Duration::from_secs(5);
+        let min_emit_interval = Duration::from_secs(10);
+        let display_wake_jump = Duration::from_secs(60); // Previous idle >= 60s, now < 5s = display wake
+        let display_wake_cooldown = Duration::from_secs(30); // Don't emit for 30s after suspected wake
+
         tokio::spawn(async move {
             use tauri::Emitter;
-            let mut last_mouse_pos: Option<(f64, f64)> = None;
             let mut last_emit_time = Instant::now();
-            let min_emit_interval = Duration::from_secs(10); // Emit activity event at most once every 10 seconds
-            let mut consecutive_movements = 0; // Track consecutive small movements
+            let mut prev_idle: Option<std::time::Duration> = None;
+            let mut display_wake_until: Option<Instant> = None;
 
             loop {
                 {
-                    // Check if monitoring should continue
                     let monitoring = match is_monitoring_clone.lock() {
                         Ok(m) => m,
-                        Err(_) => break, // Mutex poisoned, exit loop
+                        Err(_) => break,
                     };
                     if !*monitoring {
                         break;
                     }
                 }
 
-                // Get current mouse position using NSEvent.mouseLocation through objc
-                unsafe {
-                    let ns_event_class = match Class::get("NSEvent") {
-                        Some(class) => class,
-                        None => {
-                            // Class not found, skip this iteration
-                            tokio::time::sleep(Duration::from_millis(1000)).await;
-                            continue;
-                        }
-                    };
-                    let mouse_location: core_graphics::geometry::CGPoint =
-                        msg_send![ns_event_class, mouseLocation];
-
-                    let current_mouse_pos = (mouse_location.x, mouse_location.y);
-
-                    // Check if mouse moved significantly
-                    let mut activity_detected = false;
-                    if let Some((last_x, last_y)) = last_mouse_pos {
-                        let delta_x = (current_mouse_pos.0 - last_x).abs();
-                        let delta_y = (current_mouse_pos.1 - last_y).abs();
-                        let total_delta = (delta_x * delta_x + delta_y * delta_y).sqrt();
-
-                        // If mouse moved more than 20 pixels, consider it real activity
-                        // This filters out small hand tremors and system noise
-                        if total_delta > 20.0 {
-                            activity_detected = true;
-                            consecutive_movements = 0; // Reset counter on significant movement
-                        } else if total_delta > 1.0 {
-                            // Small movement - increment counter
-                            consecutive_movements += 1;
-                            // If many small movements accumulate, it might be real activity
-                            if consecutive_movements >= 10 {
-                                activity_detected = true;
-                                consecutive_movements = 0;
-                            }
-                        } else {
-                            // No movement - reset counter
-                            consecutive_movements = 0;
-                        }
-                    } else {
-                        // First check - don't emit immediately, just initialize
-                        last_mouse_pos = Some(current_mouse_pos);
-                        tokio::time::sleep(Duration::from_millis(1000)).await;
-                        continue;
+                let idle_duration = match get_idle_time() {
+                    Ok(d) => Some(d),
+                    Err(e) => {
+                        drop(e); // Box<dyn StdError> is not Send
+                        None
                     }
+                };
+                let Some(idle_duration) = idle_duration else {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                };
 
-                    // Only emit event if activity detected AND enough time has passed since last emit
-                    if activity_detected {
-                        let now = Instant::now();
-                        if now.duration_since(last_emit_time) >= min_emit_interval {
-                            // Update activity time first (even if emit fails)
-                            {
-                                if let Ok(mut last) = last_activity_clone.lock() {
-                                    *last = Instant::now();
-                                }
-                            }
-                            // Emit event (ignore errors)
-                            // BUG FIX: Log error if emit fails instead of silently ignoring
-                            if let Err(e) = app_clone.emit("activity-detected", ()) {
-                                warn!("[ACTIVITY] Failed to emit activity-detected event: {:?}", e);
-                            }
-                            last_emit_time = now;
-                        }
+                let is_display_wake_jump = prev_idle
+                    .is_some_and(|p| p >= display_wake_jump && idle_duration < activity_threshold);
+                prev_idle = Some(idle_duration);
+
+                if is_display_wake_jump {
+                    display_wake_until = Some(Instant::now() + display_wake_cooldown);
+                }
+                let in_cooldown = match display_wake_until {
+                    Some(t) if Instant::now() < t => true,
+                    Some(_) => {
+                        display_wake_until = None;
+                        false
                     }
+                    None => false,
+                };
 
-                    last_mouse_pos = Some(current_mouse_pos);
+                if idle_duration < activity_threshold && !is_display_wake_jump && !in_cooldown {
+                    let now = Instant::now();
+                    if now.duration_since(last_emit_time) >= min_emit_interval {
+                        if let Ok(mut last) = last_activity_clone.lock() {
+                            *last = Instant::now();
+                        }
+                        let idle_secs = idle_duration.as_secs() as u32;
+                        if let Err(e) = app_clone.emit("activity-detected", idle_secs) {
+                            warn!("[ACTIVITY] Failed to emit activity-detected event: {:?}", e);
+                        }
+                        last_emit_time = now;
+                    }
                 }
 
-                // Check every 1 second to reduce CPU usage and false positives
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
@@ -147,19 +124,23 @@ pub async fn start_activity_monitoring(
 
     #[cfg(target_os = "windows")]
     {
-        use mouse_position::mouse_position::Mouse;
         use std::time::Duration;
+        use system_idle_time::get_idle_time;
 
         let is_monitoring_clone = is_monitoring.clone();
         let last_activity_clone = last_activity.clone();
         let app_clone = app.clone();
 
+        let activity_threshold = Duration::from_secs(5);
+        let min_emit_interval = Duration::from_secs(10);
+        let display_wake_jump = Duration::from_secs(60);
+        let display_wake_cooldown = Duration::from_secs(30);
+
         tokio::spawn(async move {
             use tauri::Emitter;
-            let mut last_mouse_pos: Option<(f64, f64)> = None;
             let mut last_emit_time = Instant::now();
-            let min_emit_interval = Duration::from_secs(10);
-            let mut consecutive_movements = 0;
+            let mut prev_idle: Option<std::time::Duration> = None;
+            let mut display_wake_until: Option<Instant> = None;
 
             loop {
                 {
@@ -172,52 +153,48 @@ pub async fn start_activity_monitoring(
                     }
                 }
 
-                let current_mouse_pos = match Mouse::get_mouse_position() {
-                    mouse_position::mouse_position::Mouse::Position { x, y } => (x as f64, y as f64),
-                    _ => {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        continue;
+                let idle_duration = match get_idle_time() {
+                    Ok(d) => Some(d),
+                    Err(e) => {
+                        drop(e);
+                        None
                     }
                 };
-
-                let mut activity_detected = false;
-                if let Some((last_x, last_y)) = last_mouse_pos {
-                    let delta_x = (current_mouse_pos.0 - last_x).abs();
-                    let delta_y = (current_mouse_pos.1 - last_y).abs();
-                    let total_delta = (delta_x * delta_x + delta_y * delta_y).sqrt();
-
-                    if total_delta > 20.0 {
-                        activity_detected = true;
-                        consecutive_movements = 0;
-                    } else if total_delta > 1.0 {
-                        consecutive_movements += 1;
-                        if consecutive_movements >= 10 {
-                            activity_detected = true;
-                            consecutive_movements = 0;
-                        }
-                    } else {
-                        consecutive_movements = 0;
-                    }
-                } else {
-                    last_mouse_pos = Some(current_mouse_pos);
+                let Some(idle_duration) = idle_duration else {
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
-                }
+                };
 
-                if activity_detected {
+                let is_display_wake_jump = prev_idle
+                    .is_some_and(|p| p >= display_wake_jump && idle_duration < activity_threshold);
+                prev_idle = Some(idle_duration);
+
+                if is_display_wake_jump {
+                    display_wake_until = Some(Instant::now() + display_wake_cooldown);
+                }
+                let in_cooldown = match display_wake_until {
+                    Some(t) if Instant::now() < t => true,
+                    Some(_) => {
+                        display_wake_until = None;
+                        false
+                    }
+                    None => false,
+                };
+
+                if idle_duration < activity_threshold && !is_display_wake_jump && !in_cooldown {
                     let now = Instant::now();
                     if now.duration_since(last_emit_time) >= min_emit_interval {
                         if let Ok(mut last) = last_activity_clone.lock() {
                             *last = Instant::now();
                         }
-                        if let Err(e) = app_clone.emit("activity-detected", ()) {
+                        let idle_secs = idle_duration.as_secs() as u32;
+                        if let Err(e) = app_clone.emit("activity-detected", idle_secs) {
                             warn!("[ACTIVITY] Failed to emit activity-detected event: {:?}", e);
                         }
                         last_emit_time = now;
                     }
                 }
 
-                last_mouse_pos = Some(current_mouse_pos);
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
@@ -225,12 +202,25 @@ pub async fn start_activity_monitoring(
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        // Linux and other platforms: stub - emits every second (no real idle detection)
+        // Linux: use system idle time
+        use std::time::Duration;
+        use system_idle_time::get_idle_time;
+
         let is_monitoring_clone = is_monitoring.clone();
         let last_activity_clone = last_activity.clone();
         let app_clone = app.clone();
 
+        let activity_threshold = Duration::from_secs(5);
+        let min_emit_interval = Duration::from_secs(10);
+        let display_wake_jump = Duration::from_secs(60);
+        let display_wake_cooldown = Duration::from_secs(30);
+
         tokio::spawn(async move {
+            use tauri::Emitter;
+            let mut last_emit_time = Instant::now();
+            let mut prev_idle: Option<std::time::Duration> = None;
+            let mut display_wake_until: Option<Instant> = None;
+
             loop {
                 {
                     let monitoring = match is_monitoring_clone.lock() {
@@ -242,14 +232,49 @@ pub async fn start_activity_monitoring(
                     }
                 }
 
-                if let Err(e) = app_clone.emit("activity-detected", ()) {
-                    warn!("[ACTIVITY] Failed to emit activity-detected event: {:?}", e);
+                let idle_duration = match get_idle_time() {
+                    Ok(d) => Some(d),
+                    Err(e) => {
+                        drop(e);
+                        None
+                    }
+                };
+                let Some(idle_duration) = idle_duration else {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                };
+
+                let is_display_wake_jump = prev_idle
+                    .is_some_and(|p| p >= display_wake_jump && idle_duration < activity_threshold);
+                prev_idle = Some(idle_duration);
+
+                if is_display_wake_jump {
+                    display_wake_until = Some(Instant::now() + display_wake_cooldown);
                 }
-                if let Ok(mut last) = last_activity_clone.lock() {
-                    *last = Instant::now();
+                let in_cooldown = match display_wake_until {
+                    Some(t) if Instant::now() < t => true,
+                    Some(_) => {
+                        display_wake_until = None;
+                        false
+                    }
+                    None => false,
+                };
+
+                if idle_duration < activity_threshold && !is_display_wake_jump && !in_cooldown {
+                    let now = Instant::now();
+                    if now.duration_since(last_emit_time) >= min_emit_interval {
+                        if let Ok(mut last) = last_activity_clone.lock() {
+                            *last = Instant::now();
+                        }
+                        let idle_secs = idle_duration.as_secs() as u32;
+                        if let Err(e) = app_clone.emit("activity-detected", idle_secs) {
+                            warn!("[ACTIVITY] Failed to emit activity-detected event: {:?}", e);
+                        }
+                        last_emit_time = now;
+                    }
                 }
 
-                tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
     }

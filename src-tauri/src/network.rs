@@ -1,16 +1,16 @@
-/// Проверка online статуса через легковесный HTTP запрос
+use reqwest::Client;
+use std::time::Duration;
+
+// Проверка online статуса через легковесный HTTP запрос
 pub async fn check_online_status() -> bool {
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
-        .build()
-    {
+    let client = match Client::builder().timeout(Duration::from_secs(2)).build() {
         Ok(client) => client,
         Err(_) => return false,
     };
 
     match client
         .get("https://www.cloudflare.com/cdn-cgi/trace")
-        .timeout(std::time::Duration::from_secs(2))
+        .timeout(Duration::from_secs(2))
         .send()
         .await
     {
@@ -18,7 +18,7 @@ pub async fn check_online_status() -> bool {
         Err(_) => {
             match client
                 .get("https://www.google.com/generate_204")
-                .timeout(std::time::Duration::from_secs(2))
+                .timeout(Duration::from_secs(2))
                 .send()
                 .await
             {
