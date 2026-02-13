@@ -14,6 +14,73 @@ use tauri::{AppHandle, Emitter, Manager, State};
 #[allow(unused_imports)]
 use tracing::{debug, info, warn};
 
+/// Activity detection constants and logic (testable).
+pub(crate) mod activity_emit {
+    use std::time::{Duration, Instant};
+
+    pub const ACTIVITY_THRESHOLD: Duration = Duration::from_secs(5);
+    pub const MIN_EMIT_INTERVAL: Duration = Duration::from_secs(10);
+
+    /// Returns true if we should emit activity-detected: idle < threshold and enough time since last emit.
+    pub fn should_emit(idle_duration: Duration, last_emit_time: Instant) -> bool {
+        idle_duration < ACTIVITY_THRESHOLD && Instant::now().duration_since(last_emit_time) >= MIN_EMIT_INTERVAL
+    }
+}
+
+#[cfg(test)]
+mod activity_emit_tests {
+    use super::activity_emit::{should_emit, ACTIVITY_THRESHOLD, MIN_EMIT_INTERVAL};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn test_should_emit_idle_below_threshold_after_interval() {
+        let last_emit = Instant::now() - MIN_EMIT_INTERVAL - Duration::from_secs(1);
+        assert!(should_emit(Duration::from_secs(2), last_emit));
+        assert!(should_emit(Duration::from_secs(0), last_emit));
+    }
+
+    #[test]
+    fn test_should_not_emit_idle_above_threshold() {
+        let last_emit = Instant::now() - MIN_EMIT_INTERVAL - Duration::from_secs(1);
+        assert!(!should_emit(Duration::from_secs(5), last_emit));
+        assert!(!should_emit(Duration::from_secs(10), last_emit));
+    }
+
+    #[test]
+    fn test_should_not_emit_before_min_interval() {
+        let last_emit = Instant::now() - Duration::from_secs(5);
+        assert!(!should_emit(Duration::from_secs(2), last_emit));
+    }
+
+    #[test]
+    fn test_threshold_boundary() {
+        let last_emit = Instant::now() - MIN_EMIT_INTERVAL - Duration::from_secs(1);
+        // 4s < 5s — активность, emit
+        assert!(should_emit(Duration::from_secs(4), last_emit));
+        // 5s >= 5s — порог, не emit
+        assert!(!should_emit(Duration::from_secs(5), last_emit));
+        // 4.999s < 5s — emit
+        assert!(should_emit(Duration::from_millis(4999), last_emit));
+    }
+
+    #[test]
+    fn test_interval_boundary() {
+        let idle = Duration::from_secs(2);
+        // 9s с прошлого emit — ещё рано
+        let last_emit_9s = Instant::now() - Duration::from_secs(9);
+        assert!(!should_emit(idle, last_emit_9s));
+        // 10s — можно emit
+        let last_emit_10s = Instant::now() - MIN_EMIT_INTERVAL;
+        assert!(should_emit(idle, last_emit_10s));
+    }
+
+    #[test]
+    fn test_constants() {
+        assert_eq!(ACTIVITY_THRESHOLD, Duration::from_secs(5));
+        assert_eq!(MIN_EMIT_INTERVAL, Duration::from_secs(10));
+    }
+}
+
 #[tauri::command]
 pub async fn start_activity_monitoring(
     monitor: State<'_, ActivityMonitor>,
@@ -52,17 +119,9 @@ pub async fn start_activity_monitoring(
 
         // Use system idle time instead of mouse position — more reliable, no false positives
         // when user is away (NSEvent.mouseLocation could drift due to Retina scaling, etc.)
-        // Emit only when idle < 5s — user just moved mouse/keyboard; reduces false positives
-        let activity_threshold = Duration::from_secs(5);
-        let min_emit_interval = Duration::from_secs(10);
-        let display_wake_jump = Duration::from_secs(60); // Previous idle >= 60s, now < 5s = display wake
-        let display_wake_cooldown = Duration::from_secs(30); // Don't emit for 30s after suspected wake
-
         tokio::spawn(async move {
             use tauri::Emitter;
             let mut last_emit_time = Instant::now();
-            let mut prev_idle: Option<std::time::Duration> = None;
-            let mut display_wake_until: Option<Instant> = None;
 
             loop {
                 {
@@ -87,34 +146,16 @@ pub async fn start_activity_monitoring(
                     continue;
                 };
 
-                let is_display_wake_jump = prev_idle
-                    .is_some_and(|p| p >= display_wake_jump && idle_duration < activity_threshold);
-                prev_idle = Some(idle_duration);
-
-                if is_display_wake_jump {
-                    display_wake_until = Some(Instant::now() + display_wake_cooldown);
-                }
-                let in_cooldown = match display_wake_until {
-                    Some(t) if Instant::now() < t => true,
-                    Some(_) => {
-                        display_wake_until = None;
-                        false
-                    }
-                    None => false,
-                };
-
-                if idle_duration < activity_threshold && !is_display_wake_jump && !in_cooldown {
+                if activity_emit::should_emit(idle_duration, last_emit_time) {
                     let now = Instant::now();
-                    if now.duration_since(last_emit_time) >= min_emit_interval {
-                        if let Ok(mut last) = last_activity_clone.lock() {
-                            *last = Instant::now();
-                        }
-                        let idle_secs = idle_duration.as_secs() as u32;
-                        if let Err(e) = app_clone.emit("activity-detected", idle_secs) {
-                            warn!("[ACTIVITY] Failed to emit activity-detected event: {:?}", e);
-                        }
-                        last_emit_time = now;
+                    if let Ok(mut last) = last_activity_clone.lock() {
+                        *last = Instant::now();
                     }
+                    let idle_secs = idle_duration.as_secs() as u32;
+                    if let Err(e) = app_clone.emit("activity-detected", idle_secs) {
+                        warn!("[ACTIVITY] Failed to emit activity-detected event: {:?}", e);
+                    }
+                    last_emit_time = now;
                 }
 
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -131,16 +172,9 @@ pub async fn start_activity_monitoring(
         let last_activity_clone = last_activity.clone();
         let app_clone = app.clone();
 
-        let activity_threshold = Duration::from_secs(5);
-        let min_emit_interval = Duration::from_secs(10);
-        let display_wake_jump = Duration::from_secs(60);
-        let display_wake_cooldown = Duration::from_secs(30);
-
         tokio::spawn(async move {
             use tauri::Emitter;
             let mut last_emit_time = Instant::now();
-            let mut prev_idle: Option<std::time::Duration> = None;
-            let mut display_wake_until: Option<Instant> = None;
 
             loop {
                 {
@@ -165,34 +199,16 @@ pub async fn start_activity_monitoring(
                     continue;
                 };
 
-                let is_display_wake_jump = prev_idle
-                    .is_some_and(|p| p >= display_wake_jump && idle_duration < activity_threshold);
-                prev_idle = Some(idle_duration);
-
-                if is_display_wake_jump {
-                    display_wake_until = Some(Instant::now() + display_wake_cooldown);
-                }
-                let in_cooldown = match display_wake_until {
-                    Some(t) if Instant::now() < t => true,
-                    Some(_) => {
-                        display_wake_until = None;
-                        false
-                    }
-                    None => false,
-                };
-
-                if idle_duration < activity_threshold && !is_display_wake_jump && !in_cooldown {
+                if activity_emit::should_emit(idle_duration, last_emit_time) {
                     let now = Instant::now();
-                    if now.duration_since(last_emit_time) >= min_emit_interval {
-                        if let Ok(mut last) = last_activity_clone.lock() {
-                            *last = Instant::now();
-                        }
-                        let idle_secs = idle_duration.as_secs() as u32;
-                        if let Err(e) = app_clone.emit("activity-detected", idle_secs) {
-                            warn!("[ACTIVITY] Failed to emit activity-detected event: {:?}", e);
-                        }
-                        last_emit_time = now;
+                    if let Ok(mut last) = last_activity_clone.lock() {
+                        *last = Instant::now();
                     }
+                    let idle_secs = idle_duration.as_secs() as u32;
+                    if let Err(e) = app_clone.emit("activity-detected", idle_secs) {
+                        warn!("[ACTIVITY] Failed to emit activity-detected event: {:?}", e);
+                    }
+                    last_emit_time = now;
                 }
 
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -210,16 +226,9 @@ pub async fn start_activity_monitoring(
         let last_activity_clone = last_activity.clone();
         let app_clone = app.clone();
 
-        let activity_threshold = Duration::from_secs(5);
-        let min_emit_interval = Duration::from_secs(10);
-        let display_wake_jump = Duration::from_secs(60);
-        let display_wake_cooldown = Duration::from_secs(30);
-
         tokio::spawn(async move {
             use tauri::Emitter;
             let mut last_emit_time = Instant::now();
-            let mut prev_idle: Option<std::time::Duration> = None;
-            let mut display_wake_until: Option<Instant> = None;
 
             loop {
                 {
@@ -244,34 +253,16 @@ pub async fn start_activity_monitoring(
                     continue;
                 };
 
-                let is_display_wake_jump = prev_idle
-                    .is_some_and(|p| p >= display_wake_jump && idle_duration < activity_threshold);
-                prev_idle = Some(idle_duration);
-
-                if is_display_wake_jump {
-                    display_wake_until = Some(Instant::now() + display_wake_cooldown);
-                }
-                let in_cooldown = match display_wake_until {
-                    Some(t) if Instant::now() < t => true,
-                    Some(_) => {
-                        display_wake_until = None;
-                        false
-                    }
-                    None => false,
-                };
-
-                if idle_duration < activity_threshold && !is_display_wake_jump && !in_cooldown {
+                if activity_emit::should_emit(idle_duration, last_emit_time) {
                     let now = Instant::now();
-                    if now.duration_since(last_emit_time) >= min_emit_interval {
-                        if let Ok(mut last) = last_activity_clone.lock() {
-                            *last = Instant::now();
-                        }
-                        let idle_secs = idle_duration.as_secs() as u32;
-                        if let Err(e) = app_clone.emit("activity-detected", idle_secs) {
-                            warn!("[ACTIVITY] Failed to emit activity-detected event: {:?}", e);
-                        }
-                        last_emit_time = now;
+                    if let Ok(mut last) = last_activity_clone.lock() {
+                        *last = Instant::now();
                     }
+                    let idle_secs = idle_duration.as_secs() as u32;
+                    if let Err(e) = app_clone.emit("activity-detected", idle_secs) {
+                        warn!("[ACTIVITY] Failed to emit activity-detected event: {:?}", e);
+                    }
+                    last_emit_time = now;
                 }
 
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -1039,6 +1030,17 @@ pub async fn pause_timer(
     engine: State<'_, Arc<TimerEngine>>,
 ) -> Result<TimerStateResponse, String> {
     engine.pause()?;
+    engine.get_state()
+}
+
+/// Пауза при idle — исключаем время простоя из accumulated
+/// work_elapsed_secs = (lastActivityTime/1000) - session_start
+#[tauri::command]
+pub async fn pause_timer_idle(
+    work_elapsed_secs: u64,
+    engine: State<'_, Arc<TimerEngine>>,
+) -> Result<TimerStateResponse, String> {
+    engine.pause_with_work_elapsed(work_elapsed_secs)?;
     engine.get_state()
 }
 
