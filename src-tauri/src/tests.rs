@@ -191,6 +191,52 @@ mod tests {
         }
     }
 
+    // Тесты для stop_activity_monitoring (start_activity_monitoring требует AppHandle,
+    // который MockRuntime не поддерживает — см. tauri-apps/tauri#12077)
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    mod activity_monitoring_tests {
+        use super::*;
+        use tauri::Manager;
+        use tauri::webview::InvokeRequest;
+        use tauri::ipc::{CallbackFn, InvokeBody};
+
+        fn create_activity_monitor_app() -> tauri::App<tauri::test::MockRuntime> {
+            tauri::test::mock_builder()
+                .manage(ActivityMonitor::new())
+                .invoke_handler(tauri::generate_handler![stop_activity_monitoring])
+                .build(tauri::test::mock_context(tauri::test::noop_assets()))
+                .unwrap()
+        }
+
+        #[test]
+        fn test_stop_activity_monitoring_sets_monitoring_false() {
+            let app = create_activity_monitor_app();
+            let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+                .build()
+                .unwrap();
+
+            // Вручную выставляем is_monitoring=true (имитация после start)
+            *app.state::<ActivityMonitor>().is_monitoring.lock().unwrap() = true;
+            assert!(*app.state::<ActivityMonitor>().is_monitoring.lock().unwrap());
+
+            // stop устанавливает is_monitoring=false
+            let stop_res = tauri::test::get_ipc_response(
+                &webview,
+                InvokeRequest {
+                    cmd: "stop_activity_monitoring".into(),
+                    callback: CallbackFn(0),
+                    error: CallbackFn(1),
+                    url: "http://tauri.localhost".parse().unwrap(),
+                    body: InvokeBody::default(),
+                    headers: Default::default(),
+                    invoke_key: tauri::test::INVOKE_KEY.to_string(),
+                },
+            );
+            assert!(stop_res.is_ok());
+            assert!(!*app.state::<ActivityMonitor>().is_monitoring.lock().unwrap());
+        }
+    }
+
     // Тесты для TimerEngine
     #[cfg(test)]
     mod timer_engine_tests {
@@ -381,6 +427,20 @@ mod tests {
 
             let state_after = engine.get_state().unwrap();
             assert!(state_after.accumulated_seconds >= elapsed_before);
+        }
+
+        #[test]
+        fn test_pause_with_work_elapsed_excludes_idle_time() {
+            // Idle pause: добавляем только work_elapsed, не полную сессию
+            let engine = TimerEngine::new();
+            engine.start().unwrap();
+            thread::sleep(Duration::from_secs(2)); // 2s реально прошло (monotonic_elapsed >= 1)
+
+            engine.pause_with_work_elapsed(1).unwrap(); // work_elapsed = 1s (имитация lastActivity 1s назад)
+
+            let state = engine.get_state().unwrap();
+            assert!(matches!(state.state, engine::TimerStateForAPI::Paused));
+            assert_eq!(state.accumulated_seconds, 1); // только 1s, не 2s idle
         }
 
         #[test]
