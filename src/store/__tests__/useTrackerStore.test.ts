@@ -21,6 +21,7 @@ const mockResumeTimeEntry = vi.fn();
 const mockGetActiveTimeEntries = vi.fn();
 const mockStartTimer = vi.fn();
 const mockPauseTimer = vi.fn();
+const mockPauseIdle = vi.fn();
 const mockResumeTimer = vi.fn();
 const mockStopTimer = vi.fn();
 const mockGetTimerState = vi.fn();
@@ -60,6 +61,7 @@ vi.mock('../../lib/timer-engine', () => ({
   TimerEngineAPI: {
     start: (...args: any[]) => mockStartTimer(...args),
     pause: (...args: any[]) => mockPauseTimer(...args),
+    pauseIdle: (...args: any[]) => mockPauseIdle(...args),
     resume: (...args: any[]) => mockResumeTimer(...args),
     stop: (...args: any[]) => mockStopTimer(...args),
     getState: (...args: any[]) => mockGetTimerState(...args),
@@ -274,6 +276,45 @@ describe('useTrackerStore', () => {
       
       await new Promise(r => setTimeout(r, 50));
       expect(mockPauseTimeEntry).toHaveBeenCalled();
+    });
+
+    it('calls pauseIdle (not pause) when isIdlePause=true, excludes idle time from accumulated', async () => {
+      const project = { id: '1', name: 'Test Project', color: '#000000', description: '', clientName: '', budget: 0, status: 'ACTIVE' as const, companyId: '', createdAt: '', updatedAt: '' };
+      useTrackerStore.getState().selectProject(project);
+      await useTrackerStore.getState().startTracking();
+      await new Promise(r => setTimeout(r, 80));
+
+      const currentEntry = useTrackerStore.getState().currentTimeEntry;
+      expect(currentEntry).toBeTruthy();
+
+      const sessionStart = Math.floor(Date.now() / 1000) - 300; // 5 min ago
+      const lastActivityTime = (sessionStart + 180) * 1000; // last active 3 min ago (2 min idle)
+      useTrackerStore.setState({ lastActivityTime });
+
+      const runningState = {
+        state: 'RUNNING' as const,
+        started_at: sessionStart,
+        elapsed_seconds: 300,
+        accumulated_seconds: 0,
+        session_start: sessionStart,
+        day_start: Math.floor(Date.now() / 1000),
+      };
+      mockGetTimerState.mockResolvedValue(runningState); // Multiple getState calls in pauseTracking flow
+      mockPauseIdle.mockResolvedValue({
+        state: 'PAUSED',
+        elapsed_seconds: 180,
+        accumulated_seconds: 180,
+        session_start: null,
+        day_start: Math.floor(Date.now() / 1000),
+      });
+      mockPauseTimeEntry.mockResolvedValue({ ...currentEntry, status: 'PAUSED' });
+
+      await useTrackerStore.getState().pauseTracking(true);
+
+      expect(mockPauseIdle).toHaveBeenCalledWith(180);
+      expect(mockPauseTimer).not.toHaveBeenCalled();
+      const state = useTrackerStore.getState();
+      expect(state.isPaused).toBe(true);
     });
 
     it('handles error when pausing timer engine', async () => {

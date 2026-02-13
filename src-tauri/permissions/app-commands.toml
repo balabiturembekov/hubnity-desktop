@@ -15,6 +15,7 @@ commands.allow = [
   "retry_failed_tasks",
   "start_timer",
   "pause_timer",
+  "pause_timer_idle",
   "resume_timer",
   "stop_timer",
   "get_timer_state",

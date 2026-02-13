@@ -1011,7 +1011,19 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       }
       logger.info('PAUSE', 'Pausing Timer Engine without time entry (no RUNNING entry on server)');
       try {
-        await TimerEngineAPI.pause();
+        if (isIdlePause && timerState?.state === 'RUNNING' && timerState?.session_start != null) {
+          const { lastActivityTime } = get();
+          const workElapsedSecs = Math.max(
+            0,
+            Math.min(
+              Math.floor(lastActivityTime / 1000) - timerState.session_start,
+              (timerState.elapsed_seconds ?? 0) - (timerState.accumulated_seconds ?? 0)
+            )
+          );
+          await TimerEngineAPI.pauseIdle(workElapsedSecs);
+        } else {
+          await TimerEngineAPI.pause();
+        }
         const pausedState = await TimerEngineAPI.getState();
         if (pausedState.state === 'PAUSED') {
           // FIX: Try to load any active entry (PAUSED) so Stop will have ID for queue/API
@@ -1076,7 +1088,19 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           // Timer Engine is still RUNNING but we don't have entry - try to pause anyway
           logger.warn('PAUSE', 'Timer Engine is RUNNING but no entry - attempting pause anyway');
           try {
-            await TimerEngineAPI.pause();
+            if (isIdlePause && finalTimerState.state === 'RUNNING' && finalTimerState.session_start != null) {
+              const { lastActivityTime } = get();
+              const workElapsedSecs = Math.max(
+                0,
+                Math.min(
+                  Math.floor(lastActivityTime / 1000) - finalTimerState.session_start,
+                  (finalTimerState.elapsed_seconds ?? 0) - (finalTimerState.accumulated_seconds ?? 0)
+                )
+              );
+              await TimerEngineAPI.pauseIdle(workElapsedSecs);
+            } else {
+              await TimerEngineAPI.pause();
+            }
             const pausedState = await TimerEngineAPI.getState();
             set({
               isPaused: pausedState.state === 'PAUSED',
@@ -1124,9 +1148,28 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       
       // OPTIMISTIC: Сначала паузим Timer Engine (локально) и сразу обновляем UI
       // Как в Hubstaff — UI реагирует мгновенно, API в фоне
+      // Idle: исключаем время простоя — используем lastActivityTime вместо now
       let timerState: import('../lib/timer-engine').TimerStateResponse | null = null;
       try {
-        timerState = await TimerEngineAPI.pause();
+        if (isIdlePause) {
+          const { lastActivityTime } = get();
+          const preState = await TimerEngineAPI.getState();
+          if (preState.state === 'RUNNING' && preState.session_start != null) {
+            const sessionStart = preState.session_start;
+            const workElapsedSecs = Math.max(
+              0,
+              Math.min(
+                Math.floor(lastActivityTime / 1000) - sessionStart,
+                preState.elapsed_seconds - preState.accumulated_seconds
+              )
+            );
+            timerState = await TimerEngineAPI.pauseIdle(workElapsedSecs);
+          } else {
+            timerState = await TimerEngineAPI.pause();
+          }
+        } else {
+          timerState = await TimerEngineAPI.pause();
+        }
       } catch (timerError: any) {
         if (timerError.message?.includes('already paused') || 
             timerError.message?.includes('stopped') ||

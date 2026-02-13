@@ -153,6 +153,16 @@ impl TimerEngine {
     /// Переход: Running → Paused
     /// Сохраняет время сессии в accumulated
     pub fn pause(&self) -> Result<(), String> {
+        self.pause_internal(None)
+    }
+
+    /// Переход: Running → Paused при idle (исключаем время простоя)
+    /// work_elapsed_secs — реальное время работы до lastActivityTime (без 2 мин простоя)
+    pub fn pause_with_work_elapsed(&self, work_elapsed_secs: u64) -> Result<(), String> {
+        self.pause_internal(Some(work_elapsed_secs))
+    }
+
+    fn pause_internal(&self, work_elapsed_override: Option<u64>) -> Result<(), String> {
         // Проверяем смену дня перед любыми операциями
         self.ensure_correct_day()?;
 
@@ -167,7 +177,15 @@ impl TimerEngine {
             } => {
                 // Допустимый переход: Running → Paused
                 let now = Instant::now();
-                let session_elapsed = now.duration_since(*started_at_instant).as_secs();
+                let monotonic_elapsed = now.duration_since(*started_at_instant).as_secs();
+                let session_elapsed = match work_elapsed_override {
+                    Some(work) => {
+                        // Idle pause: используем только время до lastActivityTime
+                        // Clamp: не больше полной сессии, не меньше 0
+                        work.min(monotonic_elapsed)
+                    }
+                    None => monotonic_elapsed,
+                };
 
                 // CRITICAL FIX: Вычисляем новый accumulated БЕЗ обновления в памяти
                 // Это позволяет сохранить атомарность: либо обновляем и сохраняем, либо ничего

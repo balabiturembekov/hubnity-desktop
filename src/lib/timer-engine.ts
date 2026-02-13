@@ -60,6 +60,16 @@ export class TimerEngineAPI {
   }
 
   /**
+   * Пауза при idle — исключаем время простоя из accumulated
+   * workElapsedSecs = время работы до lastActivityTime (без минут простоя)
+   */
+  static async pauseIdle(workElapsedSecs: number): Promise<TimerStateResponse> {
+    return await invoke<TimerStateResponse>('pause_timer_idle', {
+      workElapsedSecs,
+    });
+  }
+
+  /**
    * Возобновить трекинг (из состояния PAUSED)
    */
   static async resume(): Promise<TimerStateResponse> {
