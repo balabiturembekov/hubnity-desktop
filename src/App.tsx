@@ -74,7 +74,7 @@ function App() {
       .catch(error => {
         logger.debug('APP', 'Failed to get app version', error);
         // Fallback to package.json version if available
-        setAppVersion('0.1.13'); // Fallback version
+        setAppVersion('0.1.14'); // Fallback version
       });
   }, []);
 
@@ -266,6 +266,7 @@ function App() {
             new Date(b.startTime).getTime() - new Date(a.startTime).getTime()
           );
           const activeEntry = sortedEntries[0];
+          if (!activeEntry) return;
           const { currentTimeEntry: currentEntry, loadActiveTimeEntry } = useTrackerStore.getState();
           
           // Если нет currentTimeEntry, но таймер работает — пробуем загрузить с сервера
@@ -294,14 +295,14 @@ function App() {
             if (currentStoreState.isPaused || timerState.state === 'PAUSED') {
               logger.info('APP', 'Syncing timer: server is RUNNING, resuming local timer');
               const { resumeTracking } = useTrackerStore.getState();
-              await resumeTracking().catch((e) => {
+              await resumeTracking(undefined, true).catch((e) => {
                 logger.warn('APP', 'Failed to resume timer on sync', e);
               });
             } else if (timerState.state === 'STOPPED') {
               // Timer is stopped, need to start instead of resume
               logger.info('APP', 'Syncing timer: server is RUNNING, starting local timer');
               const { startTracking } = useTrackerStore.getState();
-              await startTracking().catch((e) => {
+              await startTracking(undefined, true).catch((e) => {
                 logger.warn('APP', 'Failed to start timer on sync', e);
               });
             }
@@ -630,6 +631,23 @@ function App() {
     let isCleanedUp = false;
     const unlistenRef = { current: null as (() => void) | null };
 
+    // FIX: DOM fallback for lastActivityTime — macOS HIDIdleTime can fail to reset on keyboard-only
+    // (Karabiner-Elements issue #385). Detect mousemove/keydown/etc in app window.
+    const DOM_THROTTLE_MS = 5000;
+    let lastDomUpdate = 0;
+    const onDomActivity = () => {
+      if (isCleanedUp) return;
+      const now = Date.now();
+      if (now - lastDomUpdate >= DOM_THROTTLE_MS) {
+        lastDomUpdate = now;
+        useTrackerStore.getState().updateActivityTime();
+      }
+    };
+    const domEvents = ['mousemove', 'keydown', 'mousedown', 'click', 'touchstart', 'scroll'] as const;
+    for (const ev of domEvents) {
+      window.addEventListener(ev, onDomActivity);
+    }
+
     // FIX: Create intervals synchronously so cleanup can clear them (prevents leak on unmount before async)
     const idleCheckInterval = setInterval(() => {
       if (!isCleanedUp) {
@@ -654,12 +672,12 @@ function App() {
 
     (async () => {
       try {
-        const unlisten = await listen('activity-detected', () => {
+        const unlisten = await listen<number>('activity-detected', (ev) => {
           if (isCleanedUp) return;
           logger.safeLogToRust('[ACTIVITY] Event received from Rust').catch((e) => {
             logger.debug('ACTIVITY', 'Failed to log (non-critical)', e);
           });
-          useTrackerStore.getState().updateActivityTime();
+          useTrackerStore.getState().updateActivityTime(ev.payload);
         });
         unlistenRef.current = unlisten;
         if (isCleanedUp) unlisten();
@@ -671,6 +689,9 @@ function App() {
 
     return () => {
       isCleanedUp = true;
+      for (const ev of domEvents) {
+        window.removeEventListener(ev, onDomActivity);
+      }
       clearInterval(idleCheckInterval);
       clearInterval(heartbeatInterval);
       unlistenRef.current?.();
