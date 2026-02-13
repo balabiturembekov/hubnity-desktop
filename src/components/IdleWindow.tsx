@@ -17,6 +17,7 @@ export function IdleWindow() {
   const [idleTime, setIdleTime] = useState(0);
   const [isLoading, setIsLoading] = useState(false);
   const [idlePauseStartTime, setIdlePauseStartTime] = useState<number | null>(null);
+  const [lastActivityTime, setLastActivityTime] = useState<number | null>(null);
   
   // BUG FIX: Track component mount state to prevent setState after unmount
   const isMountedRef = useRef(true);
@@ -46,11 +47,11 @@ export function IdleWindow() {
     
     const MAX_IDLE_SECONDS = 24 * 60 * 60; // 24 hours = 86400 seconds
     
-    const updateState = (pauseTime: number | null, loading: boolean) => {
+    const updateState = (pauseTime: number | null, loading: boolean, lastActivity: number | null) => {
       // BUG FIX: Check if component is still mounted before updating state
       if (!isMounted) return;
       
-      logger.debug('IDLE_WINDOW', 'Updating state', { pauseTime, isLoading: loading, pauseTimeType: typeof pauseTime });
+      logger.debug('IDLE_WINDOW', 'Updating state', { pauseTime, lastActivity, isLoading: loading, pauseTimeType: typeof pauseTime });
       
       // Validate pauseTime before setting
       let validPauseTime: number | null = null;
@@ -64,26 +65,37 @@ export function IdleWindow() {
         }
       }
       
+      // Validate lastActivityTime for total idle display (Hubstaff-style)
+      let validLastActivity: number | null = null;
+      if (lastActivity !== null && lastActivity !== undefined) {
+        const numValue = Number(lastActivity);
+        if (!isNaN(numValue) && numValue > 0 && isFinite(numValue)) {
+          validLastActivity = numValue;
+        }
+      }
+      
       // Check again before setState
       if (!isMounted) return;
       
       setIdlePauseStartTime(validPauseTime);
+      setLastActivityTime(validLastActivity);
       // Only set isLoading if it's actually a loading operation (not from screenshots)
       // Screenshots should not block buttons
       setIsLoading(loading);
       
-      // Calculate initial time if we have pause start time
-      if (validPauseTime !== null && validPauseTime > 0) {
+      // Calculate initial time: prefer lastActivityTime (total idle) over idlePauseStartTime (window open time)
+      const baseTime = validLastActivity ?? validPauseTime;
+      if (baseTime !== null && baseTime > 0) {
         const now = Date.now();
-        const idleSeconds = Math.floor((now - validPauseTime) / 1000);
+        const idleSeconds = Math.floor((now - baseTime) / 1000);
         // Validate: ensure no NaN or negative values
         const validIdleSeconds = isNaN(idleSeconds) ? 0 : Math.max(0, idleSeconds);
         // Reset to 0 after 24 hours
         const displaySeconds = validIdleSeconds >= MAX_IDLE_SECONDS ? 0 : validIdleSeconds;
-        logger.debug('IDLE_WINDOW', `Calculated initial idle time: ${idleSeconds}s, displaying: ${displaySeconds}s (max 24h)`);
+        logger.debug('IDLE_WINDOW', `Calculated initial idle time: ${idleSeconds}s (base: ${validLastActivity ? 'lastActivity' : 'pauseStart'}), displaying: ${displaySeconds}s (max 24h)`);
         setIdleTime(displaySeconds);
       } else {
-        logger.debug('IDLE_WINDOW', 'No valid pause time, resetting idle time to 0');
+        logger.debug('IDLE_WINDOW', 'No valid base time, resetting idle time to 0');
         setIdleTime(0);
       }
     };
@@ -92,8 +104,8 @@ export function IdleWindow() {
       try {
         logger.debug('IDLE_WINDOW', 'Setting up idle-state-update listener...');
         
-        // Listen for state updates (pause start time, loading state)
-        const unlistenStateFn = await listen<{ idlePauseStartTime: number | null; isLoading: boolean }>('idle-state-update', (event) => {
+        // Listen for state updates (pause start time, last activity time, loading state)
+        const unlistenStateFn = await listen<{ idlePauseStartTime: number | null; lastActivityTime?: number | null; isLoading: boolean }>('idle-state-update', (event) => {
           logger.debug('IDLE_WINDOW', 'State update received', event.payload);
           
           // Handle null values correctly
@@ -110,7 +122,16 @@ export function IdleWindow() {
             }
           }
           
-          updateState(pauseTime, event.payload.isLoading);
+          let lastActivity: number | null = null;
+          const rawLastActivity = event.payload.lastActivityTime;
+          if (rawLastActivity !== null && rawLastActivity !== undefined) {
+            const numValue = Number(rawLastActivity);
+            if (!isNaN(numValue) && numValue > 0 && isFinite(numValue)) {
+              lastActivity = numValue;
+            }
+          }
+          
+          updateState(pauseTime, event.payload.isLoading, lastActivity);
         });
         
         // FIX: If unmounted while listen() was pending, clean up immediately
@@ -158,12 +179,13 @@ export function IdleWindow() {
     };
   }, []);
 
-  // Local timer that updates every second if we have pause start time
+  // Local timer that updates every second; use lastActivityTime (total idle) when available, else idlePauseStartTime
   // Timer resets to 0 after 24 hours (86400 seconds)
+  const baseTime = lastActivityTime ?? idlePauseStartTime;
   useEffect(() => {
     let isMounted = true;
     
-    if (idlePauseStartTime !== null && idlePauseStartTime > 0 && !isNaN(idlePauseStartTime) && isFinite(idlePauseStartTime)) {
+    if (baseTime !== null && baseTime > 0 && !isNaN(baseTime) && isFinite(baseTime)) {
       const MAX_IDLE_SECONDS = 24 * 60 * 60; // 24 hours = 86400 seconds
       
       const updateTime = () => {
@@ -171,7 +193,7 @@ export function IdleWindow() {
         if (!isMounted) return;
         
         const now = Date.now();
-        const idleSeconds = Math.floor((now - idlePauseStartTime) / 1000);
+        const idleSeconds = Math.floor((now - baseTime) / 1000);
         
         // Validate: ensure no NaN or negative values
         const validIdleSeconds = isNaN(idleSeconds) ? 0 : Math.max(0, idleSeconds);
@@ -199,7 +221,7 @@ export function IdleWindow() {
         isMounted = false;
       };
     }
-  }, [idlePauseStartTime]);
+  }, [baseTime]);
   
   const handleResume = async () => {
     if (isLoading) return;

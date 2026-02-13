@@ -1349,7 +1349,7 @@ function App() {
         const unlisten = await listen('request-idle-state-for-idle-window', async () => {
           logger.debug('APP', '🔔 Idle window requested current state');
           const state = useTrackerStore.getState();
-          const { idlePauseStartTime, isLoading } = state;
+          const { idlePauseStartTime, isLoading, lastActivityTime } = state;
           
           logger.debug('APP', '📊 Current state from store', { 
             idlePauseStartTime, 
@@ -1377,9 +1377,11 @@ function App() {
               isNull: pauseTimeForRust === null
             });
             
+            const lastActivityForRust = lastActivityTime && lastActivityTime > 0 ? Number(lastActivityTime) : null;
             await invoke('update_idle_state', {
               idlePauseStartTime: pauseTimeForRust,
               isLoading: isLoading,
+              lastActivityTime: lastActivityForRust,
             });
             logger.debug('APP', '✅ State sent to idle window successfully');
           } catch (error) {
@@ -1424,7 +1426,7 @@ function App() {
   // This prevents stale closures where subscribe callback uses old version of sendStateUpdate
   const sendStateUpdate = useCallback(async () => {
     // Get fresh state each time
-    const { idlePauseStartTime, isLoading, isTakingScreenshot } = useTrackerStore.getState();
+    const { idlePauseStartTime, isLoading, isTakingScreenshot, lastActivityTime } = useTrackerStore.getState();
     // Don't block idle window buttons during screenshots
     // Only send isLoading=true if it's actually a loading operation, not a screenshot
     const effectiveIsLoading = isLoading && !isTakingScreenshot;
@@ -1447,9 +1449,11 @@ function App() {
         type: typeof pauseTimeForRust 
       });
       
+      const lastActivityForRust = lastActivityTime && lastActivityTime > 0 ? Number(lastActivityTime) : null;
       await invoke('update_idle_state', {
         idlePauseStartTime: pauseTimeForRust,
         isLoading: effectiveIsLoading, // Don't block buttons during screenshots
+        lastActivityTime: lastActivityForRust,
       });
       logger.debug('APP', 'State update sent successfully');
     } catch (error) {

@@ -34,6 +34,7 @@ export function Timer() {
     error,
     isTakingScreenshot,
     idlePauseStartTime,
+    lastActivityTime,
   } = useTrackerStore();
   const isOnline = useSyncStore((s) => s.status?.is_online ?? true);
 
@@ -159,17 +160,18 @@ export function Timer() {
     };
   }, [timerState?.day_start]);
 
-  // Обновление idle time
+  // Обновление idle time — используем lastActivityTime (общее время простоя) когда есть, иначе idlePauseStartTime
+  const idleBaseTime = lastActivityTime ?? idlePauseStartTime;
   useEffect(() => {
     let isMounted = true;
     
-    if (timerState?.state === 'PAUSED' && idlePauseStartTime) {
+    if (timerState?.state === 'PAUSED' && idleBaseTime) {
       const updateIdleTime = () => {
         // BUG FIX: Check if component is still mounted before updating state
         if (!isMounted) return;
         
         const now = Date.now();
-        const idleSeconds = Math.floor((now - idlePauseStartTime) / 1000);
+        const idleSeconds = Math.floor((now - idleBaseTime) / 1000);
         const validIdleSeconds = isNaN(idleSeconds) ? 0 : Math.max(0, idleSeconds);
         setIdleTime(validIdleSeconds);
       };
@@ -186,7 +188,7 @@ export function Timer() {
         isMounted = false;
       };
     }
-  }, [timerState?.state, idlePauseStartTime]);
+  }, [timerState?.state, idleBaseTime]);
 
   // BUG FIX: Track component mount state to prevent setState after unmount
   const isMountedRef = useRef(true);

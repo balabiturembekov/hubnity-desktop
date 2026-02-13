@@ -2126,9 +2126,11 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
               logger.debug('IDLE_CHECK', 'Failed to log (non-critical)', e);
             });
             
+            const lastActivityForRust = stateAfterPause.lastActivityTime && stateAfterPause.lastActivityTime > 0 ? Number(stateAfterPause.lastActivityTime) : null;
             invoke('update_idle_state', {
               idlePauseStartTime: pauseTimeForRust,
               isLoading: false,
+              lastActivityTime: lastActivityForRust,
             }).catch(async (err) => {
               logger.warn('IDLE_CHECK', 'Failed to send state update to idle window', err);
               await logger.safeLogToRust(`[IDLE CHECK] Failed to send state update: ${err}`).catch((e) => {
@@ -2160,6 +2162,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
             const timerState = await TimerEngineAPI.getState();
             if (timerState.state === 'PAUSED') {
               const pauseStartTime = Date.now();
+              const storeState = get();
               set({
                 isPaused: true,
                 isTracking: true,
@@ -2167,7 +2170,8 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
               });
               await invoke('show_idle_window');
               await new Promise(resolve => setTimeout(resolve, 1000));
-              invoke('update_idle_state', { idlePauseStartTime: pauseStartTime, isLoading: false }).catch(() => {});
+              const lastActivityForRust = storeState.lastActivityTime && storeState.lastActivityTime > 0 ? Number(storeState.lastActivityTime) : null;
+              invoke('update_idle_state', { idlePauseStartTime: pauseStartTime, isLoading: false, lastActivityTime: lastActivityForRust }).catch(() => {});
               await invoke('show_notification', {
                 title: 'Tracker paused',
                 body: `No activity for more than ${idleThreshold} minutes`,
