@@ -1929,6 +1929,12 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
   // updateElapsedTime УДАЛЕН - время теперь считается в Rust Timer Engine
 
   updateActivityTime: (idleSecs?: number) => {
+    // FIX: Don't update lastActivityTime when idle window is shown — user moving mouse
+    // in idle window would reset displayed idle time to 0 (Hubstaff shows total idle, not window-open time)
+    const { idlePauseStartTime } = get();
+    if (idlePauseStartTime !== null && idlePauseStartTime > 0) {
+      return;
+    }
     const now = Date.now();
     // If Rust passes idle_secs, lastActivity was actually (now - idleSecs) ago
     const lastActivity = idleSecs != null ? now - idleSecs * 1000 : now;
