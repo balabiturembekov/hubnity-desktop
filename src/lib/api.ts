@@ -148,6 +148,8 @@ class ApiClient {
       timeout: 30000, // 30 second timeout for all requests (can be overridden per request)
       maxContentLength: Infinity,
       maxBodyLength: Infinity,
+      // Use fetch adapter so tauri-plugin-cors-fetch can proxy requests (bypass CORS in Tauri webview)
+      adapter: 'fetch',
     });
 
     // Load token from storage

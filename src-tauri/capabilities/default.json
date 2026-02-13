@@ -9,6 +9,7 @@
     "notification:default",
     "app-commands",
     "updater:default",
-    "process:allow-restart"
+    "process:allow-restart",
+    "cors-fetch:default"
   ]
 }

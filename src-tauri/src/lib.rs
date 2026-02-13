@@ -63,11 +63,13 @@ pub fn run() {
 
     #[cfg(desktop)]
     let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_cors_fetch::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_process::init());
     #[cfg(not(desktop))]
     let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_cors_fetch::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init());
 
@@ -258,6 +260,7 @@ pub fn run() {
             // Timer Engine commands
             start_timer,
             pause_timer,
+            pause_timer_idle,
             resume_timer,
             stop_timer,
             get_timer_state,
