@@ -5,12 +5,38 @@ import { Button } from './ui/button';
 import { RotateCcw, Square } from 'lucide-react';
 import { logger } from '../lib/logger';
 
-function formatTime(seconds: number): string {
-  const displaySeconds = Math.max(0, seconds);
-  const hours = Math.floor(displaySeconds / 3600);
-  const minutes = Math.floor((displaySeconds % 3600) / 60);
-  const secs = displaySeconds % 60;
-  return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+/**
+ * Hubstaff-style idle time format:
+ * - Under 1 hour: minutes (e.g. "11 minutes")
+ * - 1–24 hours: hours and minutes (e.g. "1 hour 30 minutes")
+ * - Over 24 hours: days and hours (e.g. "2 days 16 hours")
+ * No seconds — less distracting.
+ */
+function formatIdleTime(seconds: number): string {
+  const totalSeconds = Math.max(0, Math.floor(seconds));
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  const totalHours = Math.floor(totalSeconds / 3600);
+  const days = Math.floor(totalSeconds / 86400);
+
+  if (days >= 1) {
+    const remainingHours = Math.floor((totalSeconds % 86400) / 3600);
+    if (remainingHours === 0) {
+      return days === 1 ? '1 day' : `${days} days`;
+    }
+    return days === 1
+      ? `1 day ${remainingHours} ${remainingHours === 1 ? 'hour' : 'hours'}`
+      : `${days} days ${remainingHours} ${remainingHours === 1 ? 'hour' : 'hours'}`;
+  }
+  if (totalHours >= 1) {
+    const remainingMinutes = Math.floor((totalSeconds % 3600) / 60);
+    if (remainingMinutes === 0) {
+      return totalHours === 1 ? '1 hour' : `${totalHours} hours`;
+    }
+    const h = totalHours === 1 ? '1 hour' : `${totalHours} hours`;
+    const m = remainingMinutes === 1 ? '1 minute' : `${remainingMinutes} minutes`;
+    return `${h} ${m}`;
+  }
+  return totalMinutes === 1 ? '1 minute' : `${totalMinutes} minutes`;
 }
 
 export function IdleWindow() {
@@ -18,6 +44,7 @@ export function IdleWindow() {
   const [isLoading, setIsLoading] = useState(false);
   const [idlePauseStartTime, setIdlePauseStartTime] = useState<number | null>(null);
   const [lastActivityTime, setLastActivityTime] = useState<number | null>(null);
+  const [projectName, setProjectName] = useState<string | null>(null);
   
   // BUG FIX: Track component mount state to prevent setState after unmount
   const isMountedRef = useRef(true);
@@ -47,7 +74,7 @@ export function IdleWindow() {
     
     const MAX_IDLE_SECONDS = 24 * 60 * 60; // 24 hours = 86400 seconds
     
-    const updateState = (pauseTime: number | null, loading: boolean, lastActivity: number | null) => {
+    const updateState = (pauseTime: number | null, loading: boolean, lastActivity: number | null, project: string | null) => {
       // BUG FIX: Check if component is still mounted before updating state
       if (!isMounted) return;
       
@@ -79,6 +106,7 @@ export function IdleWindow() {
       
       setIdlePauseStartTime(validPauseTime);
       setLastActivityTime(validLastActivity);
+      setProjectName(project ?? null);
       // Only set isLoading if it's actually a loading operation (not from screenshots)
       // Screenshots should not block buttons
       setIsLoading(loading);
@@ -104,8 +132,8 @@ export function IdleWindow() {
       try {
         logger.debug('IDLE_WINDOW', 'Setting up idle-state-update listener...');
         
-        // Listen for state updates (pause start time, last activity time, loading state)
-        const unlistenStateFn = await listen<{ idlePauseStartTime: number | null; lastActivityTime?: number | null; isLoading: boolean }>('idle-state-update', (event) => {
+        // Listen for state updates (pause start time, last activity time, loading state, project name)
+        const unlistenStateFn = await listen<{ idlePauseStartTime: number | null; lastActivityTime?: number | null; isLoading: boolean; projectName?: string | null }>('idle-state-update', (event) => {
           logger.debug('IDLE_WINDOW', 'State update received', event.payload);
           
           // Handle null values correctly
@@ -131,7 +159,8 @@ export function IdleWindow() {
             }
           }
           
-          updateState(pauseTime, event.payload.isLoading, lastActivity);
+          const project = typeof event.payload.projectName === 'string' ? event.payload.projectName : null;
+          updateState(pauseTime, event.payload.isLoading, lastActivity, project);
         });
         
         // FIX: If unmounted while listen() was pending, clean up immediately
@@ -206,10 +235,10 @@ export function IdleWindow() {
       // Initial update immediately
       updateTime();
       
-      // Update every second
+      // Update every minute — no seconds shown, so no need for 1s tick
       const interval = setInterval(() => {
         updateTime();
-      }, 1000);
+      }, 60_000);
       
       return () => {
         isMounted = false;
@@ -272,22 +301,54 @@ export function IdleWindow() {
   };
 
   return (
-    <div className="h-screen bg-background flex flex-col items-center justify-center px-5 py-6">
-      <div className="flex flex-col items-center space-y-4 mb-6 flex-1 justify-center">
-        <div className="text-5xl font-mono font-bold text-primary tracking-tight leading-none">
-          {formatTime(idleTime)}
+    <div className="h-screen w-screen bg-background flex flex-col items-center justify-center px-6 py-6">
+      {/* Hubstaff-style layout */}
+      <h2 className="text-lg font-semibold text-foreground mb-4">Idle time alert</h2>
+      
+      <div className="w-full max-w-sm rounded-lg bg-muted/50 border border-border p-4 mb-6">
+        <div className="text-xs text-muted-foreground uppercase tracking-wide mb-1">
+          You have been idle for
         </div>
-        <div className="flex flex-col items-center gap-1">
-          <div className="flex items-center gap-1.5 text-xs text-muted-foreground/60">
-            <div className="w-1.5 h-1.5 rounded-full bg-muted-foreground/30" />
-            <span>Paused (no activity)</span>
+        <div className="text-3xl font-bold text-foreground mb-3">
+          {formatIdleTime(idleTime)}
+        </div>
+        <div className="border-t border-border pt-3 flex justify-between items-start gap-4">
+          <div className="space-y-1 text-sm text-muted-foreground">
+            <div>Project: {projectName || '-'}</div>
+            <div>Task: -</div>
           </div>
-          <span className="text-[11px] text-muted-foreground/50">
-            Return to continue tracking
-          </span>
+          <button
+            type="button"
+            className="text-sm text-primary hover:underline shrink-0"
+            onClick={async () => {
+              try {
+                await invoke('show_notification', {
+                  title: 'Reassign time',
+                  body: 'Coming soon',
+                });
+              } catch {}
+            }}
+          >
+            Reassign time
+          </button>
         </div>
       </div>
-      <div className="flex gap-2 w-full max-w-sm pb-2">
+
+      <p className="text-xs text-muted-foreground mb-6 text-center">
+        Idle time is not included in the tracked duration.
+      </p>
+
+      <div className="flex gap-2 w-full max-w-sm">
+        <Button
+          onClick={handleStop}
+          disabled={isLoading}
+          size="default"
+          variant="outline"
+          className="gap-2 flex-1 h-10 text-sm rounded-md"
+        >
+          <Square className="h-4 w-4" />
+          Stop timer
+        </Button>
         <Button
           onClick={handleResume}
           disabled={isLoading}
@@ -296,25 +357,9 @@ export function IdleWindow() {
           className="gap-2 flex-1 h-10 text-sm rounded-md"
         >
           <RotateCcw className="h-4 w-4" />
-          Resume
-        </Button>
-        <Button
-          onClick={handleStop}
-          disabled={isLoading}
-          size="default"
-          variant="outline"
-          className="gap-2 h-10 px-4 text-sm rounded-md"
-        >
-          <Square className="h-4 w-4" />
-          Stop
+          Resume timer
         </Button>
       </div>
-      {import.meta.env.DEV && idlePauseStartTime && (
-        <div className="mt-3 text-[10px] text-muted-foreground/40 font-mono max-w-md break-all text-center">
-          pauseStart: {new Date(idlePauseStartTime).toLocaleTimeString()}, diff:{' '}
-          {Math.floor((Date.now() - idlePauseStartTime) / 1000)}s
-        </div>
-      )}
     </div>
   );
 }

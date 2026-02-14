@@ -2,7 +2,7 @@ import { useEffect, useState, useRef } from 'react';
 import { Button } from './ui/button';
 import { useTrackerStore, type TimerStateResponse } from '../store/useTrackerStore';
 import { useSyncStore } from '../store/useSyncStore';
-import { Play, Pause, Square, RotateCcw, Camera, AlertCircle } from 'lucide-react';
+import { Play, Pause, Square, RotateCcw, Camera, AlertCircle, Coffee } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { logger } from '../lib/logger';
 import { cn } from '../lib/utils';
@@ -26,6 +26,8 @@ export function Timer() {
   const {
     selectedProject,
     currentTimeEntry,
+    isTracking,
+    isPaused,
     startTracking,
     pauseTracking,
     resumeTracking,
@@ -303,43 +305,39 @@ export function Timer() {
     }
   };
 
-  // Определяем состояние и цвета - macOS-style state-based colors
-  const getTimerState = () => {
-    if (!timerState) {
-      return { 
-        state: 'STOPPED' as const, 
-        color: 'text-muted-foreground', 
-        statusText: 'Not started',
-        statusColor: undefined,
-      };
-    }
-    
-    const currentState = timerState.state;
-    if (currentState === 'RUNNING') {
-      return {
-        state: 'RUNNING' as const,
-        color: 'text-timer-running dark:text-timer-running-dark',
-        statusText: 'Tracking',
-        statusColor: 'bg-timer-running dark:bg-timer-running-dark',
-      };
-    }
-    if (currentState === 'PAUSED') {
-      return {
-        state: 'PAUSED' as const,
-        color: 'text-muted-foreground',
-        statusText: idlePauseStartTime ? 'Paused (no activity)' : 'Paused',
-        statusColor: 'bg-muted-foreground/40',
-      };
-    }
-    return {
-      state: 'STOPPED' as const,
-      color: 'text-muted-foreground',
-        statusText: 'Not started',
-      statusColor: undefined,
-    };
-  };
+  // FIX: Use store state as fallback when Timer Engine is STOPPED but we have active entry from server
+  // loadActiveTimeEntry is async — user may see Start before sync completes. Show Resume/Stop if store
+  // has currentTimeEntry with isTracking (server had PAUSED/RUNNING entry).
+  const effectiveState =
+    timerState?.state === 'RUNNING' || timerState?.state === 'PAUSED'
+      ? timerState.state
+      : currentTimeEntry && isTracking
+        ? (isPaused ? 'PAUSED' as const : 'RUNNING' as const)
+        : 'STOPPED';
 
-  const timerStateInfo = getTimerState();
+  // Определяем состояние и цвета - macOS-style state-based colors (используем effectiveState)
+  const timerStateInfo =
+    effectiveState === 'RUNNING'
+      ? {
+          state: 'RUNNING' as const,
+          color: 'text-timer-running dark:text-timer-running-dark',
+          statusText: 'Tracking',
+          statusColor: 'bg-timer-running dark:bg-timer-running-dark' as const,
+        }
+      : effectiveState === 'PAUSED'
+        ? {
+            state: 'PAUSED' as const,
+            color: 'text-muted-foreground',
+            statusText: idlePauseStartTime ? 'Paused (no activity)' : 'Paused',
+            statusColor: 'bg-muted-foreground/40' as const,
+          }
+        : {
+            state: 'STOPPED' as const,
+            color: 'text-muted-foreground',
+            statusText: 'Not started',
+            statusColor: undefined as undefined,
+          };
+
   const elapsedSeconds = timerState?.elapsed_seconds ?? 0;
   const totalTodaySeconds = timerState?.today_seconds ?? elapsedSeconds;
 
@@ -466,7 +464,7 @@ export function Timer() {
       {/* Кнопки управления - macOS-style unified controls */}
       <div className="flex gap-2 justify-center">
         {(() => {
-          if (!timerState || timerState.state === 'STOPPED') {
+          if (effectiveState === 'STOPPED') {
             return (
               <Button
                 onClick={handleStart}
@@ -480,7 +478,7 @@ export function Timer() {
             );
           }
           
-          const currentState = timerState.state;
+          const currentState = effectiveState;
           
           return (
             <>
@@ -521,6 +519,14 @@ export function Timer() {
           );
         })()}
       </div>
+
+      {/* Pause state — encouraging message in free space */}
+      {effectiveState === 'PAUSED' && (
+        <div className="flex flex-col items-center gap-2 pt-20 text-muted-foreground">
+          <Coffee className="h-40 w-40" style={{ color: '#ff9300' }} strokeWidth={2.25} />
+          <span className="text-sm font-medium">Take a break and enjoy a cup of coffee!</span>
+        </div>
+      )}
     </div>
   );
 }

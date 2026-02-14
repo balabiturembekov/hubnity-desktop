@@ -2034,33 +2034,10 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         return; // НЕ продолжаем с паузой, если не можем проверить состояние
       }
       
-      // Also check if time entry is already paused on server
-      const storeState = get();
-      if (storeState.currentTimeEntry?.status === 'PAUSED') {
-        await logger.safeLogToRust(`[IDLE CHECK] Time entry already paused on server, syncing with Timer Engine`).catch((e) => {
-          logger.debug('IDLE_CHECK', 'Failed to log (non-critical)', e);
-        });
-        // Sync with Timer Engine state (source of truth)
-        try {
-          const timerStateForSync = await TimerEngineAPI.getState();
-          set({
-            isPaused: timerStateForSync.state === 'PAUSED',
-            isTracking: timerStateForSync.state === 'PAUSED' || timerStateForSync.state === 'RUNNING',
-            idlePauseStartTime: null, // FIX: Syncing to Timer Engine — not idle
-            ...(timerStateForSync.state === 'STOPPED'
-              ? { currentTimeEntry: null, lastResumeTime: null, localTimerStartTime: null }
-              : {}),
-          });
-          invoke('hide_idle_window').catch(() => {}); // FIX: Ensure idle window hidden when syncing
-        } catch (e) {
-          // BUG FIX: If can't get Timer Engine state, don't assume paused
-          // Server state might be stale, so we should not set isPaused without Timer Engine confirmation
-          logger.warn('IDLE_CHECK', 'Cannot get Timer Engine state, cannot confirm pause status', e);
-          // Don't set isPaused - let syncTimerState handle it later
-          // Setting isPaused: true without Timer Engine confirmation can cause desync
-        }
-        return;
-      }
+      // BUG FIX: Do NOT skip based on currentTimeEntry.status === 'PAUSED'.
+      // Timer Engine is RUNNING (verified above) — we must pause and show idle window.
+      // Store's currentTimeEntry can be stale (e.g. from sync/loadActiveTimeEntry).
+      // Skipping here caused idle window to never appear when user waited 2 min.
       
       // Don't set isLoading here - let pauseTracking manage it
       // This prevents the "Already loading" check from blocking the pause
@@ -2133,10 +2110,12 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
             });
             
             const lastActivityForRust = stateAfterPause.lastActivityTime && stateAfterPause.lastActivityTime > 0 ? Number(stateAfterPause.lastActivityTime) : null;
+            const projectName = stateAfterPause.selectedProject?.name || stateAfterPause.currentTimeEntry?.project?.name || null;
             invoke('update_idle_state', {
               idlePauseStartTime: pauseTimeForRust,
               isLoading: false,
               lastActivityTime: lastActivityForRust,
+              projectName,
             }).catch(async (err) => {
               logger.warn('IDLE_CHECK', 'Failed to send state update to idle window', err);
               await logger.safeLogToRust(`[IDLE CHECK] Failed to send state update: ${err}`).catch((e) => {
@@ -2177,7 +2156,8 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
               await invoke('show_idle_window');
               await new Promise(resolve => setTimeout(resolve, 1000));
               const lastActivityForRust = storeState.lastActivityTime && storeState.lastActivityTime > 0 ? Number(storeState.lastActivityTime) : null;
-              invoke('update_idle_state', { idlePauseStartTime: pauseStartTime, isLoading: false, lastActivityTime: lastActivityForRust }).catch(() => {});
+              const projectName = get().selectedProject?.name || get().currentTimeEntry?.project?.name || null;
+              invoke('update_idle_state', { idlePauseStartTime: pauseStartTime, isLoading: false, lastActivityTime: lastActivityForRust, projectName }).catch(() => {});
               await invoke('show_notification', {
                 title: 'Tracker paused',
                 body: `No activity for more than ${idleThreshold} minutes`,

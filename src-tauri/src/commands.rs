@@ -683,13 +683,14 @@ pub async fn update_idle_state(
     idle_pause_start_time: Option<u64>,
     is_loading: bool,
     last_activity_time: Option<u64>,
+    project_name: Option<String>,
     app: AppHandle,
 ) -> Result<(), String> {
     use tauri::{Emitter, Manager};
 
     debug!(
-        "update_idle_state: idle_pause_start_time={:?}, last_activity_time={:?}, is_loading={}",
-        idle_pause_start_time, last_activity_time, is_loading
+        "update_idle_state: idle_pause_start_time={:?}, last_activity_time={:?}, is_loading={}, project_name={:?}",
+        idle_pause_start_time, last_activity_time, is_loading, project_name
     );
 
     // Convert Option<u64> to number or null for JSON
@@ -701,11 +702,16 @@ pub async fn update_idle_state(
         Some(t) => serde_json::Value::Number(serde_json::Number::from(t)),
         None => serde_json::Value::Null,
     };
+    let project_name_json = match &project_name {
+        Some(n) => serde_json::Value::String(n.clone()),
+        None => serde_json::Value::Null,
+    };
 
     let payload = serde_json::json!({
         "idlePauseStartTime": pause_time_json,
         "lastActivityTime": last_activity_json,
         "isLoading": is_loading,
+        "projectName": project_name_json,
     });
 
     // Emit to idle window if it exists

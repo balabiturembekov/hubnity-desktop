@@ -30,6 +30,8 @@ function App() {
   const isInstallingRef = useRef<boolean>(false);
   const autoInstallTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const [appVersion, setAppVersion] = useState<string | null>(null);
+  const [isCheckingForUpdate, setIsCheckingForUpdate] = useState(false);
+  const [updateCheckResult, setUpdateCheckResult] = useState<'idle' | 'latest' | 'available' | 'error'>('idle');
 
   // Восстанавливаем токены в Rust AuthManager — иначе фоновая синхронизация всегда получает "token not set" и Синхронизировано = 0
   const restoreTokens = useCallback(async () => {
@@ -74,7 +76,7 @@ function App() {
       .catch(error => {
         logger.debug('APP', 'Failed to get app version', error);
         // Fallback to package.json version if available
-        setAppVersion('0.1.14'); // Fallback version
+        setAppVersion('0.1.17'); // Fallback when get_app_version fails
       });
   }, []);
 
@@ -547,11 +549,17 @@ function App() {
     };
   }, []);
 
+  const isCheckingUpdateRef = useRef(false);
   const checkForUpdateManually = useCallback(async () => {
+    if (isCheckingUpdateRef.current) return;
+    isCheckingUpdateRef.current = true;
+    setIsCheckingForUpdate(true);
+    setUpdateCheckResult('idle');
     try {
       const { check } = await import('@tauri-apps/plugin-updater');
       const update = await check();
       if (!update) {
+        setUpdateCheckResult('latest');
         await invoke('show_notification', {
           title: 'Hubnity',
           body: 'You are on the latest version.',
@@ -560,16 +568,24 @@ function App() {
       }
       pendingUpdateRef.current = update;
       setUpdateAvailable({ version: update.version, body: update.body ?? undefined });
+      setUpdateCheckResult('available');
       await invoke('show_notification', {
         title: 'Hubnity',
         body: `New version ${update.version} available.`,
       }).catch(() => {});
     } catch (e) {
       logger.debug('APP', 'Update check failed', e);
+      await logger.safeLogToRust(`[UPDATE] Check failed: ${e instanceof Error ? e.message : String(e)}`).catch(() => {});
+      setUpdateCheckResult('error');
       await invoke('show_notification', {
         title: 'Hubnity',
         body: 'Could not check for updates. Check your internet connection.',
       }).catch(() => {});
+    } finally {
+      isCheckingUpdateRef.current = false;
+      setIsCheckingForUpdate(false);
+      // Clear inline result after 5s so footer stays clean
+      setTimeout(() => setUpdateCheckResult('idle'), 5000);
     }
   }, []);
 
@@ -1349,7 +1365,7 @@ function App() {
         const unlisten = await listen('request-idle-state-for-idle-window', async () => {
           logger.debug('APP', '🔔 Idle window requested current state');
           const state = useTrackerStore.getState();
-          const { idlePauseStartTime, isLoading, lastActivityTime } = state;
+          const { idlePauseStartTime, isLoading, lastActivityTime, selectedProject, currentTimeEntry } = state;
           
           logger.debug('APP', '📊 Current state from store', { 
             idlePauseStartTime, 
@@ -1378,10 +1394,12 @@ function App() {
             });
             
             const lastActivityForRust = lastActivityTime && lastActivityTime > 0 ? Number(lastActivityTime) : null;
+            const projectName = selectedProject?.name || currentTimeEntry?.project?.name || null;
             await invoke('update_idle_state', {
               idlePauseStartTime: pauseTimeForRust,
               isLoading: isLoading,
               lastActivityTime: lastActivityForRust,
+              projectName,
             });
             logger.debug('APP', '✅ State sent to idle window successfully');
           } catch (error) {
@@ -1426,7 +1444,7 @@ function App() {
   // This prevents stale closures where subscribe callback uses old version of sendStateUpdate
   const sendStateUpdate = useCallback(async () => {
     // Get fresh state each time
-    const { idlePauseStartTime, isLoading, isTakingScreenshot, lastActivityTime } = useTrackerStore.getState();
+    const { idlePauseStartTime, isLoading, isTakingScreenshot, lastActivityTime, selectedProject, currentTimeEntry } = useTrackerStore.getState();
     // Don't block idle window buttons during screenshots
     // Only send isLoading=true if it's actually a loading operation, not a screenshot
     const effectiveIsLoading = isLoading && !isTakingScreenshot;
@@ -1450,10 +1468,12 @@ function App() {
       });
       
       const lastActivityForRust = lastActivityTime && lastActivityTime > 0 ? Number(lastActivityTime) : null;
+      const projectName = selectedProject?.name || currentTimeEntry?.project?.name || null;
       await invoke('update_idle_state', {
         idlePauseStartTime: pauseTimeForRust,
         isLoading: effectiveIsLoading, // Don't block buttons during screenshots
         lastActivityTime: lastActivityForRust,
+        projectName,
       });
       logger.debug('APP', 'State update sent successfully');
     } catch (error) {
@@ -1635,10 +1655,20 @@ function App() {
                 <button
                   type="button"
                   onClick={checkForUpdateManually}
-                  className="text-xs text-muted-foreground/60 hover:text-foreground/80 underline cursor-pointer"
+                  disabled={isCheckingForUpdate}
+                  className="text-xs text-muted-foreground/60 hover:text-foreground/80 underline cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed disabled:no-underline"
                 >
-                  Check for updates
+                  {isCheckingForUpdate ? 'Checking...' : 'Check for updates'}
                 </button>
+                {updateCheckResult === 'latest' && (
+                  <span className="text-xs text-muted-foreground/50">Up to date</span>
+                )}
+                {updateCheckResult === 'available' && updateAvailable && (
+                  <span className="text-xs text-primary/80">v{updateAvailable.version} available</span>
+                )}
+                {updateCheckResult === 'error' && (
+                  <span className="text-xs text-destructive/80">Check failed</span>
+                )}
               </div>
               <SyncIndicator />
             </div>

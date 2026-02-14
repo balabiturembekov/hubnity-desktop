@@ -28,29 +28,30 @@ describe('IdleWindow', () => {
     mockListen.mockResolvedValue(() => {});
   });
 
-  it('renders idle state and buttons', () => {
+  it('renders idle alert and buttons', () => {
     render(<IdleWindow />);
-    expect(screen.getByText(/Paused \(no activity\)/i)).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /resume/i })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /stop/i })).toBeInTheDocument();
+    expect(screen.getByText('Idle time alert')).toBeInTheDocument();
+    expect(screen.getByText(/You have been idle for/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /resume timer/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /stop timer/i })).toBeInTheDocument();
   });
 
-  it('shows 00:00:00 initially', () => {
+  it('shows 0 minutes initially (Hubstaff-style format)', () => {
     render(<IdleWindow />);
-    expect(screen.getByText('00:00:00')).toBeInTheDocument();
+    expect(screen.getByText('0 minutes')).toBeInTheDocument();
   });
 
-  it('calls resume_tracking_from_idle when Resume clicked', async () => {
+  it('calls resume_tracking_from_idle when Resume timer clicked', async () => {
     const user = userEvent.setup();
     render(<IdleWindow />);
-    await user.click(screen.getByRole('button', { name: /resume/i }));
+    await user.click(screen.getByRole('button', { name: /resume timer/i }));
     expect(mockInvoke).toHaveBeenCalledWith('resume_tracking_from_idle');
   });
 
-  it('calls stop_tracking_from_idle when Stop clicked', async () => {
+  it('calls stop_tracking_from_idle when Stop timer clicked', async () => {
     const user = userEvent.setup();
     render(<IdleWindow />);
-    await user.click(screen.getByRole('button', { name: /stop/i }));
+    await user.click(screen.getByRole('button', { name: /stop timer/i }));
     expect(mockInvoke).toHaveBeenCalledWith('stop_tracking_from_idle');
   });
 });
