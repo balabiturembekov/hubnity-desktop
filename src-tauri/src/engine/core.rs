@@ -173,18 +173,25 @@ impl TimerEngine {
 
         match &*state {
             TimerState::Running {
-                started_at_instant, ..
+                started_at,
+                started_at_instant,
+                ..
             } => {
                 // Допустимый переход: Running → Paused
                 let now = Instant::now();
                 let monotonic_elapsed = now.duration_since(*started_at_instant).as_secs();
+                let now_wall = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let wall_elapsed = now_wall.saturating_sub(*started_at);
+                let base_elapsed = wall_elapsed.min(monotonic_elapsed); // Fix TSC drift на Windows
                 let session_elapsed = match work_elapsed_override {
                     Some(work) => {
                         // Idle pause: используем только время до lastActivityTime
-                        // Clamp: не больше полной сессии, не меньше 0
-                        work.min(monotonic_elapsed)
+                        work.min(base_elapsed)
                     }
-                    None => monotonic_elapsed,
+                    None => base_elapsed,
                 };
 
                 // CRITICAL FIX: Вычисляем новый accumulated БЕЗ обновления в памяти
@@ -318,11 +325,19 @@ impl TimerEngine {
 
         match &*state {
             TimerState::Running {
-                started_at_instant, ..
+                started_at,
+                started_at_instant,
+                ..
             } => {
                 // Допустимый переход: Running → Stopped
                 let now = Instant::now();
-                let session_elapsed = now.duration_since(*started_at_instant).as_secs();
+                let monotonic_elapsed = now.duration_since(*started_at_instant).as_secs();
+                let now_wall = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let wall_elapsed = now_wall.saturating_sub(*started_at);
+                let session_elapsed = wall_elapsed.min(monotonic_elapsed); // Fix TSC drift на Windows
 
                 // CRITICAL FIX: Вычисляем новый accumulated БЕЗ обновления в памяти
                 let new_accumulated = {
@@ -441,23 +456,26 @@ impl TimerEngine {
             .unwrap_or(0);
 
         // Расчет elapsed только для RUNNING состояния
-        // Формула: accumulated + (now - started_at_instant)
-        // Дополнительно: проверка на sleep (большой пропуск времени)
+        // Используем min(wall, monotonic): wall clock для пользователя (fix TSC drift на Windows),
+        // monotonic ограничивает при сне (wall прыгает вперёд).
         let (elapsed_seconds, session_start, needs_sleep_handling) = match &*state {
             TimerState::Running {
                 started_at,
                 started_at_instant,
             } => {
                 let now = Instant::now();
-                let session_elapsed = now.duration_since(*started_at_instant).as_secs();
+                let monotonic_elapsed = now.duration_since(*started_at_instant).as_secs();
+                let wall_elapsed = now_wall.saturating_sub(*started_at);
 
                 // Sleep detection: реальный сон = разрыв между wall-clock и monotonic.
-                // При сне системы monotonic почти не растёт, wall-clock прыгает вперёд.
-                // Раньше ошибочно паузили при session_elapsed > 15 мин (просто долгая сессия).
-                let wall_elapsed = now_wall.saturating_sub(*started_at);
                 const SLEEP_GAP_THRESHOLD_SECONDS: u64 = 5 * 60; // 5 минут разрыва = сон
-                let is_sleep = wall_elapsed > session_elapsed
-                    && (wall_elapsed - session_elapsed) >= SLEEP_GAP_THRESHOLD_SECONDS;
+                let is_sleep = wall_elapsed > monotonic_elapsed
+                    && (wall_elapsed - monotonic_elapsed) >= SLEEP_GAP_THRESHOLD_SECONDS;
+
+                // min(wall, monotonic): на Windows Instant (QPC) может идти быстрее реального
+                // времени (TSC drift). Wall clock = то, что видит пользователь. При сне
+                // monotonic меньше wall — не считаем время сна.
+                let session_elapsed = wall_elapsed.min(monotonic_elapsed);
 
                 // Защита от переполнения при вычислении elapsed_seconds
                 let elapsed = accumulated.saturating_add(session_elapsed);
@@ -675,14 +693,22 @@ impl TimerEngine {
                     // Ограничиваем максимум 24 часами
                     24 * 3600
                 } else if clock_skew > 60 && time_until_midnight > instant_elapsed + clock_skew {
-                    // Если есть clock skew и time_until_midnight подозрительно большой,
-                    // ограничиваем его instant_elapsed (используем Instant как source of truth)
+                    // Wall clock прыгнул вперёд (NTP, ручная смена) — ограничиваем instant_elapsed
                     warn!(
                         "[CLOCK_SKEW] Time until midnight ({}) exceeds Instant elapsed ({}) + skew ({}). \
                         Limiting to Instant elapsed to prevent time loss.",
                         time_until_midnight, instant_elapsed, clock_skew
                     );
                     instant_elapsed
+                } else if system_time_elapsed < instant_elapsed && clock_skew > 5 {
+                    // Instant идёт быстрее wall (TSC drift на Windows) — ограничиваем wall
+                    let capped = time_until_midnight.min(system_time_elapsed);
+                    warn!(
+                        "[CLOCK_SKEW] Instant faster than wall (TSC drift). \
+                        Limiting time_until_midnight {} to system elapsed {}.",
+                        time_until_midnight, capped
+                    );
+                    capped
                 } else {
                     time_until_midnight
                 };
