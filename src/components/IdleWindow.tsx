@@ -301,9 +301,11 @@ export function IdleWindow() {
   };
 
   return (
-    <div className="h-screen w-screen bg-background flex flex-col items-center justify-center px-6 py-6">
-      {/* Hubstaff-style layout */}
-      <h2 className="text-lg font-semibold text-foreground mb-4">Idle time alert</h2>
+    <div className="h-screen w-screen bg-background flex flex-col items-center justify-center px-6 py-6 rounded-2xl overflow-hidden">
+      {/* Hubstaff-style layout — header is draggable (no decorations) */}
+      <div data-tauri-drag-region className="cursor-grab active:cursor-grabbing -mx-6 -mt-6 px-6 pt-6 pb-2 mb-2">
+        <h2 className="text-lg font-semibold text-foreground">Idle time alert</h2>
+      </div>
       
       <div className="w-full max-w-sm rounded-lg bg-muted/50 border border-border p-4 mb-6">
         <div className="text-xs text-muted-foreground uppercase tracking-wide mb-1">

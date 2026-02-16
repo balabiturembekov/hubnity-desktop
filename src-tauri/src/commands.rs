@@ -587,6 +587,13 @@ pub async fn update_tray_time(
 pub async fn show_idle_window(app: AppHandle) -> Result<(), String> {
     use tauri::Manager;
 
+    // Disable main window (Hubstaff-style: main window becomes non-clickable while idle)
+    if let Some(main_window) = app.get_webview_window("main") {
+        main_window
+            .set_enabled(false)
+            .map_err(|e| format!("Failed to disable main window: {}", e))?;
+    }
+
     // Get or create idle window
     if let Some(idle_window) = app.get_webview_window("idle") {
         // Window exists, just show it
@@ -615,6 +622,13 @@ pub async fn hide_idle_window(app: AppHandle) -> Result<(), String> {
         idle_window
             .hide()
             .map_err(|e| format!("Failed to hide idle window: {}", e))?;
+    }
+
+    // Re-enable main window (Hubstaff-style: restore interaction after idle)
+    if let Some(main_window) = app.get_webview_window("main") {
+        main_window
+            .set_enabled(true)
+            .map_err(|e| format!("Failed to enable main window: {}", e))?;
     }
 
     Ok(())
