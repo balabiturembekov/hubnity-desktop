@@ -185,7 +185,7 @@ impl TimerEngine {
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
                 let wall_elapsed = now_wall.saturating_sub(*started_at);
-                let base_elapsed = wall_elapsed.min(monotonic_elapsed); // Fix TSC drift на Windows
+                let base_elapsed = wall_elapsed.min(monotonic_elapsed); // min для sleep protection
                 let session_elapsed = match work_elapsed_override {
                     Some(work) => {
                         // Idle pause: используем только время до lastActivityTime
@@ -337,7 +337,7 @@ impl TimerEngine {
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
                 let wall_elapsed = now_wall.saturating_sub(*started_at);
-                let session_elapsed = wall_elapsed.min(monotonic_elapsed); // Fix TSC drift на Windows
+                let session_elapsed = wall_elapsed.min(monotonic_elapsed); // min для sleep protection
 
                 // CRITICAL FIX: Вычисляем новый accumulated БЕЗ обновления в памяти
                 let new_accumulated = {
@@ -456,8 +456,9 @@ impl TimerEngine {
             .unwrap_or(0);
 
         // Расчет elapsed только для RUNNING состояния
-        // Используем min(wall, monotonic): wall clock для пользователя (fix TSC drift на Windows),
-        // monotonic ограничивает при сне (wall прыгает вперёд).
+        // Только wall clock (SystemTime) — синхронно с системным временем и Hubstaff.
+        // Instant (QPC/CLOCK_UPTIME) может идти быстрее на Windows и macOS (TSC drift, Rust docs).
+        // Sleep detection: при сне паузим до возврата, не показываем время сна.
         let (elapsed_seconds, session_start, needs_sleep_handling) = match &*state {
             TimerState::Running {
                 started_at,
@@ -472,10 +473,7 @@ impl TimerEngine {
                 let is_sleep = wall_elapsed > monotonic_elapsed
                     && (wall_elapsed - monotonic_elapsed) >= SLEEP_GAP_THRESHOLD_SECONDS;
 
-                // min(wall, monotonic): на Windows Instant (QPC) может идти быстрее реального
-                // времени (TSC drift). Wall clock = то, что видит пользователь. При сне
-                // monotonic меньше wall — не считаем время сна.
-                let session_elapsed = wall_elapsed.min(monotonic_elapsed);
+                let session_elapsed = wall_elapsed;
 
                 // Защита от переполнения при вычислении elapsed_seconds
                 let elapsed = accumulated.saturating_add(session_elapsed);

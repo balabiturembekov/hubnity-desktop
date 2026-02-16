@@ -45,10 +45,22 @@ export function Timer() {
   const [idleTime, setIdleTime] = useState(0);
   const [isProcessing, setIsProcessing] = useState(false);
 
-  // Получаем состояние таймера из Rust каждую секунду
+  // Получаем состояние таймера из Rust — синхронно с границами секунд (как системные часы)
   useEffect(() => {
     let isMounted = true;
-    
+    let timeoutId: ReturnType<typeof setTimeout>;
+
+    const scheduleNext = () => {
+      const now = Date.now();
+      const msInSecond = now % 1000;
+      const msUntilNextSecond = msInSecond === 0 ? 1000 : 1000 - msInSecond;
+      timeoutId = setTimeout(() => {
+        if (!isMounted) return;
+        updateTimerState();
+        scheduleNext();
+      }, msUntilNextSecond);
+    };
+
     const updateTimerState = async () => {
       // BUG FIX: Check if component is still mounted before updating state
       if (!isMounted) return;
@@ -118,10 +130,10 @@ export function Timer() {
     };
 
     updateTimerState();
-    const interval = setInterval(updateTimerState, 1000);
+    scheduleNext();
     return () => {
       isMounted = false;
-      clearInterval(interval);
+      clearTimeout(timeoutId);
     };
   }, []);
 
