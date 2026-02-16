@@ -76,7 +76,7 @@ function App() {
       .catch(error => {
         logger.debug('APP', 'Failed to get app version', error);
         // Fallback to package.json version if available
-        setAppVersion('0.1.22'); // Fallback when get_app_version fails
+        setAppVersion('0.1.23'); // Fallback when get_app_version fails
       });
   }, []);
 

@@ -354,7 +354,7 @@ export function Timer() {
 
   // Для RUNNING: считаем на фронте через Date.now() (тот же источник, что системные часы)
   // session_start — всегда из Rust (start_timer/get_timer_state), единая точка отсчёта.
-  // Минимальный буфер 50ms — только от джиттера, без заметного отставания.
+  // Буфер 0ms — Date.now() тот же источник, что системные часы.
   const [displaySeconds, setDisplaySeconds] = useState(0);
   useEffect(() => {
     const s = effectiveTimerState;
@@ -365,7 +365,7 @@ export function Timer() {
     const acc = s.accumulated_seconds ?? 0;
     const tick = () => {
       const nowSec = Date.now() / 1000;
-      const sessionElapsed = Math.max(0, nowSec - s.session_start! - 0.05);
+      const sessionElapsed = Math.max(0, nowSec - s.session_start!);
       const computed = acc + Math.floor(sessionElapsed);
       // Защита: в первую секунду (now - session_start < 0.3) computed может быть < acc
       setDisplaySeconds(Math.max(acc, computed));
