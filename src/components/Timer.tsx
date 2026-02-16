@@ -38,7 +38,6 @@ export function Timer() {
     idlePauseStartTime,
     lastActivityTime,
     lastTimerStateFromStart,
-    clientSessionStartMs,
   } = useTrackerStore();
   const isOnline = useSyncStore((s) => s.status?.is_online ?? true);
 
@@ -112,20 +111,10 @@ export function Timer() {
           }
         }
         
-        // Обновляем tray tooltip — session_start_ms (Rust) точнее session_start (секунды)
+        // Обновляем tray tooltip — используем elapsed_seconds из Rust (единый источник)
         let tooltip = '⏹ 00:00:00';
         if (state.state === 'RUNNING') {
-          const store = useTrackerStore.getState();
-          const sessionStartMs = state.session_start_ms ?? store.clientSessionStartMs ?? (state.session_start != null ? state.session_start * 1000 : 0);
-          const sessionStartSec = sessionStartMs / 1000;
-          if (sessionStartSec > 0) {
-            const acc = state.accumulated_seconds ?? 0;
-            const nowSec = Date.now() / 1000;
-            const elapsed = acc + Math.floor(Math.max(0, nowSec - sessionStartSec));
-            tooltip = `▶ ${formatTime(elapsed)}`;
-          } else {
-            tooltip = `▶ ${formatTime(state.elapsed_seconds)}`;
-          }
+          tooltip = `▶ ${formatTime(state.elapsed_seconds)}`;
         } else if (state.state === 'PAUSED') {
           tooltip = `⏸ ${formatTime(state.elapsed_seconds)}`;
         }
@@ -363,44 +352,9 @@ export function Timer() {
             statusColor: undefined as undefined,
           };
 
-  // Для RUNNING: считаем на фронте через Date.now(). session_start_ms (Rust) — точная синхронизация.
-  // Self-adjusting setTimeout (Stack Overflow): компенсирует drift.
-  const TICK_MS = 100;
-  const [displaySeconds, setDisplaySeconds] = useState(0);
-  const sessionStartMs = effectiveTimerState?.state === 'RUNNING'
-    ? (effectiveTimerState.session_start_ms ?? clientSessionStartMs ?? (effectiveTimerState.session_start != null ? effectiveTimerState.session_start * 1000 : 0))
-    : 0;
-  useEffect(() => {
-    const s = effectiveTimerState;
-    if (!s || s.state !== 'RUNNING') {
-      setDisplaySeconds(s?.elapsed_seconds ?? 0);
-      return;
-    }
-    const acc = s.accumulated_seconds ?? 0;
-    const sessionStartSec = sessionStartMs / 1000;
-    if (sessionStartSec === 0) {
-      setDisplaySeconds(s.elapsed_seconds);
-      return;
-    }
-    let expected = Date.now();
-    let timeoutId: ReturnType<typeof setTimeout>;
-    const step = () => {
-      const nowSec = Date.now() / 1000;
-      const sessionElapsed = Math.max(0, nowSec - sessionStartSec);
-      const computed = acc + Math.floor(sessionElapsed);
-      setDisplaySeconds(Math.max(acc, computed));
-      const drift = Date.now() - expected;
-      expected += TICK_MS;
-      timeoutId = setTimeout(step, Math.max(0, TICK_MS - drift));
-    };
-    step();
-    return () => clearTimeout(timeoutId);
-  }, [effectiveTimerState?.state, effectiveTimerState?.session_start, effectiveTimerState?.session_start_ms, effectiveTimerState?.accumulated_seconds, effectiveTimerState?.elapsed_seconds, clientSessionStartMs, sessionStartMs]);
-
-  const useClientDisplay =
-    effectiveTimerState?.state === 'RUNNING' &&
-    (sessionStartMs > 0 || clientSessionStartMs != null || effectiveTimerState?.session_start != null);
-  const elapsedSeconds = useClientDisplay ? displaySeconds : (effectiveTimerState?.elapsed_seconds ?? 0);
+  // RUNNING: используем elapsed_seconds из Rust (poll 200ms) — без рассинхрона из-за задержки invoke.
+  // Клиентский расчёт через Date.now() давал diff=1s: Rust считает при вызове, JS — при получении ответа (~100ms позже).
+  const elapsedSeconds = effectiveTimerState?.elapsed_seconds ?? 0;
   const totalTodaySeconds = effectiveTimerState?.today_seconds ?? elapsedSeconds;
 
   // FIX: Показываем таймер если есть active time entry, даже если selectedProject не установлен
