@@ -210,6 +210,32 @@ impl Database {
         Ok(None)
     }
 
+    /// Получить последний time entry ID из очереди (pending или sent) — fallback когда app_meta пуст
+    pub fn get_last_time_entry_id_from_queue(&self) -> SqliteResult<Option<String>> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT entity_type, payload FROM sync_queue
+             WHERE entity_type IN ('time_entry_pause', 'time_entry_resume', 'time_entry_stop')
+             ORDER BY created_at DESC LIMIT 5",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (_entity_type, encrypted) = row?;
+            if let Ok(decrypted) = self.encryption.decrypt(&encrypted) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&decrypted) {
+                    if let Some(id) = v.get("id").and_then(|v| v.as_str()) {
+                        if !id.is_empty() && !id.starts_with("temp-") {
+                            return Ok(Some(id.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Получить значение из app_meta (для изоляции данных по пользователю)
     pub fn get_app_meta(&self, key: &str) -> SqliteResult<Option<String>> {
         let conn = self.lock_conn()?;
@@ -237,6 +263,7 @@ impl Database {
         let conn = self.lock_conn()?;
         conn.execute("DELETE FROM time_entries", [])?;
         conn.execute("DELETE FROM sync_queue", [])?;
+        let _ = self.set_app_meta("last_active_time_entry_id", "");
         Ok(())
     }
 

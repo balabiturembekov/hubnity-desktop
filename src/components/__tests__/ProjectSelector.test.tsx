@@ -76,13 +76,13 @@ describe('ProjectSelector', () => {
     expect(screen.getByRole('button', { name: /retry/i })).toBeInTheDocument();
   });
 
-  it('shows Offline message without Retry when error (offline)', () => {
+  it('shows Offline message and Retry when error (offline)', () => {
     defaultState.error = 'Network Error';
     defaultState.projects = [];
     mockIsOnline = false;
     render(<ProjectSelector />);
     expect(screen.getByText(/Offline — projects unavailable/i)).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /retry/i })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /retry/i })).toBeInTheDocument();
   });
 
   it('shows No projects when projects empty', () => {

@@ -4,6 +4,7 @@ import { useTrackerStore, type TimerStateResponse } from '../store/useTrackerSto
 import { useSyncStore } from '../store/useSyncStore';
 import { Play, Pause, Square, RotateCcw, Camera, AlertCircle, Coffee } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { logger } from '../lib/logger';
 import { cn } from '../lib/utils';
 
@@ -36,8 +37,11 @@ export function Timer() {
     error,
     isTakingScreenshot,
     idlePauseStartTime,
+    idlePauseStartPerfRef,
     lastActivityTime,
+    lastActivityPerfRef,
     lastTimerStateFromStart,
+    clientSessionStartMs,
   } = useTrackerStore();
   const isOnline = useSyncStore((s) => s.status?.is_online ?? true);
 
@@ -53,93 +57,91 @@ export function Timer() {
   const [idleTime, setIdleTime] = useState(0);
   const [isProcessing, setIsProcessing] = useState(false);
 
-  // Получаем состояние таймера из Rust. Poll 200ms — без интерполяции, только Rust (избегаем опережения).
+  // Состояние из Rust: push (timer-state-update каждые 200ms) + poll fallback. Push не throttлится в фоне.
   const POLL_MS = 200;
   useEffect(() => {
     let isMounted = true;
     let timeoutId: ReturnType<typeof setTimeout>;
+    let unlistenTimer: (() => void) | null = null;
 
-    const scheduleNext = () => {
-      timeoutId = setTimeout(() => {
-        if (!isMounted) return;
-        updateTimerState();
-        scheduleNext();
-      }, POLL_MS);
+    const processState = (state: TimerStateResponse) => {
+      if (!isMounted) return;
+      setTimerState(state);
+      const isRunning = state.state === 'RUNNING';
+      const isPaused = state.state === 'PAUSED';
+      const store = useTrackerStore.getState();
+      const { isTracking: currentIsTracking, isPaused: currentIsPaused, currentTimeEntry } = store;
+      const trackingChanged = currentIsTracking !== (isRunning || isPaused) || currentIsPaused !== isPaused;
+      const needClearEntry = state.state === 'STOPPED' && currentTimeEntry !== null;
+      if (trackingChanged || needClearEntry) {
+        useTrackerStore.setState({
+          isTracking: isRunning || isPaused,
+          isPaused: isPaused,
+          ...(state.state === 'STOPPED'
+            ? { currentTimeEntry: null, idlePauseStartTime: null, lastResumeTime: null, localTimerStartTime: null }
+            : state.state === 'RUNNING'
+              ? { idlePauseStartTime: null }
+              : {}),
+        });
+        if (state.state === 'RUNNING' || state.state === 'STOPPED') {
+          invoke('hide_idle_window').catch(() => {});
+        }
+        if (state.state === 'RUNNING') {
+          invoke('start_activity_monitoring').catch(() => {});
+        }
+        if ((isRunning || isPaused) && !currentTimeEntry) {
+          useTrackerStore.getState().loadActiveTimeEntry().catch((e) => {
+            logger.debug('TIMER', 'loadActiveTimeEntry failed (non-critical)', e);
+          });
+        }
+      }
+      const tooltip =
+        state.state === 'RUNNING'
+          ? `▶ ${formatTime(state.elapsed_seconds)}`
+          : state.state === 'PAUSED'
+            ? `⏸ ${formatTime(state.elapsed_seconds)}`
+            : '⏹ 00:00:00';
+      invoke('plugin:tray|set_tooltip', { id: 'main', tooltip }).catch(() => {});
     };
 
-    const updateTimerState = async () => {
-      // BUG FIX: Check if component is still mounted before updating state
+    listen<TimerStateResponse>('timer-state-update', (ev) => {
       if (!isMounted) return;
-      
+      const state = ev.payload;
+      // Не перезаписывать RUNNING (после resume из idle) устаревшим PAUSED из очереди событий
+      const lastFromStore = useTrackerStore.getState().lastTimerStateFromStart;
+      if (lastFromStore?.state === 'RUNNING' && state.state === 'PAUSED') return;
+      processState(state);
+    }).then((fn) => {
+      unlistenTimer = fn;
+    });
+
+    const pollOnce = async () => {
+      if (!isMounted) return;
       try {
         const state = await useTrackerStore.getState().getTimerState();
-        
-        // Check again after async operation
         if (!isMounted) return;
-        
-        setTimerState(state);
-        
-        const isRunning = state.state === 'RUNNING';
-        const isPaused = state.state === 'PAUSED';
-        
-        const store = useTrackerStore.getState();
-        const { isTracking: currentIsTracking, isPaused: currentIsPaused, currentTimeEntry } = store;
-        
-        // BUG FIX: Always update store if state changed, even if isLoading is true
-        // This prevents store from being stale when isLoading gets stuck or operations complete
-        // The isLoading check was preventing sync when operations finished but isLoading wasn't cleared
-        const trackingChanged = currentIsTracking !== (isRunning || isPaused) || currentIsPaused !== isPaused;
-        const needClearEntry = state.state === 'STOPPED' && currentTimeEntry !== null;
-        if (trackingChanged || needClearEntry) {
-          useTrackerStore.setState({
-            isTracking: isRunning || isPaused,
-            isPaused: isPaused,
-            ...(state.state === 'STOPPED'
-              ? { currentTimeEntry: null, idlePauseStartTime: null, lastResumeTime: null, localTimerStartTime: null }
-              : state.state === 'RUNNING'
-                ? { idlePauseStartTime: null } // FIX: Clear idle — Timer Engine RUNNING means we're not idle
-                : {}),
-          });
-          // FIX: Hide idle window when Timer Engine is RUNNING or STOPPED — store/UI must stay in sync
-          if (state.state === 'RUNNING' || state.state === 'STOPPED') {
-            invoke('hide_idle_window').catch(() => {});
-          }
-          if (state.state === 'RUNNING') {
-            invoke('start_activity_monitoring').catch(() => {}); // FIX: Sync to RUNNING — ensure monitoring
-          }
-          // BUG FIX: Timer Engine RUNNING/PAUSED but currentTimeEntry null — restore from server
-          if ((isRunning || isPaused) && !currentTimeEntry) {
-            useTrackerStore.getState().loadActiveTimeEntry().catch((e) => {
-              logger.debug('TIMER', 'loadActiveTimeEntry failed (non-critical)', e);
-            });
-          }
-        }
-        
-        // Обновляем tray tooltip — используем elapsed_seconds из Rust (единый источник)
-        let tooltip = '⏹ 00:00:00';
-        if (state.state === 'RUNNING') {
-          tooltip = `▶ ${formatTime(state.elapsed_seconds)}`;
-        } else if (state.state === 'PAUSED') {
-          tooltip = `⏸ ${formatTime(state.elapsed_seconds)}`;
-        }
-        
-        invoke('plugin:tray|set_tooltip', {
-          id: 'main',
-          tooltip,
-        }).catch((error) => {
-          // BUG FIX: Log error instead of silently ignoring (tray might not be available, but log for debugging)
-          logger.debug('TIMER', 'Failed to set tray tooltip (non-critical)', error);
-        });
-      } catch (error) {
-        logger.error('TIMER', 'Failed to get timer state', error);
+        const lastFromStore = useTrackerStore.getState().lastTimerStateFromStart;
+        if (lastFromStore?.state === 'RUNNING' && state.state === 'PAUSED') return;
+        processState(state);
+      } catch (e) {
+        logger.error('TIMER', 'Failed to get timer state', e);
       }
     };
 
-    updateTimerState();
+    pollOnce();
+    const scheduleNext = () => {
+      timeoutId = setTimeout(() => {
+        if (!isMounted) return;
+        pollOnce();
+        scheduleNext();
+      }, POLL_MS);
+    };
     scheduleNext();
+
     return () => {
       isMounted = false;
       clearTimeout(timeoutId);
+      unlistenTimer?.();
     };
   }, []);
 
@@ -180,18 +182,17 @@ export function Timer() {
     };
   }, [effectiveTimerState?.day_start]);
 
-  // Обновление idle time — используем lastActivityTime (общее время простоя) когда есть, иначе idlePauseStartTime
-  const idleBaseTime = lastActivityTime ?? idlePauseStartTime;
+  // Обновление idle time — performance.now() для монотонного elapsed (не прыгает при NTP)
+  const idleBasePerfRef = lastActivityPerfRef ?? idlePauseStartPerfRef;
+  const hasIdleBase = (lastActivityTime ?? idlePauseStartTime) && idleBasePerfRef;
   useEffect(() => {
     let isMounted = true;
     
-    if (effectiveTimerState?.state === 'PAUSED' && idleBaseTime) {
+    if (effectiveTimerState?.state === 'PAUSED' && hasIdleBase) {
       const updateIdleTime = () => {
-        // BUG FIX: Check if component is still mounted before updating state
         if (!isMounted) return;
-        
-        const now = Date.now();
-        const idleSeconds = Math.floor((now - idleBaseTime) / 1000);
+        const perfNow = typeof performance !== 'undefined' ? performance.now() : Date.now();
+        const idleSeconds = Math.floor((perfNow - idleBasePerfRef!) / 1000);
         const validIdleSeconds = isNaN(idleSeconds) ? 0 : Math.max(0, idleSeconds);
         setIdleTime(validIdleSeconds);
       };
@@ -208,11 +209,18 @@ export function Timer() {
         isMounted = false;
       };
     }
-  }, [effectiveTimerState?.state, idleBaseTime]);
+  }, [effectiveTimerState?.state, idleBasePerfRef, hasIdleBase]);
 
   // BUG FIX: Track component mount state to prevent setState after unmount
   const isMountedRef = useRef(true);
-  
+
+  // Сбрасываем isProcessing при оптимистичном обновлении (таймер уже показывается)
+  useEffect(() => {
+    if ((isTracking || effectiveTimerState?.state === 'RUNNING') && isProcessing) {
+      setIsProcessing(false);
+    }
+  }, [isTracking, effectiveTimerState?.state, isProcessing]);
+
   useEffect(() => {
     isMountedRef.current = true;
     return () => {
@@ -356,8 +364,24 @@ export function Timer() {
             statusColor: undefined as undefined,
           };
 
-  // RUNNING: только elapsed_seconds из Rust — без интерполяции (она опережала из‑за разной частоты effect vs poll).
-  const elapsedSeconds = effectiveTimerState?.elapsed_seconds ?? 0;
+  // Тик каждую секунду при RUNNING — для интерполяции (таймер тикает сразу, не ждём push от Rust)
+  const [, setTick] = useState(0);
+  const rustElapsed = effectiveTimerState?.elapsed_seconds ?? 0;
+  const wallElapsed = clientSessionStartMs != null
+    ? Math.floor((Date.now() - clientSessionStartMs) / 1000)
+    : 0;
+  // Интерполяция: когда poll ещё не вернул RUNNING (оптимистичный старт) — показываем wallElapsed
+  const useInterpolation =
+    effectiveTimerState?.state === 'RUNNING' &&
+    clientSessionStartMs != null &&
+    pollStaleAfterStartResume;
+  useEffect(() => {
+    if (!useInterpolation) return;
+    const id = setInterval(() => setTick((t) => t + 1), 1000);
+    return () => clearInterval(id);
+  }, [useInterpolation]);
+
+  const elapsedSeconds = useInterpolation ? wallElapsed : rustElapsed;
   const totalTodaySeconds = effectiveTimerState?.today_seconds ?? elapsedSeconds;
 
   // FIX: Показываем таймер если есть active time entry, даже если selectedProject не установлен

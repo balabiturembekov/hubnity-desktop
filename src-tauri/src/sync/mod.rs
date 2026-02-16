@@ -101,10 +101,11 @@ impl SyncManager {
     /// PRODUCTION: Адаптивный размер batch для эффективной синхронизации
     fn calculate_batch_size(&self, pending_count: i32) -> i32 {
         match pending_count {
-            0..=20 => 5,     // Маленькая очередь - маленький batch
-            21..=100 => 20,  // Средняя очередь - средний batch
-            101..=500 => 50, // Большая очередь - большой batch
-            _ => 100,        // Очень большая очередь - максимальный batch
+            0..=20 => 5,      // Маленькая очередь - маленький batch
+            21..=100 => 20,   // Средняя очередь - средний batch
+            101..=500 => 50,  // Большая очередь - большой batch
+            501..=2000 => 100, // Очень большая очередь
+            _ => 150,         // Огромная очередь - ускоренная обработка
         }
     }
 
@@ -459,7 +460,6 @@ impl SyncManager {
             Err(e) => {
                 let msg = format!("[SYNC] Skipping sync (no token): {}", e);
                 warn!("{}", msg);
-                eprintln!("{}", msg);
                 return Ok(0);
             }
         }
@@ -507,7 +507,6 @@ impl SyncManager {
             "[SYNC] Starting sync: {} pending tasks{}, batch size: {}",
             pending_count, stats_info, batch_size
         );
-        eprintln!("[SYNC] Starting sync: {} pending tasks", pending_count);
 
         let tasks = self
             .db
@@ -515,7 +514,7 @@ impl SyncManager {
             .map_err(|e| SyncError::Db(format!("get retry tasks: {}", e)))?;
 
         if tasks.is_empty() {
-            eprintln!("[SYNC] No tasks ready for retry (backoff or empty), skipping");
+            debug!("[SYNC] No tasks ready for retry (backoff or empty), skipping");
             if let Err(e) = self.db.set_app_meta(
                 "last_sync_at",
                 &chrono::Utc::now().timestamp().to_string(),
@@ -700,10 +699,6 @@ impl SyncManager {
             }
             info!("[SYNC] Sync completed: {}", log_parts.join(", "));
         }
-        eprintln!(
-            "[SYNC] Sync completed: {} sent, {} failed",
-            synced_count, failed_in_batch
-        );
 
         Ok(synced_count)
     }

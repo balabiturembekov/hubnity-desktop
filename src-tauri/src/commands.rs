@@ -12,7 +12,7 @@ use std::time::Instant;
 #[allow(unused_imports)] // Emitter used in #[cfg(not(target_os = "macos"))] activity branch
 use tauri::{AppHandle, Emitter, Manager, State};
 #[allow(unused_imports)]
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Activity detection constants and logic (testable).
 pub(crate) mod activity_emit {
@@ -416,13 +416,13 @@ pub async fn take_screenshot(_time_entry_id: String) -> Result<Vec<u8>, String> 
             "Failed to get screens: {:?}. Please ensure the application has necessary permissions to capture screenshots.",
             e
         );
-        eprintln!("[SCREENSHOT ERROR] {}", err_msg);
+        error!("[SCREENSHOT ERROR] {}", err_msg);
         err_msg
     })?;
 
     // Check if we have any screens available
     if screens.is_empty() {
-        eprintln!("[SCREENSHOT ERROR] No screens available");
+        error!("[SCREENSHOT ERROR] No screens available");
         return Err("No screens available".to_string());
     }
 
@@ -442,7 +442,7 @@ pub async fn take_screenshot(_time_entry_id: String) -> Result<Vec<u8>, String> 
             "Failed to capture screenshot: {:?}. Please ensure the application has necessary permissions to capture screenshots.",
             e
         );
-        eprintln!("[SCREENSHOT ERROR] {}", err_msg);
+        error!("[SCREENSHOT ERROR] {}", err_msg);
         err_msg
     })?;
 
@@ -452,7 +452,7 @@ pub async fn take_screenshot(_time_entry_id: String) -> Result<Vec<u8>, String> 
 
     // Validate dimensions
     if width == 0 || height == 0 {
-        eprintln!(
+        error!(
             "[SCREENSHOT ERROR] Invalid screenshot dimensions: {}x{}",
             width, height
         );
@@ -466,7 +466,7 @@ pub async fn take_screenshot(_time_entry_id: String) -> Result<Vec<u8>, String> 
     // But we need to convert to Vec<u8> for ImageBuffer
     let img_buffer: ImageBuffer<Rgba<u8>, Vec<u8>> =
         ImageBuffer::from_raw(width, height, rgba_data.to_vec()).ok_or_else(|| {
-            eprintln!("[SCREENSHOT ERROR] Failed to create ImageBuffer from RGBA data");
+            error!("[SCREENSHOT ERROR] Failed to create ImageBuffer from RGBA data");
             "Failed to create ImageBuffer from RGBA data".to_string()
         })?;
 
@@ -475,7 +475,7 @@ pub async fn take_screenshot(_time_entry_id: String) -> Result<Vec<u8>, String> 
     let max_width = 1280u32;
     let max_height = 720u32;
     let final_buffer = if width > max_width || height > max_height {
-        eprintln!(
+        info!(
             "[SCREENSHOT] Image too large ({}x{}), resizing to max {}x{}",
             width, height, max_width, max_height
         );
@@ -530,25 +530,25 @@ pub async fn take_screenshot(_time_entry_id: String) -> Result<Vec<u8>, String> 
             .write_to(&mut cursor, image::ImageFormat::Jpeg)
             .map_err(|e| {
                 let err_msg = format!("Failed to encode JPEG: {:?}", e);
-                eprintln!("[SCREENSHOT ERROR] {}", err_msg);
+                error!("[SCREENSHOT ERROR] {}", err_msg);
                 err_msg
             })?;
     }
 
     // Validate that we actually have JPEG data
     if jpeg_bytes.is_empty() {
-        eprintln!("[SCREENSHOT ERROR] Encoded JPEG data is empty");
+        error!("[SCREENSHOT ERROR] Encoded JPEG data is empty");
         return Err("Screenshot encoding produced empty result".to_string());
     }
 
-    eprintln!("[SCREENSHOT] Final JPEG size: {} bytes", jpeg_bytes.len());
+    info!("[SCREENSHOT] Final JPEG size: {} bytes", jpeg_bytes.len());
 
     Ok(jpeg_bytes)
 }
 
 #[tauri::command]
 pub async fn log_message(message: String) -> Result<(), String> {
-    eprintln!("{}", message);
+    info!("{}", message);
     Ok(())
 }
 
@@ -695,8 +695,10 @@ pub fn get_app_version(app: AppHandle) -> Result<String, String> {
 #[tauri::command]
 pub async fn update_idle_state(
     idle_pause_start_time: Option<u64>,
+    idle_pause_start_perf_ref: Option<f64>,
     is_loading: bool,
     last_activity_time: Option<u64>,
+    last_activity_perf_ref: Option<f64>,
     project_name: Option<String>,
     app: AppHandle,
 ) -> Result<(), String> {
@@ -721,9 +723,17 @@ pub async fn update_idle_state(
         None => serde_json::Value::Null,
     };
 
+    let pause_perf_json = idle_pause_start_perf_ref
+        .map(|v| serde_json::Value::Number(serde_json::Number::from_f64(v).unwrap_or(serde_json::Number::from(0))))
+        .unwrap_or(serde_json::Value::Null);
+    let last_activity_perf_json = last_activity_perf_ref
+        .map(|v| serde_json::Value::Number(serde_json::Number::from_f64(v).unwrap_or(serde_json::Number::from(0))))
+        .unwrap_or(serde_json::Value::Null);
     let payload = serde_json::json!({
         "idlePauseStartTime": pause_time_json,
+        "idlePauseStartPerfRef": pause_perf_json,
         "lastActivityTime": last_activity_json,
+        "lastActivityPerfRef": last_activity_perf_json,
         "isLoading": is_loading,
         "projectName": project_name_json,
     });
@@ -1037,6 +1047,68 @@ pub async fn retry_failed_tasks(
     }
 
     Ok(count)
+}
+
+/// Сохранить ID активной time entry для офлайн pause (когда currentTimeEntry может быть null)
+#[tauri::command]
+pub async fn persist_time_entry_id(
+    id: Option<String>,
+    sync_manager: State<'_, SyncManager>,
+) -> Result<(), String> {
+    let value = id.unwrap_or_default();
+    sync_manager
+        .db
+        .set_app_meta("last_active_time_entry_id", &value)
+        .map_err(|e| format!("Failed to persist time entry id: {}", e))
+}
+
+/// Получить порог sleep detection (минуты) — разрыв wall/monotonic для авто-паузы
+#[tauri::command]
+pub fn get_sleep_gap_threshold_minutes(
+    sync_manager: State<'_, SyncManager>,
+) -> Result<u64, String> {
+    let val = sync_manager
+        .db
+        .get_app_meta("sleep_gap_threshold_minutes")
+        .map_err(|e| format!("Failed to get sleep gap threshold: {}", e))?;
+    Ok(val
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(5)
+        .clamp(1, 120))
+}
+
+/// Установить порог sleep detection (минуты). 1–120, default 5.
+#[tauri::command]
+pub fn set_sleep_gap_threshold_minutes(
+    minutes: u64,
+    sync_manager: State<'_, SyncManager>,
+) -> Result<(), String> {
+    let clamped = minutes.clamp(1, 120);
+    sync_manager
+        .db
+        .set_app_meta("sleep_gap_threshold_minutes", &clamped.to_string())
+        .map_err(|e| format!("Failed to set sleep gap threshold: {}", e))
+}
+
+/// Получить последний сохранённый ID time entry (для офлайн pause без currentTimeEntry)
+/// Fallback: ищет в очереди sync (pause/resume задачи содержат id)
+#[tauri::command]
+pub async fn get_last_time_entry_id(
+    sync_manager: State<'_, SyncManager>,
+) -> Result<Option<String>, String> {
+    let from_meta = sync_manager
+        .db
+        .get_app_meta("last_active_time_entry_id")
+        .map_err(|e| format!("Failed to get last time entry id: {}", e))?;
+    if let Some(ref s) = from_meta {
+        if !s.is_empty() && !s.starts_with("temp-") {
+            return Ok(Some(s.clone()));
+        }
+    }
+    sync_manager
+        .db
+        .get_last_time_entry_id_from_queue()
+        .map_err(|e| format!("Failed to get last time entry id from queue: {}", e))
 }
 
 // ============================================

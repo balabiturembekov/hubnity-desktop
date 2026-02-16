@@ -39,14 +39,14 @@ struct SyncStatusResponse {
 
 #[cfg(target_os = "macos")]
 fn setup_sleep_wake_handlers(_app: AppHandle, engine: Arc<TimerEngine>) -> Result<(), String> {
-    eprintln!("[SLEEP/WAKE] Sleep/wake detection via time gap in get_state(); wake on startup");
+    info!("[SLEEP/WAKE] Sleep/wake detection via time gap in get_state(); wake on startup");
     engine.handle_system_wake()?;
     Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
 fn setup_sleep_wake_handlers(_app: AppHandle, engine: Arc<TimerEngine>) -> Result<(), String> {
-    eprintln!("[SLEEP/WAKE] Wake handler on startup");
+    info!("[SLEEP/WAKE] Wake handler on startup");
     engine.handle_system_wake()?;
     Ok(())
 }
@@ -132,7 +132,7 @@ pub fn run() {
                 // ДОКАЗАНО: Это событие вызывается синхронно перед закрытием окна
                 // Сохраняем состояние таймера синхронно
                 if let Err(e) = engine_for_close.save_state() {
-                    eprintln!("[SHUTDOWN] Failed to save timer state on window close: {}", e);
+                    error!("[SHUTDOWN] Failed to save timer state on window close: {}", e);
                 } else {
                     info!("[SHUTDOWN] Timer state saved successfully on window close");
                 }
@@ -168,6 +168,36 @@ pub fn run() {
                             warn!("[TIMER] Failed to save state periodically: {}", e);
                         } else {
                             debug!("[TIMER] State saved periodically");
+                        }
+                    }
+                });
+            });
+
+            // FIX: Push timer state from Rust каждые 200ms — только при RUNNING/PAUSED (не спамить при STOPPED)
+            let engine_for_emit = engine_arc.clone();
+            let app_handle_for_emit = app.handle().clone();
+            std::thread::spawn(move || {
+                let rt = match tokio::runtime::Runtime::new() {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        error!("[TIMER] Failed to create runtime for timer emit: {}", e);
+                        return;
+                    }
+                };
+                rt.block_on(async {
+                    use tauri::Emitter;
+                    use crate::engine::TimerStateForAPI;
+                    let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(200));
+                    loop {
+                        interval.tick().await;
+                        if let Ok(state) = engine_for_emit.get_state() {
+                            let should_emit = matches!(
+                                state.state,
+                                TimerStateForAPI::Running { .. } | TimerStateForAPI::Paused
+                            );
+                            if should_emit {
+                                let _ = app_handle_for_emit.emit("timer-state-update", &state);
+                            }
                         }
                     }
                 });
@@ -257,6 +287,10 @@ pub fn run() {
             mark_task_sent_by_id,
             get_failed_tasks,
             retry_failed_tasks,
+            persist_time_entry_id,
+            get_last_time_entry_id,
+            get_sleep_gap_threshold_minutes,
+            set_sleep_gap_threshold_minutes,
             // Timer Engine commands
             start_timer,
             pause_timer,

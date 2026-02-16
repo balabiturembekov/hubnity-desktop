@@ -289,7 +289,7 @@ describe('useTrackerStore', () => {
 
       const sessionStart = Math.floor(Date.now() / 1000) - 300; // 5 min ago
       const lastActivityTime = (sessionStart + 180) * 1000; // last active 3 min ago (2 min idle)
-      useTrackerStore.setState({ lastActivityTime });
+      useTrackerStore.setState({ lastActivityTime, clientSessionStartMs: null }); // use session_start from mock
 
       const runningState = {
         state: 'RUNNING' as const,
@@ -427,25 +427,28 @@ describe('useTrackerStore', () => {
 
     it('handles error when resuming timer engine', async () => {
       const project = { id: '1', name: 'Test Project', color: '#000000', description: '', clientName: '', budget: 0, status: 'ACTIVE' as const, companyId: '', createdAt: '', updatedAt: '' };
-      useTrackerStore.getState().selectProject(project);
-      await useTrackerStore.getState().startTracking();
-      await new Promise(r => setTimeout(r, 80));
-      mockGetTimerState.mockResolvedValueOnce({
-        state: 'RUNNING',
-        started_at: Date.now() / 1000,
-        elapsed_seconds: 0,
-        accumulated_seconds: 0,
-        session_start: Date.now() / 1000,
-        day_start: Math.floor(Date.now() / 1000),
+      const pausedEntry = {
+        id: 'test-entry-id',
+        projectId: project.id,
+        project,
+        status: 'PAUSED' as const,
+        startTime: new Date().toISOString(),
+        endTime: null,
+        duration: 0,
+        description: '',
+        userId: 'test-user-id',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      useTrackerStore.setState({
+        selectedProject: project,
+        currentTimeEntry: pausedEntry,
+        isTracking: true,
+        isPaused: true,
       });
-      await useTrackerStore.getState().pauseTracking();
-      await new Promise(r => setTimeout(r, 50));
-      
-      const currentEntry = useTrackerStore.getState().currentTimeEntry;
-      expect(currentEntry).toBeTruthy();
       
       // Mock getState to return PAUSED state for resume
-      mockGetTimerState.mockResolvedValueOnce({
+      mockGetTimerState.mockResolvedValue({
         state: 'PAUSED',
         elapsed_seconds: 0,
         accumulated_seconds: 0,

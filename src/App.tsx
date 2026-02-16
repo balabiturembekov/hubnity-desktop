@@ -217,6 +217,18 @@ function App() {
     let syncSkippedDueToLoading = 0;
     const syncTimerState = async () => {
       try {
+        // FIX: Не синхронизировать с сервером при отсутствии интернета — таймер должен работать офлайн
+        try {
+          const syncStatus = await invoke<{ is_online: boolean }>('get_sync_status');
+          if (!syncStatus.is_online) {
+            logger.debug('APP', 'syncTimerState: offline, skipping (timer continues locally)');
+            return;
+          }
+        } catch (e) {
+          logger.debug('APP', 'syncTimerState: failed to check online status, skipping', e);
+          return;
+        }
+
         const { currentTimeEntry, idlePauseStartTime, isLoading, getTimerState } = useTrackerStore.getState();
         
         // BUG FIX: Don't sync if another operation is in progress
@@ -674,6 +686,10 @@ function App() {
     const heartbeatInterval = setInterval(async () => {
       if (!isCleanedUp) {
         try {
+          const timerState = await useTrackerStore.getState().getTimerState();
+          if (timerState.state === 'STOPPED') {
+            return; // Don't send heartbeat when timer is stopped — no active time entry
+          }
           const store = useTrackerStore.getState();
           const { lastActivityTime } = store;
           const now = Date.now();
@@ -1002,8 +1018,9 @@ function App() {
       
       // Only take screenshot if tracking is active, not paused, and not idle
       const currentState = useTrackerStore.getState();
-      if (!currentState.isTracking || currentState.isPaused || !currentState.currentTimeEntry || currentState.idlePauseStartTime !== null) {
-        await logger.safeLogToRust(`[SCREENSHOT] Skipped: isTracking=${currentState.isTracking}, isPaused=${currentState.isPaused}, hasEntry=${!!currentState.currentTimeEntry}, isIdle=${currentState.idlePauseStartTime !== null}`).catch((e) => {
+      const timeEntryId = currentState.currentTimeEntry?.id ?? await invoke<string | null>('get_last_time_entry_id').catch(() => null);
+      if (!currentState.isTracking || currentState.isPaused || currentState.idlePauseStartTime !== null || !timeEntryId || timeEntryId.startsWith('temp-')) {
+        await logger.safeLogToRust(`[SCREENSHOT] Skipped: isTracking=${currentState.isTracking}, isPaused=${currentState.isPaused}, hasEntry=${!!currentState.currentTimeEntry}, hasId=${!!timeEntryId}, isIdle=${currentState.idlePauseStartTime !== null}`).catch((e) => {
           logger.debug('SCREENSHOT', 'Failed to log (non-critical)', e);
         });
         // Reset flag if we're not taking screenshot
@@ -1017,18 +1034,20 @@ function App() {
       
       let screenshotData: number[] | null = null;
       let finalState = useTrackerStore.getState();
+      let finalTimeEntryId = timeEntryId;
       
       try {
         // Final state check before taking screenshot
         finalState = useTrackerStore.getState();
-        if (!finalState.isTracking || finalState.isPaused || !finalState.currentTimeEntry || finalState.idlePauseStartTime !== null || isCleanedUp) {
+        finalTimeEntryId = finalState.currentTimeEntry?.id ?? timeEntryId;
+        if (!finalState.isTracking || finalState.isPaused || finalState.idlePauseStartTime !== null || !finalTimeEntryId || isCleanedUp) {
           useTrackerStore.setState({ isTakingScreenshot: false });
           return; // State changed or idle, skip screenshot
         }
         
         // Take screenshot via Rust
         screenshotData = await invoke<number[]>('take_screenshot', {
-          timeEntryId: finalState.currentTimeEntry.id,
+          timeEntryId: finalTimeEntryId,
         });
         
         // Final check before upload
@@ -1071,7 +1090,7 @@ function App() {
             const refreshToken = localStorage.getItem('refresh_token');
             await invoke('upload_screenshot', {
               pngData: Array.from(screenshotData),
-              timeEntryId: finalState.currentTimeEntry.id,
+              timeEntryId: finalTimeEntryId,
               accessToken: accessToken,
               refreshToken: refreshToken || null,
             });
@@ -1092,7 +1111,7 @@ function App() {
           });
         }
         
-        await useTrackerStore.getState().uploadScreenshot(file, finalState.currentTimeEntry.id);
+        await useTrackerStore.getState().uploadScreenshot(file, finalTimeEntryId);
         
         // Emit event to refresh screenshots view
         if (!isCleanedUp) {
@@ -1108,10 +1127,10 @@ function App() {
           try {
             const accessToken = useTrackerStore.getState().getAccessToken();
             const refreshToken = localStorage.getItem('refresh_token');
-            if (accessToken && screenshotData && screenshotData.length > 0 && finalState.currentTimeEntry) {
+            if (accessToken && screenshotData && screenshotData.length > 0 && finalTimeEntryId) {
               await invoke('upload_screenshot', {
                 pngData: Array.from(screenshotData),
-                timeEntryId: finalState.currentTimeEntry.id,
+                timeEntryId: finalTimeEntryId,
                 accessToken,
                 refreshToken: refreshToken || null,
               });
@@ -1145,9 +1164,10 @@ function App() {
       }
       
       const state = useTrackerStore.getState();
-      // Don't schedule screenshots if not tracking, paused, idle, or no time entry
-      if (!state.isTracking || state.isPaused || !state.currentTimeEntry || state.idlePauseStartTime !== null) {
-        await logger.safeLogToRust(`[SCREENSHOT] Cannot schedule: isTracking=${state.isTracking}, isPaused=${state.isPaused}, hasEntry=${!!state.currentTimeEntry}, isIdle=${state.idlePauseStartTime !== null}`).catch((e) => {
+      const entryId = state.currentTimeEntry?.id ?? await invoke<string | null>('get_last_time_entry_id').catch(() => null);
+      // Don't schedule screenshots if not tracking, paused, idle, or no time entry ID
+      if (!state.isTracking || state.isPaused || !entryId || entryId.startsWith('temp-') || state.idlePauseStartTime !== null) {
+        await logger.safeLogToRust(`[SCREENSHOT] Cannot schedule: isTracking=${state.isTracking}, isPaused=${state.isPaused}, hasEntryId=${!!entryId}, isIdle=${state.idlePauseStartTime !== null}`).catch((e) => {
           logger.debug('SCREENSHOT', 'Failed to log (non-critical)', e);
         });
         return; // Don't schedule if not tracking or idle
@@ -1172,8 +1192,9 @@ function App() {
       screenshotTimeout = setTimeout(async () => {
         if (!isCleanedUp) {
           const state = useTrackerStore.getState();
-          if (!state.isTracking || state.isPaused || !state.currentTimeEntry || state.idlePauseStartTime !== null) {
-            await logger.safeLogToRust(`[SCREENSHOT] Timeout fired but paused/idle — not taking screenshot, not scheduling next`).catch(() => {});
+          const entryId = state.currentTimeEntry?.id ?? await invoke<string | null>('get_last_time_entry_id').catch(() => null);
+          if (!state.isTracking || state.isPaused || !entryId || entryId.startsWith('temp-') || state.idlePauseStartTime !== null) {
+            await logger.safeLogToRust(`[SCREENSHOT] Timeout fired but paused/idle/no entry — not taking screenshot, not scheduling next`).catch(() => {});
             screenshotTimeout = null;
             return;
           }
@@ -1199,9 +1220,12 @@ function App() {
 
     const checkAndStartScreenshots = async () => {
       const state = useTrackerStore.getState();
-      
-      // Only start screenshots if tracking, not paused, not idle, and has time entry
-      if (state.isTracking && !state.isPaused && state.currentTimeEntry && state.idlePauseStartTime === null) {
+      const canStart = state.isTracking && !state.isPaused && state.idlePauseStartTime === null;
+      const hasEntry = !!state.currentTimeEntry;
+      const hasTimeEntryId = hasEntry || !!(await invoke<string | null>('get_last_time_entry_id').catch(() => null));
+
+      // Only start screenshots if tracking, not paused, not idle, and has time entry (or lastId fallback)
+      if (canStart && hasTimeEntryId) {
         // Start screenshots if not already scheduled
         if (!screenshotTimeout) {
           await logger.safeLogToRust('[SCREENSHOT] Starting screenshot scheduling...').catch((e) => {
@@ -1221,6 +1245,8 @@ function App() {
           });
           clearTimeout(screenshotTimeout);
           screenshotTimeout = null;
+        } else if (canStart && !hasTimeEntryId) {
+          await logger.safeLogToRust('[SCREENSHOT] Not starting: no time entry ID (currentTimeEntry or queue)').catch(() => {});
         }
       }
     };
@@ -1365,7 +1391,7 @@ function App() {
         const unlisten = await listen('request-idle-state-for-idle-window', async () => {
           logger.debug('APP', '🔔 Idle window requested current state');
           const state = useTrackerStore.getState();
-          const { idlePauseStartTime, isLoading, lastActivityTime, selectedProject, currentTimeEntry } = state;
+          const { idlePauseStartTime, idlePauseStartPerfRef, isLoading, lastActivityTime, lastActivityPerfRef, selectedProject, currentTimeEntry } = state;
           
           logger.debug('APP', '📊 Current state from store', { 
             idlePauseStartTime, 
@@ -1394,11 +1420,15 @@ function App() {
             });
             
             const lastActivityForRust = lastActivityTime && lastActivityTime > 0 ? Number(lastActivityTime) : null;
+            const lastActivityPerfRefForRust = lastActivityPerfRef ?? null;
+            const idlePauseStartPerfRefForRust = idlePauseStartPerfRef ?? null;
             const projectName = selectedProject?.name || currentTimeEntry?.project?.name || null;
             await invoke('update_idle_state', {
               idlePauseStartTime: pauseTimeForRust,
+              idlePauseStartPerfRef: idlePauseStartPerfRefForRust,
               isLoading: isLoading,
               lastActivityTime: lastActivityForRust,
+              lastActivityPerfRef: lastActivityPerfRefForRust,
               projectName,
             });
             logger.debug('APP', '✅ State sent to idle window successfully');
@@ -1444,7 +1474,7 @@ function App() {
   // This prevents stale closures where subscribe callback uses old version of sendStateUpdate
   const sendStateUpdate = useCallback(async () => {
     // Get fresh state each time
-    const { idlePauseStartTime, isLoading, isTakingScreenshot, lastActivityTime, selectedProject, currentTimeEntry } = useTrackerStore.getState();
+    const { idlePauseStartTime, idlePauseStartPerfRef, isLoading, isTakingScreenshot, lastActivityTime, lastActivityPerfRef, selectedProject, currentTimeEntry } = useTrackerStore.getState();
     // Don't block idle window buttons during screenshots
     // Only send isLoading=true if it's actually a loading operation, not a screenshot
     const effectiveIsLoading = isLoading && !isTakingScreenshot;
@@ -1468,11 +1498,15 @@ function App() {
       });
       
       const lastActivityForRust = lastActivityTime && lastActivityTime > 0 ? Number(lastActivityTime) : null;
+      const lastActivityPerfRefForRust = lastActivityPerfRef ?? null;
+      const idlePauseStartPerfRefForRust = idlePauseStartPerfRef ?? null;
       const projectName = selectedProject?.name || currentTimeEntry?.project?.name || null;
       await invoke('update_idle_state', {
         idlePauseStartTime: pauseTimeForRust,
+        idlePauseStartPerfRef: idlePauseStartPerfRefForRust,
         isLoading: effectiveIsLoading, // Don't block buttons during screenshots
         lastActivityTime: lastActivityForRust,
+        lastActivityPerfRef: lastActivityPerfRefForRust,
         projectName,
       });
       logger.debug('APP', 'State update sent successfully');

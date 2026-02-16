@@ -44,14 +44,12 @@ export function ProjectSelector() {
           <span className="text-sm text-muted-foreground">
             {!isOnline ? 'Offline — projects unavailable' : error}
           </span>
-          {isOnline && (
-            <button
-              onClick={() => loadProjects()}
-              className="text-xs text-foreground underline hover:no-underline"
-            >
-              Retry
-            </button>
-          )}
+          <button
+            onClick={() => loadProjects()}
+            className="text-xs text-foreground underline hover:no-underline"
+          >
+            Retry
+          </button>
         </div>
       ) : projects.length === 0 ? (
         <span className="text-sm text-muted-foreground">No projects</span>

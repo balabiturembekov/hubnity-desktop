@@ -76,7 +76,7 @@ impl TimerEngine {
 
         // Восстанавливаем состояние из БД
         if let Err(e) = engine.restore_state() {
-            eprintln!("[TIMER] Failed to restore state from DB: {}", e);
+            error!("[TIMER] Failed to restore state from DB: {}", e);
         }
 
         engine

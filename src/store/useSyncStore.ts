@@ -15,7 +15,7 @@ interface SyncStore {
   fetchSyncStatus: () => Promise<void>;
 }
 
-export const useSyncStore = create<SyncStore>((set) => ({
+export const useSyncStore = create<SyncStore>((set, get) => ({
   status: null,
   isLoading: true,
 
@@ -25,12 +25,11 @@ export const useSyncStore = create<SyncStore>((set) => ({
       set({ status: result, isLoading: false });
     } catch (error) {
       logger.error('SYNC_STORE', 'Failed to get sync status', error);
+      const prev = get().status;
       set({
-        status: {
-          pending_count: 0,
-          failed_count: 0,
-          is_online: false,
-        },
+        status: prev
+          ? { ...prev, is_online: false }
+          : { pending_count: 0, failed_count: 0, is_online: false },
         isLoading: false,
       });
     }

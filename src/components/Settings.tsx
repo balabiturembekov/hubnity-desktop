@@ -21,6 +21,8 @@ export function Settings() {
   const { idleThreshold, setIdleThreshold } = useTrackerStore();
   const { logout, user } = useAuthStore();
   const [threshold, setThreshold] = useState(idleThreshold);
+  const [sleepGapThreshold, setSleepGapThreshold] = useState(5);
+  const [loadedSleepGap, setLoadedSleepGap] = useState(5);
   const [isSaving, setIsSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   
@@ -113,6 +115,18 @@ export function Settings() {
     return () => clearInterval(interval);
   }, []);
 
+  // Load sleep gap threshold on mount
+  useEffect(() => {
+    invoke<number>('get_sleep_gap_threshold_minutes')
+      .then((m) => {
+        if (isMountedRef.current) {
+          setSleepGapThreshold(m);
+          setLoadedSleepGap(m);
+        }
+      })
+      .catch(() => {});
+  }, []);
+
   const handleSave = async () => {
     if (!isMountedRef.current) return;
     
@@ -125,15 +139,20 @@ export function Settings() {
       setThreshold(validThreshold);
       setIdleThreshold(validThreshold);
       
+      const validSleepGap = Math.max(1, Math.min(120, Math.floor(sleepGapThreshold)));
+      setSleepGapThreshold(validSleepGap);
+      setLoadedSleepGap(validSleepGap);
+      await invoke('set_sleep_gap_threshold_minutes', { minutes: validSleepGap });
+      
       // Log for debugging
-      await logger.safeLogToRust(`[SETTINGS] Idle threshold saved: ${validThreshold} minutes`).catch((e) => {
+      await logger.safeLogToRust(`[SETTINGS] Idle: ${validThreshold} min, sleep gap: ${validSleepGap} min`).catch((e) => {
         logger.debug('SETTINGS', 'Failed to log (non-critical)', e);
       });
       
       // Show notification
       await invoke('show_notification', {
         title: 'Settings saved',
-        body: `Idle threshold set: ${validThreshold} ${validThreshold === 1 ? 'minute' : 'minutes'}`,
+        body: `Idle: ${validThreshold} min, sleep detection: ${validSleepGap} min`,
       }).catch((e) => {
         logger.warn('SETTINGS', 'Failed to show notification (non-critical)', e);
       });
@@ -194,7 +213,7 @@ export function Settings() {
                 onClick={handleSave} 
                 size="default" 
                 className="h-9 px-4"
-                disabled={isSaving || threshold === idleThreshold}
+                disabled={isSaving || (threshold === idleThreshold && sleepGapThreshold === loadedSleepGap)}
               >
                 {isSaving ? (
                   'Saving...'
@@ -210,6 +229,30 @@ export function Settings() {
             </div>
             <p className="text-xs text-muted-foreground">
               Auto-pause after {idleThreshold} {idleThreshold === 1 ? 'minute' : 'minutes'} of inactivity
+            </p>
+          </div>
+          <div className="space-y-2 pt-2 border-t">
+            <Label htmlFor="sleep-gap" className="text-sm text-foreground">
+              Sleep detection threshold (min)
+            </Label>
+            <div className="flex gap-2">
+              <Input
+                id="sleep-gap"
+                type="number"
+                min="1"
+                max="120"
+                value={sleepGapThreshold}
+                onChange={(e) => {
+                  const value = Number(e.target.value);
+                  setSleepGapThreshold(Math.max(1, Math.min(120, value || 1)));
+                  setSaved(false);
+                }}
+                className="h-9"
+                disabled={isSaving}
+              />
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Pause timer when system sleep gap exceeds {sleepGapThreshold} min (1–120)
             </p>
           </div>
         </CardContent>

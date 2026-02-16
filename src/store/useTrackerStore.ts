@@ -21,11 +21,15 @@ export interface TrackerState {
   isTracking: boolean; // UI cache - источник истины в Rust Timer Engine
   isPaused: boolean; // UI cache - источник истины в Rust Timer Engine
   lastActivityTime: number;
+  /** performance.now() при последнем обновлении lastActivityTime — для монотонного elapsed (не прыгает при NTP) */
+  lastActivityPerfRef: number;
   idleThreshold: number; // in minutes, default 2
   isLoading: boolean;
   error: string | null;
   isTakingScreenshot: boolean; // Indicates if screenshot is being taken
   idlePauseStartTime: number | null; // Timestamp when paused due to inactivity
+  /** performance.now() при установке idlePauseStartTime — для монотонного idle display */
+  idlePauseStartPerfRef: number | null;
   urlActivities: UrlActivity[]; // Accumulated URL activities waiting to be sent
   localTimerStartTime: number | null; // Timestamp when timer was started locally (for sync protection)
   lastResumeTime: number | null; // Timestamp when timer was last resumed (for sync protection)
@@ -68,11 +72,13 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
   isTracking: false, // UI cache - синхронизируется с Rust Timer Engine
   isPaused: false, // UI cache - синхронизируется с Rust Timer Engine
   lastActivityTime: Date.now(),
+  lastActivityPerfRef: typeof performance !== 'undefined' ? performance.now() : Date.now(),
   idleThreshold: 2,
   isLoading: false,
   error: null,
   isTakingScreenshot: false,
   idlePauseStartTime: null,
+  idlePauseStartPerfRef: null,
   urlActivities: [], // Accumulated URL activities
   localTimerStartTime: null, // Track when timer was started locally
   lastResumeTime: null, // Track when timer was last resumed (for sync protection)
@@ -365,22 +371,39 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           isTracking: isTracking,
           isPaused: isPaused,
           selectedProject: restoredProject,
-          idlePauseStartTime: null, // FIX: Restoring from server — not idle state
+          idlePauseStartTime: null,
+  idlePauseStartPerfRef: null, // FIX: Restoring from server — not idle state
         });
+        if (!activeEntry.id.startsWith('temp-')) {
+          invoke('persist_time_entry_id', { id: activeEntry.id }).catch(() => {});
+        }
         // Don't set lastActivityTime here — restore/sync is not real user activity.
         // Activity monitor will update it when user actually interacts.
       }
     } catch (error: any) {
       // BUG FIX: Log error instead of silently failing
-      // Silent failures hide important issues like network errors or API changes
       logger.error('LOAD', 'Failed to load active time entry', error);
-      // Don't clear state on error - might be temporary network issue
-      // User can retry or sync will happen on next poll
+      // OFFLINE FIX: When API fails, sync store from Timer Engine so UI shows correct state
+      try {
+        const timerState = await TimerEngineAPI.getState();
+        if (timerState.state === 'RUNNING' || timerState.state === 'PAUSED') {
+          const isTracking = timerState.state === 'RUNNING' || timerState.state === 'PAUSED';
+          const isPaused = timerState.state === 'PAUSED';
+          set({
+            isTracking,
+            isPaused,
+            idlePauseStartTime: null,
+            idlePauseStartPerfRef: null,
+          });
+          logger.info('LOAD', `Offline: synced store from Timer Engine (${timerState.state})`);
+        }
+      } catch (engineError) {
+        logger.warn('LOAD', 'Failed to sync from Timer Engine after API error', engineError);
+      }
     }
   },
 
   selectProject: async (project: Project) => {
-    const { currentTimeEntry } = get();
     // BUG FIX: Check actual Timer Engine state instead of store cache
     let timerState: TimerStateResponse | null = null;
     try {
@@ -389,7 +412,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       logger.warn('SELECT_PROJECT', 'Failed to get Timer Engine state', error);
       // If we can't get state, use store as fallback (better than nothing)
       const { isTracking } = get();
-      if (isTracking && currentTimeEntry) {
+      if (isTracking) {
         logger.info('SELECT_PROJECT', 'Stopping tracking before switching project (using store cache)');
         try {
           await get().stopTracking();
@@ -404,8 +427,9 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
     }
     
     // Этап 2: при смене проекта во время трекинга сначала останавливаем таймер (как в Hubstaff)
+    // BUG FIX: Stop even when currentTimeEntry is null (e.g. after wake) — Timer Engine is source of truth
     const isTracking = timerState.state === 'RUNNING' || timerState.state === 'PAUSED';
-    if (isTracking && currentTimeEntry) {
+    if (isTracking) {
       logger.info('SELECT_PROJECT', 'Stopping tracking before switching project');
       try {
         await get().stopTracking();
@@ -449,34 +473,132 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       return;
     }
 
+    const currentUser = getCurrentUser() ?? useAuthStore.getState().user;
+    const requestData: { projectId: string; userId: string; description?: string } = {
+      projectId: selectedProject.id,
+      userId: user.id,
+      description: description || `Work on project ${selectedProject.name}`,
+    };
+
     try {
-      // Check for active time entries first (skip when offline — proceed with local start)
-      let activeEntries: TimeEntry[] = [];
+      const now = Date.now();
+      const nowStr = new Date(now).toISOString();
+      const optimisticEntry: TimeEntry = {
+        id: `temp-${now}`,
+        userId: user.id,
+        projectId: selectedProject.id,
+        startTime: nowStr,
+        endTime: null,
+        duration: 0,
+        description: requestData.description || `Work on project ${selectedProject.name}`,
+        status: 'RUNNING',
+        createdAt: nowStr,
+        updatedAt: nowStr,
+        project: {
+          id: selectedProject.id,
+          name: selectedProject.name,
+          color: selectedProject.color || '#6366f1',
+        },
+      };
+
+      // OPTIMISTIC UI: показываем таймер сразу при клике (до invoke)
+      const optimisticState: TimerStateResponse = {
+        state: 'RUNNING',
+        started_at: Math.floor(now / 1000),
+        elapsed_seconds: 0,
+        accumulated_seconds: 0,
+        session_start: Math.floor(now / 1000),
+        session_start_ms: now,
+        day_start: Math.floor(now / 1000),
+        today_seconds: 0,
+        restored_from_running: false,
+      };
+      set({
+        currentTimeEntry: optimisticEntry,
+        isTracking: true,
+        isPaused: false,
+        ...(fromSync ? {} : { lastActivityTime: now, lastActivityPerfRef: typeof performance !== 'undefined' ? performance.now() : now }),
+        isLoading: false,
+        error: null,
+        localTimerStartTime: now,
+        idlePauseStartTime: null,
+        idlePauseStartPerfRef: null,
+        lastTimerStateFromStart: optimisticState,
+        clientSessionStartMs: now,
+      });
+
+      let timerState: TimerStateResponse | null = null;
+      let clientStartMs: number | null = now;
       try {
-        activeEntries = await api.getActiveTimeEntries();
-      } catch (fetchError: any) {
-        logger.warn('START', 'Could not fetch active entries (offline?), proceeding with local start', fetchError);
-        // Use empty array — create new entry locally, enqueue will sync when online
+        // Прямой вызов start() — без лишнего getState() (экономит ~50–100 ms)
+        timerState = await TimerEngineAPI.start();
+      } catch (timerError: any) {
+        const msg = timerError?.message ?? '';
+        if (msg.includes('already running') || msg.includes('already paused')) {
+          timerState = await TimerEngineAPI.getState();
+        } else if (msg.includes('Paused') || msg.includes('resume') || msg.includes('use start')) {
+          try {
+            timerState = await TimerEngineAPI.resume();
+          } catch (_) {
+            timerState = await TimerEngineAPI.getState().catch(() => null);
+          }
+        } else {
+          const isSaveError = msg.includes('Failed to save state');
+          await invoke('show_notification', {
+            title: isSaveError ? 'Storage error' : 'Timer error',
+            body: isSaveError ? 'Could not save timer state. Check storage.' : 'Could not start timer',
+          }).catch((e) => logger.warn('START', 'Failed to show notification', e));
+          timerState = await TimerEngineAPI.getState().catch((e) => {
+            logger.logError('START:getState_fallback', e);
+            return null;
+          });
+        }
       }
 
-      // SECURITY: Filter out entries that don't belong to current user
-      const currentUser = getCurrentUser() ?? useAuthStore.getState().user;
-      if (currentUser) {
-        const userEntries = activeEntries.filter(entry => entry.userId === currentUser.id);
-        const foreignEntries = activeEntries.filter(entry => entry.userId !== currentUser.id);
-        
-        if (foreignEntries.length > 0) {
-          logger.error('START', `SECURITY: Found ${foreignEntries.length} active time entries belonging to other users. Current user: ${currentUser.id}, Foreign entries: ${foreignEntries.map(e => `${e.id} (user: ${e.userId})`).join(', ')}`);
+      const isStarted = timerState?.state === 'RUNNING' || timerState?.state === 'PAUSED' || false;
+
+      // OPTIMISTIC: UI сразу
+      set({
+        currentTimeEntry: optimisticEntry,
+        isTracking: isStarted,
+        isPaused: timerState?.state === 'PAUSED' || false,
+        ...(fromSync ? {} : { lastActivityTime: now, lastActivityPerfRef: typeof performance !== 'undefined' ? performance.now() : now }),
+        isLoading: false,
+        error: !isStarted ? 'Could not start timer' : null,
+        localTimerStartTime: isStarted ? now : null,
+        idlePauseStartTime: null,
+        idlePauseStartPerfRef: null,
+        lastTimerStateFromStart: timerState?.state === 'RUNNING' ? timerState : null,
+        clientSessionStartMs: isStarted && clientStartMs != null ? clientStartMs : null,
+      });
+
+      invoke('start_activity_monitoring').catch((e) => {
+        logger.error('START', 'Failed to start activity monitoring', e);
+      });
+
+      // API в фоне: getActiveTimeEntries → restore или create
+      if (isStarted) (async () => {
+        let activeEntries: TimeEntry[] = [];
+        try {
+          activeEntries = await api.getActiveTimeEntries();
+        } catch (fetchError: any) {
+          logger.warn('START', 'Could not fetch active entries (offline?), creating locally', fetchError);
         }
-        
-        // Use only user's entries
-        if (userEntries.length > 0) {
-          activeEntries.length = 0;
-          activeEntries.push(...userEntries);
+
+        if (currentUser) {
+          const userEntries = activeEntries.filter(entry => entry.userId === currentUser.id);
+          const foreignEntries = activeEntries.filter(entry => entry.userId !== currentUser.id);
+          if (foreignEntries.length > 0) {
+            logger.error('START', `SECURITY: Found ${foreignEntries.length} active time entries belonging to other users`);
+          }
+          if (userEntries.length > 0) {
+            activeEntries.length = 0;
+            activeEntries.push(...userEntries);
+          }
         }
-      }
-      if (activeEntries.length > 0) {
-        let activeEntry: TimeEntry;
+
+        if (activeEntries.length > 0) {
+          let activeEntry: TimeEntry;
         
         // FIX: Если несколько активных записей, выбираем самую свежую и останавливаем остальные
         if (activeEntries.length > 1) {
@@ -587,8 +709,12 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
             selectedProject: restoredProject,
             isLoading: false,
             error: null,
-            idlePauseStartTime: null, // FIX: Restoring from server — not idle
+            idlePauseStartTime: null,
+  idlePauseStartPerfRef: null, // FIX: Restoring from server — not idle
           });
+          if (!activeEntry.id.startsWith('temp-')) {
+            invoke('persist_time_entry_id', { id: activeEntry.id }).catch(() => {});
+          }
           // Don't set lastActivityTime — restore is not real user activity
           // Start activity monitoring
           await invoke('start_activity_monitoring');
@@ -670,170 +796,74 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
             selectedProject: restoredProject,
             isLoading: false,
             error: null, // Убираем error - состояние восстановлено, пользователь видит кнопки
-            idlePauseStartTime: null, // FIX: Restoring from server — not idle
+            idlePauseStartTime: null,
+  idlePauseStartPerfRef: null, // FIX: Restoring from server — not idle
           });
+          if (!activeEntry.id.startsWith('temp-')) {
+            invoke('persist_time_entry_id', { id: activeEntry.id }).catch(() => {});
+          }
           
           return; // Exit - don't create new entry
         } else {
           // Other status - stop it first
           await api.stopTimeEntry(activeEntry.id);
-          // Continue to create new entry
         }
-      }
-      
-      // Prepare request data - ensure description is provided
-      const requestData: { projectId: string; userId: string; description?: string } = {
-        projectId: selectedProject.id,
-        userId: user.id,
-      };
-      
-      // Add description if provided, otherwise use empty string or project name
-      if (description) {
-        requestData.description = description;
-      } else {
-        requestData.description = `Work on project ${selectedProject.name}`;
-      }
-      
-      // OPTIMISTIC: Сначала Timer Engine (локально), сразу обновляем UI
-      const now = Date.now();
-      const nowStr = new Date(now).toISOString();
-      const optimisticEntry: TimeEntry = {
-        id: `temp-${now}`,
-        userId: user.id,
-        projectId: selectedProject.id,
-        startTime: nowStr,
-        endTime: null,
-        duration: 0,
-        description: requestData.description || `Work on project ${selectedProject.name}`,
-        status: 'RUNNING',
-        createdAt: nowStr,
-        updatedAt: nowStr,
-        project: {
-          id: selectedProject.id,
-          name: selectedProject.name,
-          color: selectedProject.color || '#6366f1',
-        },
-      };
-      
-      let timerState: TimerStateResponse | null = null;
-      let clientStartMs: number | null = null;
-      try {
-        const currentTimerState = await TimerEngineAPI.getState();
-        if (currentTimerState.state === 'STOPPED') {
-          clientStartMs = Date.now();
-          timerState = await TimerEngineAPI.start();
-        } else if (currentTimerState.state === 'PAUSED') {
-          clientStartMs = Date.now();
-          timerState = await TimerEngineAPI.resume();
-        } else if (currentTimerState.state === 'RUNNING') {
-          timerState = currentTimerState;
         } else {
-          clientStartMs = Date.now();
-          timerState = await TimerEngineAPI.start();
-        }
-      } catch (timerError: any) {
-        if (timerError.message?.includes('already running') || 
-            timerError.message?.includes('already paused')) {
-          timerState = await TimerEngineAPI.getState();
-        } else {
-          await invoke('show_notification', {
-            title: 'Timer error',
-            body: 'Could not start timer',
+          // No active entries — create new
+          try {
+          const accessToken = api.getAccessToken() || localStorage.getItem('access_token') || '';
+          const refreshToken = localStorage.getItem('refresh_token');
+          const queueId = await invoke<number>('enqueue_time_entry', {
+            operation: 'start',
+            payload: requestData,
+            accessToken,
+            refreshToken: refreshToken || null,
           }).catch((e) => {
-            logger.warn('START', 'Failed to show notification (non-critical)', e);
-          });
-          timerState = await TimerEngineAPI.getState().catch((e) => {
-            logger.logError('START:getState_fallback', e);
+            logger.warn('START', 'Failed to enqueue (background)', e);
             return null;
           });
-        }
-      }
-      
-      const isStarted = timerState?.state === 'RUNNING' || timerState?.state === 'PAUSED' || false;
-      
-      // OPTIMISTIC: Обновляем UI сразу. clientSessionStartMs точнее Rust as_secs().
-      set({
-        currentTimeEntry: optimisticEntry,
-        isTracking: isStarted,
-        isPaused: timerState?.state === 'PAUSED' || false,
-        ...(fromSync ? {} : { lastActivityTime: now }), // Don't reset when from sync — not real user activity
-        isLoading: false,
-        error: !isStarted ? 'Could not start timer' : null,
-        localTimerStartTime: isStarted ? now : null,
-        idlePauseStartTime: null, // FIX: Starting — not idle
-        lastTimerStateFromStart: timerState?.state === 'RUNNING' ? timerState : null,
-        clientSessionStartMs: isStarted && clientStartMs != null ? clientStartMs : null,
-      });
-      
-      invoke('start_activity_monitoring').catch((e) => {
-        logger.error('START', 'Failed to start activity monitoring', e);
-      });
-      
-      // API в фоне
-      if (isStarted) (async () => {
-        try {
-          const accessToken = api.getAccessToken();
-          const refreshToken = localStorage.getItem('refresh_token');
-          let queueId: number | null = null;
-          if (accessToken) {
-            queueId = await invoke<number>('enqueue_time_entry', {
-              operation: 'start',
-              payload: requestData,
-              accessToken: accessToken,
-              refreshToken: refreshToken || null,
-            }).catch((e) => {
-              logger.warn('START', 'Failed to enqueue (background)', e);
-              return null;
-            });
-          }
           const timeEntry = await api.startTimeEntry(requestData);
-          await api.sendHeartbeat(true);
-          if (queueId != null) {
-            await invoke('mark_task_sent_by_id', { id: queueId }).catch(() => {});
-          }
-          const state = get();
-          if (state.isTracking && state.currentTimeEntry?.id?.startsWith('temp-')) {
+            await api.sendHeartbeat(true);
+            if (queueId != null) {
+              await invoke('mark_task_sent_by_id', { id: queueId }).catch(() => {});
+            }
+            const state = get();
+            if (state.isTracking && state.currentTimeEntry?.id?.startsWith('temp-')) {
+              set({
+                currentTimeEntry: timeEntry,
+                localTimerStartTime: null,
+              });
+              invoke('persist_time_entry_id', { id: timeEntry.id }).catch(() => {});
+            }
+          } catch (apiError: any) {
+            if (apiError.message?.includes('already running') ||
+                apiError.message?.includes('User already has')) {
+              try {
+                const activeEntries = await api.getActiveTimeEntries();
+                const userEntries = activeEntries.filter(e => e.userId === user.id);
+                const activeEntry = userEntries[0] ?? activeEntries[0];
+                if (activeEntry) {
+                  set({
+                    currentTimeEntry: activeEntry,
+                    localTimerStartTime: null,
+                    error: null,
+                    idlePauseStartTime: null,
+                    idlePauseStartPerfRef: null,
+                  });
+                  return;
+                }
+              } catch (_) {}
+            }
+            // OFFLINE FIX: Don't stop timer — enqueue already happened, sync will create entry when online
+            logger.warn('START', 'API failed (background), queue will retry', apiError);
             set({
-              currentTimeEntry: timeEntry,
-              localTimerStartTime: null,
+              error: 'Will sync when online',
             });
+            invoke('show_notification', {
+              title: 'Offline',
+              body: 'Timer running. Will sync when online.',
+            }).catch(() => {});
           }
-        } catch (apiError: any) {
-          if (apiError.message?.includes('already running') || 
-              apiError.message?.includes('User already has')) {
-            try {
-              const activeEntries = await api.getActiveTimeEntries();
-              const userEntries = activeEntries.filter(e => e.userId === user.id);
-              const activeEntry = userEntries[0] ?? activeEntries[0];
-              if (activeEntry) {
-                set({
-                  currentTimeEntry: activeEntry,
-                  localTimerStartTime: null,
-                  error: null,
-                  idlePauseStartTime: null, // FIX: Syncing to existing entry — not idle
-                });
-                return;
-              }
-            } catch (_) {}
-          }
-          logger.warn('START', 'API failed (background), queue will retry', apiError);
-          try {
-            await TimerEngineAPI.stop();
-          } catch (_) {}
-          set({
-            currentTimeEntry: null,
-            isTracking: false,
-            isPaused: false,
-            localTimerStartTime: null,
-            lastResumeTime: null,
-            idlePauseStartTime: null,
-            error: 'Could not create entry (will sync later)',
-          });
-          invoke('hide_idle_window').catch(() => {}); // FIX: Ensure idle window hidden on API failure
-          invoke('show_notification', {
-            title: 'Sync',
-            body: 'Timer started, but could not sync with server',
-          }).catch(() => {});
         }
       })();
     } catch (error: any) {
@@ -867,7 +897,8 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
               isPaused: timerState.state === 'PAUSED',
               isLoading: false,
               error: null,
-              idlePauseStartTime: null, // FIX: Syncing to existing entry — not idle
+              idlePauseStartTime: null,
+  idlePauseStartPerfRef: null, // FIX: Syncing to existing entry — not idle
             });
             return;
           }
@@ -915,17 +946,14 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           set({ isLoading: false });
           (async () => {
             try {
-              const accessToken = api.getAccessToken();
+              const accessToken = api.getAccessToken() || localStorage.getItem('access_token') || '';
               const refreshToken = localStorage.getItem('refresh_token');
-              let queueId: number | null = null;
-              if (accessToken) {
-                queueId = await invoke<number>('enqueue_time_entry', {
-                  operation: 'stop',
-                  payload: { id: entry.id },
-                  accessToken,
-                  refreshToken: refreshToken || null,
-                }).catch((e) => { logger.warn('PAUSE', 'Failed to enqueue stop (engine STOPPED)', e); return null; });
-              }
+              const queueId = await invoke<number>('enqueue_time_entry', {
+                operation: 'stop',
+                payload: { id: entry.id },
+                accessToken,
+                refreshToken: refreshToken || null,
+              }).catch((e) => { logger.warn('PAUSE', 'Failed to enqueue stop (engine STOPPED)', e); return null; });
               await api.stopTimeEntry(entry.id);
               await api.sendHeartbeat(false);
               if (queueId != null) {
@@ -942,6 +970,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           isTracking: false,
           isPaused: false,
           idlePauseStartTime: null,
+  idlePauseStartPerfRef: null,
           lastResumeTime: null,
           localTimerStartTime: null,
         });
@@ -986,17 +1015,14 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           if (runningEntry) {
             logger.info('PAUSE', `Found RUNNING entry on server (${runningEntry.id}), syncing pause`);
             await TimerEngineAPI.pause();
-            const accessToken = api.getAccessToken() || localStorage.getItem('access_token');
+            const accessToken = api.getAccessToken() || localStorage.getItem('access_token') || '';
             const refreshToken = localStorage.getItem('refresh_token');
-            let queueId: number | null = null;
-            if (accessToken) {
-              queueId = await invoke<number>('enqueue_time_entry', {
-                operation: 'pause',
-                payload: { id: runningEntry.id },
-                accessToken,
-                refreshToken: refreshToken || null,
-              }).catch((e) => { logger.warn('PAUSE', 'Failed to enqueue pause', e); return null; });
-            }
+            const queueId = await invoke<number>('enqueue_time_entry', {
+              operation: 'pause',
+              payload: { id: runningEntry.id },
+              accessToken,
+              refreshToken: refreshToken || null,
+            }).catch((e) => { logger.warn('PAUSE', 'Failed to enqueue pause', e); return null; });
             try {
               await api.pauseTimeEntry(runningEntry.id);
               await api.sendHeartbeat(false);
@@ -1013,6 +1039,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
               isLoading: false,
               error: null,
               idlePauseStartTime: isIdlePause ? Date.now() : null,
+              idlePauseStartPerfRef: isIdlePause ? (typeof performance !== 'undefined' ? performance.now() : Date.now()) : null,
             });
             await invoke('stop_activity_monitoring').catch(() => {});
             return;
@@ -1054,12 +1081,27 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
               if (anyEntry) entryForStop = anyEntry;
             }
           } catch (_) {}
+          // FIX: При офлайне API не доступен — используем сохранённый ID для enqueue
+          if (!entryForStop) {
+            const lastId = await invoke<string | null>('get_last_time_entry_id').catch(() => null);
+            if (lastId && !lastId.startsWith('temp-')) {
+              const accessToken = api.getAccessToken() || localStorage.getItem('access_token') || '';
+              const refreshToken = localStorage.getItem('refresh_token');
+              await invoke<number>('enqueue_time_entry', {
+                operation: 'pause',
+                payload: { id: lastId },
+                accessToken,
+                refreshToken: refreshToken || null,
+              }).catch((e) => logger.warn('PAUSE', 'Failed to enqueue (no-entry path)', e));
+            }
+          }
           set({
             isPaused: true,
             isTracking: true,
             isLoading: false,
             error: null,
             idlePauseStartTime: isIdlePause ? Date.now() : null,
+            idlePauseStartPerfRef: isIdlePause ? (typeof performance !== 'undefined' ? performance.now() : Date.now()) : null,
             ...(entryForStop ? { currentTimeEntry: entryForStop } : {}),
           });
           await invoke('stop_activity_monitoring').catch(() => {});
@@ -1083,6 +1125,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
               isLoading: false,
               error: null,
               idlePauseStartTime: isIdlePause ? Date.now() : null,
+              idlePauseStartPerfRef: isIdlePause ? (typeof performance !== 'undefined' ? performance.now() : Date.now()) : null,
             });
             await invoke('stop_activity_monitoring').catch(() => {});
             return;
@@ -1155,6 +1198,10 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       logger.debug('PAUSE', 'Failed to log message (non-critical)', e);
     });
 
+    if (!timeEntryToPause.id.startsWith('temp-')) {
+      invoke('persist_time_entry_id', { id: timeEntryToPause.id }).catch(() => {});
+    }
+
     try {
       set({ error: null }); // Clear previous errors (isLoading уже установлен выше)
       
@@ -1206,9 +1253,11 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
             timerError.message?.includes('Cannot pause')) {
           timerState = await TimerEngineAPI.getState();
         } else {
+          const msg = timerError?.message ?? '';
+          const isSaveError = msg.includes('Failed to save state');
           await invoke('show_notification', {
-            title: 'Timer error',
-            body: 'Could not pause timer',
+            title: isSaveError ? 'Storage error' : 'Timer error',
+            body: isSaveError ? 'Could not save timer state. Check storage.' : 'Could not pause timer',
           }).catch((e) => {
             logger.warn('PAUSE', 'Failed to show notification (non-critical)', e);
           });
@@ -1220,6 +1269,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       }
       
       const pauseStartTime = isIdlePause ? Date.now() : null;
+      const pausePerfRef = isIdlePause ? (typeof performance !== 'undefined' ? performance.now() : Date.now()) : null;
       const isPaused = timerState?.state === 'PAUSED' || false;
       
       // OPTIMISTIC: Обновляем UI сразу после Timer Engine — без ожидания API
@@ -1230,6 +1280,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         error: !isPaused ? 'Could not pause' : null,
         localTimerStartTime: null,
         idlePauseStartTime: pauseStartTime,
+        idlePauseStartPerfRef: pausePerfRef,
         lastTimerStateFromStart: null,
         clientSessionStartMs: null,
       });
@@ -1240,6 +1291,22 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       });
       
       // API в фоне, только если пауза успешна (пропускаем temp id — запись ещё не создана)
+      // FIX: Enqueue СРАЗУ (до любых сетевых вызовов), чтобы при офлайне задача попадала в очередь
+      // Токен не нужен для enqueue (Rust получает его при sync), но передаём для совместимости
+      let queueIdPause: number | null = null;
+      if (isPaused && !entryIdToPause.startsWith('temp-')) {
+        const accessToken = api.getAccessToken() || localStorage.getItem('access_token') || '';
+        const refreshToken = localStorage.getItem('refresh_token');
+        queueIdPause = await invoke<number>('enqueue_time_entry', {
+          operation: 'pause',
+          payload: { id: entryIdToPause },
+          accessToken,
+          refreshToken: refreshToken || null,
+        }).catch((e) => {
+          logger.warn('PAUSE', 'Failed to enqueue', e);
+          return null;
+        });
+      }
       if (isPaused && !entryIdToPause.startsWith('temp-')) (async () => {
         try {
           await get().sendUrlActivities();
@@ -1247,20 +1314,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           logger.warn('PAUSE', 'Failed to send URL activities (background)', e);
         }
         try {
-          const accessToken = api.getAccessToken();
-          const refreshToken = localStorage.getItem('refresh_token');
-          let queueId: number | null = null;
-          if (accessToken) {
-            queueId = await invoke<number>('enqueue_time_entry', {
-              operation: 'pause',
-              payload: { id: entryIdToPause },
-              accessToken: accessToken,
-              refreshToken: refreshToken || null,
-            }).catch((e) => {
-              logger.warn('PAUSE', 'Failed to enqueue (background)', e);
-              return null;
-            });
-          }
+          const queueId = queueIdPause;
           await api.pauseTimeEntry(entryIdToPause);
           await api.sendHeartbeat(false);
           if (queueId != null) {
@@ -1289,7 +1343,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       } else if (isIdlePause && stateAfterPause.isPaused && !stateAfterPause.idlePauseStartTime) {
         // FIX: Если это был idle pause, isPaused установился, но idlePauseStartTime не установлен - устанавливаем его
         logger.warn('PAUSE', `Idle pause successful but idlePauseStartTime not set, setting it now`);
-        set({ idlePauseStartTime: Date.now() });
+        set({ idlePauseStartTime: Date.now(), idlePauseStartPerfRef: typeof performance !== 'undefined' ? performance.now() : Date.now() });
       }
       
       await logger.safeLogToRust(`[PAUSE] State after pause: isTracking=${stateAfterPause.isTracking}, isPaused=${stateAfterPause.isPaused}, isLoading=${stateAfterPause.isLoading}, idlePauseStartTime=${stateAfterPause.idlePauseStartTime}`).catch((e) => {
@@ -1319,6 +1373,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           isLoading: false,
           error: null,
           idlePauseStartTime: null,
+  idlePauseStartPerfRef: null,
           lastResumeTime: null,
           localTimerStartTime: null,
         });
@@ -1341,7 +1396,8 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
             isLoading: false,
             error: wasPausedSuccessfully ? null : msg, // Clear error if pause was successful
             idlePauseStartTime: (timerState.state === 'PAUSED' && isIdlePause) ? Date.now() : null,
-            ...(timerState.state === 'STOPPED' ? { currentTimeEntry: null, idlePauseStartTime: null, lastResumeTime: null, localTimerStartTime: null } : {}),
+            idlePauseStartPerfRef: (timerState.state === 'PAUSED' && isIdlePause) ? (typeof performance !== 'undefined' ? performance.now() : Date.now()) : null,
+            ...(timerState.state === 'STOPPED' ? { currentTimeEntry: null, idlePauseStartTime: null, idlePauseStartPerfRef: null, lastResumeTime: null, localTimerStartTime: null } : {}),
           });
           if (wasPausedSuccessfully) {
             logger.info('PAUSE', 'Timer Engine paused successfully despite API error - state synced, error cleared');
@@ -1418,6 +1474,19 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
     if (!initialTimeEntry) {
       logger.info('RESUME', 'No currentTimeEntry, but Timer Engine is PAUSED - resuming Timer Engine only');
       try {
+        // FIX: Enqueue resume СРАЗУ (до loadActiveTimeEntry), используя сохранённый ID — при офлайне loadActiveTimeEntry не успеет
+        const lastId = await invoke<string | null>('get_last_time_entry_id').catch(() => null);
+        let queueIdFromEnqueue: number | null = null;
+        if (lastId && !lastId.startsWith('temp-')) {
+          const accessToken = api.getAccessToken() || localStorage.getItem('access_token') || '';
+          const refreshToken = localStorage.getItem('refresh_token');
+          queueIdFromEnqueue = await invoke<number>('enqueue_time_entry', {
+            operation: 'resume',
+            payload: { id: lastId },
+            accessToken,
+            refreshToken: refreshToken || null,
+          }).catch((e) => { logger.warn('RESUME', 'Failed to enqueue (no-entry branch)', e); return null; });
+        }
         // Resume Timer Engine directly
         await TimerEngineAPI.resume();
         // Update store state
@@ -1429,6 +1498,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           isLoading: false,
           error: null,
           idlePauseStartTime: null,
+  idlePauseStartPerfRef: null,
           ...(fromSync ? {} : { lastActivityTime: resumeTimeNoEntry }), // Don't reset when from sync — not real user activity
           lastResumeTime: resumeTimeNoEntry, // BUG FIX: Track resume time to prevent sync from pausing immediately after resume
           localTimerStartTime: resumeTimeNoEntry, // BUG FIX: Track local resume time to prevent auto-pause from syncTimerState
@@ -1437,23 +1507,27 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           logger.error('RESUME', 'Failed to start activity monitoring on resume (no entry)', e);
         });
         invoke('hide_idle_window').catch(() => {});
-        // Try to load active time entry after resume
-        await get().loadActiveTimeEntry();
-        // FIX: Sync resume with server — loadActiveTimeEntry may have set PAUSED entry, we need to resume it on API
+        // BUG FIX: Await loadActiveTimeEntry before reading currentTimeEntry — otherwise entryAfterLoad is always null
+        await get().loadActiveTimeEntry().catch((e) => logger.warn('RESUME', 'loadActiveTimeEntry failed', e));
+        // FIX: Sync resume with server — loadActiveTimeEntry может установить entry, тогда API вызов в фоне
         const entryAfterLoad = get().currentTimeEntry;
         if (entryAfterLoad && !entryAfterLoad.id.startsWith('temp-')) {
           (async () => {
             try {
-              const accessToken = api.getAccessToken();
+              const accessToken = api.getAccessToken() || localStorage.getItem('access_token') || '';
               const refreshToken = localStorage.getItem('refresh_token');
-              let queueId: number | null = null;
-              if (accessToken) {
-                queueId = await invoke<number>('enqueue_time_entry', {
-                  operation: 'resume',
-                  payload: { id: entryAfterLoad.id },
-                  accessToken,
-                  refreshToken: refreshToken || null,
-                }).catch((e) => { logger.warn('RESUME', 'Failed to enqueue (no-entry branch)', e); return null; });
+              let queueId: number | null = queueIdFromEnqueue;
+              // BUG FIX: Don't double-enqueue when we already enqueued with lastId === entryAfterLoad.id
+              if (queueId == null || lastId !== entryAfterLoad.id) {
+                queueId = null;
+                if (accessToken) {
+                  queueId = await invoke<number>('enqueue_time_entry', {
+                    operation: 'resume',
+                    payload: { id: entryAfterLoad.id },
+                    accessToken,
+                    refreshToken: refreshToken || null,
+                  }).catch((e) => { logger.warn('RESUME', 'Failed to enqueue (no-entry branch bg)', e); return null; });
+                }
               }
               await api.resumeTimeEntry(entryAfterLoad.id);
               await api.sendHeartbeat(true);
@@ -1497,46 +1571,114 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
     }
 
     try {
-      
-      // FIX: Проверяем актуальный статус entry на сервере перед попыткой возобновления
-      // Это предотвращает ошибку "Only paused entries can be resumed" если entry уже не на паузе
+      const entryIdToResume = timeEntryToResume.id;
+      const clientResumeMs = Date.now();
+      // OPTIMISTIC UI: показываем RUNNING сразу (используем elapsed из timerState проверки выше)
+      const optimisticResumeState: TimerStateResponse = timerState ? {
+        state: 'RUNNING',
+        started_at: Math.floor(clientResumeMs / 1000),
+        elapsed_seconds: timerState.elapsed_seconds,
+        accumulated_seconds: timerState.accumulated_seconds,
+        session_start: Math.floor(clientResumeMs / 1000),
+        session_start_ms: clientResumeMs,
+        day_start: timerState.day_start ?? Math.floor(clientResumeMs / 1000),
+        today_seconds: timerState.today_seconds ?? timerState.elapsed_seconds,
+        restored_from_running: false,
+      } : {
+        state: 'RUNNING',
+        started_at: Math.floor(clientResumeMs / 1000),
+        elapsed_seconds: 0,
+        accumulated_seconds: 0,
+        session_start: Math.floor(clientResumeMs / 1000),
+        session_start_ms: clientResumeMs,
+        day_start: Math.floor(clientResumeMs / 1000),
+        today_seconds: 0,
+        restored_from_running: false,
+      };
+      set({
+        isPaused: false,
+        isTracking: true,
+        lastActivityTime: clientResumeMs,
+        lastActivityPerfRef: typeof performance !== 'undefined' ? performance.now() : clientResumeMs,
+        isLoading: false,
+        error: null,
+        idlePauseStartTime: null,
+        idlePauseStartPerfRef: null,
+        lastResumeTime: clientResumeMs,
+        localTimerStartTime: clientResumeMs,
+        lastTimerStateFromStart: optimisticResumeState,
+        clientSessionStartMs: clientResumeMs,
+      });
+
+      let resumeTimerState: import('../lib/timer-engine').TimerStateResponse | null = null;
       try {
-        const activeEntries = await api.getActiveTimeEntries();
-        const serverEntry = activeEntries.find(e => e.id === timeEntryToResume.id);
-        
-        if (serverEntry) {
-          if (serverEntry.status === 'RUNNING') {
-            // Entry уже запущен на сервере - синхронизируем локальное состояние
-            logger.info('RESUME', 'Entry already RUNNING on server, syncing local state');
-            const timerState = await TimerEngineAPI.getState();
-            if (timerState.state !== 'RUNNING') {
-              try {
-                await TimerEngineAPI.resume();
-              } catch (e: any) {
-                if (!e.message?.includes('already running')) {
-                  logger.warn('RESUME', 'Failed to resume Timer Engine', e);
-                }
-              }
-            }
-            const syncResumeTime = Date.now();
-            set({
-              currentTimeEntry: serverEntry,
-              isPaused: false,
-              isTracking: true,
-              isLoading: false,
-              error: null,
-              idlePauseStartTime: null,
-              ...(fromSync ? {} : { lastActivityTime: syncResumeTime }), // Don't reset when from sync
-              lastResumeTime: syncResumeTime,
-              localTimerStartTime: syncResumeTime,
-            });
-            invoke('start_activity_monitoring').catch((e) => {
-              logger.error('RESUME', 'Failed to start activity monitoring on sync resume', e);
-            });
-            invoke('hide_idle_window').catch(() => {});
-            return;
-          } else if (serverEntry.status === 'STOPPED') {
-            // Entry остановлен на сервере - синхронизируем локальное состояние и Timer Engine
+        resumeTimerState = await TimerEngineAPI.resume();
+      } catch (resumeError: any) {
+        if (resumeError?.message?.includes('already running')) {
+          resumeTimerState = await TimerEngineAPI.getState();
+        } else {
+          const msg = resumeError?.message ?? '';
+          const isSaveError = msg.includes('Failed to save state');
+          await invoke('show_notification', {
+            title: isSaveError ? 'Storage error' : 'Timer error',
+            body: isSaveError ? 'Could not save timer state. Check storage.' : 'Could not resume timer',
+          }).catch((e) => logger.warn('RESUME', 'Failed to show notification', e));
+          resumeTimerState = await TimerEngineAPI.getState().catch(() => null);
+        }
+      }
+
+      const isResumed = resumeTimerState?.state === 'RUNNING' || false;
+      const resumeTime = Date.now();
+      const isPausedActual = resumeTimerState?.state === 'PAUSED' || false;
+      const isTrackingActual = resumeTimerState?.state === 'RUNNING' || resumeTimerState?.state === 'PAUSED' || false;
+      set({
+        currentTimeEntry: timeEntryToResume,
+        isPaused: isResumed ? false : isPausedActual,
+        isTracking: isResumed ? true : isTrackingActual,
+        ...(fromSync ? {} : { lastActivityTime: resumeTime, lastActivityPerfRef: typeof performance !== 'undefined' ? performance.now() : resumeTime }),
+        isLoading: false,
+        error: !isResumed ? 'Could not resume timer' : null,
+        idlePauseStartTime: isResumed ? null : (get().idlePauseStartTime ?? null),
+        lastResumeTime: isResumed ? resumeTime : get().lastResumeTime,
+        localTimerStartTime: isResumed ? resumeTime : get().localTimerStartTime,
+        lastTimerStateFromStart: resumeTimerState?.state === 'RUNNING' ? resumeTimerState : null,
+        clientSessionStartMs: isResumed ? clientResumeMs : null,
+      });
+      if (!timeEntryToResume.id.startsWith('temp-')) {
+        invoke('persist_time_entry_id', { id: timeEntryToResume.id }).catch(() => {});
+      }
+      
+      if (isResumed) {
+        invoke('start_activity_monitoring').catch((e) => {
+          logger.error('RESUME', 'Failed to start activity monitoring on resume', e);
+        });
+        invoke('hide_idle_window').catch(() => {});
+      }
+      
+      // FIX: Enqueue СРАЗУ (до любых сетевых вызовов), чтобы при офлайне задача попадала в очередь
+      // Токен не нужен для enqueue (Rust получает его при sync), но передаём для совместимости
+      let queueIdResume: number | null = null;
+      if (isResumed && !entryIdToResume.startsWith('temp-')) {
+        const accessToken = api.getAccessToken() || localStorage.getItem('access_token') || '';
+        const refreshToken = localStorage.getItem('refresh_token');
+        queueIdResume = await invoke<number>('enqueue_time_entry', {
+          operation: 'resume',
+          payload: { id: entryIdToResume },
+          accessToken,
+          refreshToken: refreshToken || null,
+        }).catch((e) => {
+          logger.warn('RESUME', 'Failed to enqueue', e);
+          return null;
+        });
+      }
+      
+      // API в фоне: проверка сервера + resume
+      if (isResumed && !entryIdToResume.startsWith('temp-')) (async () => {
+        try {
+          // Проверка статуса на сервере (для reconcile)
+          const activeEntries = await api.getActiveTimeEntries();
+          const serverEntry = activeEntries.find(e => e.id === entryIdToResume);
+          if (serverEntry?.status === 'STOPPED') {
             logger.info('RESUME', 'Entry is STOPPED on server, syncing local state');
             try {
               const engineState = await TimerEngineAPI.getState();
@@ -1553,86 +1695,18 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
               isLoading: false,
               error: null,
               idlePauseStartTime: null,
+              idlePauseStartPerfRef: null,
               lastResumeTime: null,
               localTimerStartTime: null,
             });
-            invoke('hide_idle_window').catch(() => {}); // FIX: Entry stopped on server — sync state
+            invoke('hide_idle_window').catch(() => {});
             try { await invoke('stop_activity_monitoring'); } catch (_) { /* ignore */ }
             return;
-          } else if (serverEntry.status !== 'PAUSED') {
-            // Entry в неожиданном статусе
-            throw new Error(`Entry status on server is ${serverEntry.status}, expected PAUSED`);
           }
-        }
-      } catch (syncError: any) {
-        logger.warn('RESUME', 'Failed to check server entry status, proceeding with resume', syncError);
-        // Продолжаем попытку возобновления - возможно, это временная проблема сети
-      }
-      
-      // OPTIMISTIC: Сначала Timer Engine (локально), сразу обновляем UI
-      const entryIdToResume = timeEntryToResume.id;
-      const clientResumeMs = Date.now();
-      let timerState: import('../lib/timer-engine').TimerStateResponse | null = null;
-      try {
-        timerState = await TimerEngineAPI.resume();
-      } catch (timerError: any) {
-        if (timerError.message?.includes('already running')) {
-          timerState = await TimerEngineAPI.getState();
-        } else {
-          await invoke('show_notification', {
-            title: 'Timer error',
-            body: 'Could not resume timer',
-          }).catch((e) => {
-            logger.warn('RESUME', 'Failed to show notification (non-critical)', e);
-          });
-          timerState = await TimerEngineAPI.getState().catch(() => null);
-        }
-      }
-      
-      const isResumed = timerState?.state === 'RUNNING' || false;
-      const resumeTime = Date.now();
-      
-      // OPTIMISTIC: Обновляем UI сразу (sync with Timer Engine when resume failed)
-      const isPausedActual = timerState?.state === 'PAUSED' || false;
-      const isTrackingActual = timerState?.state === 'RUNNING' || timerState?.state === 'PAUSED' || false;
-      set({
-        currentTimeEntry: timeEntryToResume,
-        isPaused: isResumed ? false : isPausedActual,
-        isTracking: isResumed ? true : isTrackingActual,
-        ...(fromSync ? {} : { lastActivityTime: resumeTime }), // Don't reset when from sync — not real user activity
-        isLoading: false,
-        error: !isResumed ? 'Could not resume timer' : null,
-        idlePauseStartTime: isResumed ? null : (get().idlePauseStartTime ?? null), // FIX: Preserve idle when resume failed
-        lastResumeTime: isResumed ? resumeTime : get().lastResumeTime,
-        localTimerStartTime: isResumed ? resumeTime : get().localTimerStartTime,
-        lastTimerStateFromStart: timerState?.state === 'RUNNING' ? timerState : null,
-        clientSessionStartMs: isResumed ? clientResumeMs : null,
-      });
-      
-      if (isResumed) {
-        invoke('start_activity_monitoring').catch((e) => {
-          logger.error('RESUME', 'Failed to start activity monitoring on resume', e);
-        });
-        invoke('hide_idle_window').catch(() => {});
-      }
-      
-      // API в фоне (пропускаем temp id — запись ещё не создана)
-      if (isResumed && !entryIdToResume.startsWith('temp-')) (async () => {
-        try {
-          const accessToken = api.getAccessToken();
-          const refreshToken = localStorage.getItem('refresh_token');
-          let queueId: number | null = null;
-          if (accessToken) {
-            queueId = await invoke<number>('enqueue_time_entry', {
-              operation: 'resume',
-              payload: { id: entryIdToResume },
-              accessToken: accessToken,
-              refreshToken: refreshToken || null,
-            }).catch((e) => {
-              logger.warn('RESUME', 'Failed to enqueue (background)', e);
-              return null;
-            });
+          if (serverEntry?.status === 'RUNNING') {
+            set({ currentTimeEntry: serverEntry });
           }
+          const queueId = queueIdResume;
           await api.resumeTimeEntry(entryIdToResume);
           await api.sendHeartbeat(true);
           if (queueId != null) {
@@ -1671,6 +1745,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
               isLoading: false,
               error: null,
               idlePauseStartTime: null,
+  idlePauseStartPerfRef: null,
               lastResumeTime: resumeTimeForSync, // BUG FIX: Track resume time to prevent sync from pausing immediately after resume
               localTimerStartTime: resumeTimeForSync, // BUG FIX: Track local resume time to prevent auto-pause from syncTimerState
             });
@@ -1715,6 +1790,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           isLoading: false,
           error: null,
           idlePauseStartTime: null,
+  idlePauseStartPerfRef: null,
           lastResumeTime: null,
           localTimerStartTime: null,
         });
@@ -1779,28 +1855,46 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
     // It may have changed between initial check and now
     let timeEntryToStop = get().currentTimeEntry;
     
-    // Если нет currentTimeEntry, но таймер работает — пробуем загрузить с сервера
+    // Если нет currentTimeEntry, но таймер работает — пробуем загрузить (как в pauseTracking)
     if (!timeEntryToStop) {
-      const currentUser = getCurrentUser() ?? useAuthStore.getState().user;
-      if (currentUser) {
-        try {
-          const activeEntries = await api.getActiveTimeEntries();
-          const userEntry = activeEntries.find((e) => e.userId === currentUser.id);
-          if (userEntry) {
-            timeEntryToStop = userEntry;
-          }
-        } catch (_) {}
+      try {
+        await get().loadActiveTimeEntry();
+        timeEntryToStop = get().currentTimeEntry;
+      } catch (_) {}
+      if (!timeEntryToStop) {
+        const currentUser = getCurrentUser() ?? useAuthStore.getState().user;
+        if (currentUser) {
+          try {
+            const activeEntries = await api.getActiveTimeEntries();
+            const userEntry = activeEntries.find((e) => e.userId === currentUser.id);
+            if (userEntry) {
+              timeEntryToStop = userEntry;
+            }
+          } catch (_) {}
+        }
       }
     }
 
-    // Если по-прежнему нет currentTimeEntry — просто останавливаем движок
+    // Если по-прежнему нет currentTimeEntry — останавливаем движок и enqueue stop (офлайн)
     if (!timeEntryToStop) {
+      const lastId = await invoke<string | null>('get_last_time_entry_id').catch(() => null);
+      if (lastId && !lastId.startsWith('temp-')) {
+        const accessToken = api.getAccessToken() || localStorage.getItem('access_token') || '';
+        const refreshToken = localStorage.getItem('refresh_token');
+        await invoke<number>('enqueue_time_entry', {
+          operation: 'stop',
+          payload: { id: lastId },
+          accessToken,
+          refreshToken: refreshToken || null,
+        }).catch((e) => logger.warn('STOP', 'Failed to enqueue (no-entry path)', e));
+      }
       try {
         const timerState = await TimerEngineAPI.getState();
         if (timerState.state !== 'STOPPED') {
           await TimerEngineAPI.stop();
         }
         await invoke('stop_activity_monitoring');
+        invoke('persist_time_entry_id', { id: null }).catch(() => {});
         set({
           currentTimeEntry: null,
           isTracking: false,
@@ -1808,6 +1902,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           isLoading: false,
           error: null,
           idlePauseStartTime: null,
+  idlePauseStartPerfRef: null,
           localTimerStartTime: null,
           lastResumeTime: null,
         });
@@ -1835,9 +1930,11 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         if (timerError.message?.includes('already stopped')) {
           timerState = await TimerEngineAPI.getState();
         } else {
+          const msg = timerError?.message ?? '';
+          const isSaveError = msg.includes('Failed to save state');
           await invoke('show_notification', {
-            title: 'Timer error',
-            body: 'Could not stop timer',
+            title: isSaveError ? 'Storage error' : 'Timer error',
+            body: isSaveError ? 'Could not save timer state. Check storage.' : 'Could not stop timer',
           }).catch((e) => {
             logger.warn('STOP', 'Failed to show notification (non-critical)', e);
           });
@@ -1847,7 +1944,17 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       
       const isStopped = timerState?.state === 'STOPPED' || false;
       
+      // BUG FIX: Send URL activities BEFORE clearing currentTimeEntry — sendUrlActivities needs it for filtering
+      if (isStopped && !entryIdToStop.startsWith('temp-')) {
+        try {
+          await get().sendUrlActivities();
+        } catch (e) {
+          logger.warn('STOP', 'Failed to send URL activities', e);
+        }
+      }
+      
       // OPTIMISTIC: Обновляем UI сразу
+      invoke('persist_time_entry_id', { id: null }).catch(() => {});
       set({
         currentTimeEntry: null,
         isTracking: timerState?.state === 'RUNNING' || timerState?.state === 'PAUSED' || false,
@@ -1855,6 +1962,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         isLoading: false,
         error: !isStopped ? 'Could not stop timer' : null,
         idlePauseStartTime: null,
+  idlePauseStartPerfRef: null,
         localTimerStartTime: null,
         lastResumeTime: null,
         lastTimerStateFromStart: null,
@@ -1867,28 +1975,25 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       
       invoke('hide_idle_window').catch(() => {});
       
+      // FIX: Enqueue СРАЗУ (до любых сетевых вызовов), чтобы при офлайне задача попадала в очередь
+      let queueIdStop: number | null = null;
+      if (isStopped && !entryIdToStop.startsWith('temp-')) {
+        const accessToken = api.getAccessToken() || localStorage.getItem('access_token') || '';
+        const refreshToken = localStorage.getItem('refresh_token');
+        queueIdStop = await invoke<number>('enqueue_time_entry', {
+          operation: 'stop',
+          payload: { id: entryIdToStop },
+          accessToken,
+          refreshToken: refreshToken || null,
+        }).catch((e) => {
+          logger.warn('STOP', 'Failed to enqueue', e);
+          return null;
+        });
+      }
       // API в фоне (пропускаем если entry с temp id — запись ещё не создана на сервере)
       if (isStopped && !entryIdToStop.startsWith('temp-')) (async () => {
         try {
-          await get().sendUrlActivities();
-        } catch (e) {
-          logger.warn('STOP', 'Failed to send URL activities (background)', e);
-        }
-        try {
-          const accessToken = api.getAccessToken();
-          const refreshToken = localStorage.getItem('refresh_token');
-          let queueId: number | null = null;
-          if (accessToken) {
-            queueId = await invoke<number>('enqueue_time_entry', {
-              operation: 'stop',
-              payload: { id: entryIdToStop },
-              accessToken: accessToken,
-              refreshToken: refreshToken || null,
-            }).catch((e) => {
-              logger.warn('STOP', 'Failed to enqueue (background)', e);
-              return null;
-            });
-          }
+          const queueId = queueIdStop;
           await api.stopTimeEntry(entryIdToStop);
           await api.sendHeartbeat(false);
           if (queueId != null) {
@@ -1926,6 +2031,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           isLoading: false,
           error: null,
           idlePauseStartTime: null,
+  idlePauseStartPerfRef: null,
           lastResumeTime: null,
           localTimerStartTime: null,
         });
@@ -1945,7 +2051,8 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
             isTracking: timerState.state === 'RUNNING' || timerState.state === 'PAUSED',
             isLoading: false,
             error: msg,
-            ...(timerState.state === 'STOPPED' ? { currentTimeEntry: null, idlePauseStartTime: null, lastResumeTime: null, localTimerStartTime: null } : {}),
+            ...(timerState.state === 'STOPPED' ? { currentTimeEntry: null, idlePauseStartTime: null,
+  idlePauseStartPerfRef: null, lastResumeTime: null, localTimerStartTime: null } : {}),
           });
           if (timerState.state === 'STOPPED') {
             invoke('hide_idle_window').catch(() => {}); // FIX: Sync to STOPPED — ensure idle window hidden
@@ -1973,9 +2080,11 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       return;
     }
     const now = Date.now();
+    const perfNow = typeof performance !== 'undefined' ? performance.now() : now;
     // If Rust passes idle_secs, lastActivity was actually (now - idleSecs) ago
     const lastActivity = idleSecs != null ? now - idleSecs * 1000 : now;
-    set({ lastActivityTime: lastActivity });
+    const perfRef = idleSecs != null ? perfNow - idleSecs * 1000 : perfNow;
+    set({ lastActivityTime: lastActivity, lastActivityPerfRef: perfRef });
     logger.safeLogToRust(`[ACTIVITY] Activity detected, updated time: ${new Date(lastActivity).toLocaleTimeString()}`).catch((e) => {
       logger.debug('ACTIVITY', 'Failed to log (non-critical)', e);
     });
@@ -1987,7 +2096,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
   },
 
   checkIdleStatus: async () => {
-    const { lastActivityTime, idleThreshold, isLoading, idlePauseStartTime } = get();
+    const { lastActivityTime, lastActivityPerfRef, idleThreshold, isLoading, idlePauseStartTime } = get();
     
     // FIX: Skip immediately if already in idle state (idle window shown, user hasn't resumed/stopped)
     // Prevents repeated pause calls every 10s when Timer Engine/store race causes isPaused to be stale
@@ -2019,9 +2128,9 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       return;
     }
 
-    const now = Date.now();
-    // Validate: ensure no NaN or negative values
-    const timeDiff = now - lastActivityTime;
+    // performance.now() — монотонно, не прыгает при NTP (Hubstaff-style)
+    const perfNow = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    const timeDiff = perfNow - lastActivityPerfRef;
     const idleTime = isNaN(timeDiff) ? 0 : Math.max(0, timeDiff) / 1000 / 60; // minutes
     const effectiveThreshold = Math.max(1, idleThreshold); // Guard: never pause on threshold <= 0
 
@@ -2044,7 +2153,8 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           set({
             isPaused: currentTimerState === 'PAUSED',
             isTracking: currentTimerState === 'PAUSED', // true if PAUSED (timer is active, just paused)
-            idlePauseStartTime: null, // FIX: Syncing to Timer Engine — not idle (store had stale RUNNING)
+            idlePauseStartTime: null,
+  idlePauseStartPerfRef: null, // FIX: Syncing to Timer Engine — not idle (store had stale RUNNING)
             ...(currentTimerState === 'STOPPED'
               ? { currentTimeEntry: null, lastResumeTime: null, localTimerStartTime: null }
               : {}),
@@ -2147,11 +2257,15 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
             });
             
             const lastActivityForRust = stateAfterPause.lastActivityTime && stateAfterPause.lastActivityTime > 0 ? Number(stateAfterPause.lastActivityTime) : null;
+            const lastActivityPerfRefForRust = stateAfterPause.lastActivityPerfRef ?? null;
+            const idlePauseStartPerfRefForRust = stateAfterPause.idlePauseStartPerfRef ?? null;
             const projectName = stateAfterPause.selectedProject?.name || stateAfterPause.currentTimeEntry?.project?.name || null;
             invoke('update_idle_state', {
               idlePauseStartTime: pauseTimeForRust,
+              idlePauseStartPerfRef: idlePauseStartPerfRefForRust,
               isLoading: false,
               lastActivityTime: lastActivityForRust,
+              lastActivityPerfRef: lastActivityPerfRefForRust,
               projectName,
             }).catch(async (err) => {
               logger.warn('IDLE_CHECK', 'Failed to send state update to idle window', err);
@@ -2184,17 +2298,27 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
             const timerState = await TimerEngineAPI.getState();
             if (timerState.state === 'PAUSED') {
               const pauseStartTime = Date.now();
+              const pausePerfRef = typeof performance !== 'undefined' ? performance.now() : Date.now();
               const storeState = get();
               set({
                 isPaused: true,
                 isTracking: true,
                 idlePauseStartTime: pauseStartTime,
+                idlePauseStartPerfRef: pausePerfRef,
               });
               await invoke('show_idle_window');
               await new Promise(resolve => setTimeout(resolve, 1000));
               const lastActivityForRust = storeState.lastActivityTime && storeState.lastActivityTime > 0 ? Number(storeState.lastActivityTime) : null;
+              const lastActivityPerfRefForRust = storeState.lastActivityPerfRef ?? null;
               const projectName = get().selectedProject?.name || get().currentTimeEntry?.project?.name || null;
-              invoke('update_idle_state', { idlePauseStartTime: pauseStartTime, isLoading: false, lastActivityTime: lastActivityForRust, projectName }).catch(() => {});
+              invoke('update_idle_state', {
+                idlePauseStartTime: pauseStartTime,
+                idlePauseStartPerfRef: pausePerfRef,
+                isLoading: false,
+                lastActivityTime: lastActivityForRust,
+                lastActivityPerfRef: lastActivityPerfRefForRust,
+                projectName,
+              }).catch(() => {});
               await invoke('show_notification', {
                 title: 'Tracker paused',
                 body: `No activity for more than ${idleThreshold} minutes`,
@@ -2205,14 +2329,16 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
                 isTracking: false,
                 currentTimeEntry: null,
                 idlePauseStartTime: null,
+  idlePauseStartPerfRef: null,
                 lastResumeTime: null,
                 localTimerStartTime: null,
               });
             } else {
-              set({ isPaused: false, idlePauseStartTime: null, lastResumeTime: Date.now() });
+              set({ isPaused: false, idlePauseStartTime: null,
+  idlePauseStartPerfRef: null, lastResumeTime: Date.now() });
             }
           } catch (e) {
-            set({ isPaused: false, idlePauseStartTime: null });
+            set({ isPaused: false, idlePauseStartTime: null, idlePauseStartPerfRef: null });
           }
         }
       } catch (error: any) {
@@ -2396,9 +2522,11 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       isTracking: false,
       isPaused: false,
       lastActivityTime: Date.now(),
+      lastActivityPerfRef: typeof performance !== 'undefined' ? performance.now() : Date.now(),
       isLoading: false,
       error: null,
       idlePauseStartTime: null,
+      idlePauseStartPerfRef: null,
       urlActivities: [],
       localTimerStartTime: null,
       lastResumeTime: null,
@@ -2431,7 +2559,8 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       isTracking: state.state === 'RUNNING' || state.state === 'PAUSED',
       isPaused: state.state === 'PAUSED',
       ...(state.state === 'STOPPED'
-        ? { currentTimeEntry: null, idlePauseStartTime: null, lastResumeTime: null, localTimerStartTime: null }
+        ? { currentTimeEntry: null, idlePauseStartTime: null,
+  idlePauseStartPerfRef: null, lastResumeTime: null, localTimerStartTime: null }
         : {}),
     });
     if (state.state === 'STOPPED') {
@@ -2478,6 +2607,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       isLoading: false,
       error: null,
       idlePauseStartTime: null,
+  idlePauseStartPerfRef: null,
       localTimerStartTime: null, // Clear local timer start time
       lastResumeTime: null, // Clear resume time on stop
       lastTimerStateFromStart: null,
@@ -2543,6 +2673,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
               isTracking: expectedTracking,
               isPaused: expectedPaused,
               idlePauseStartTime: null,
+  idlePauseStartPerfRef: null,
             });
             invoke('hide_idle_window').catch(() => {});
           }
@@ -2578,6 +2709,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
             ? {
                 currentTimeEntry: null,
                 idlePauseStartTime: null,
+  idlePauseStartPerfRef: null,
                 lastResumeTime: null,
                 localTimerStartTime: null,
               }

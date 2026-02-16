@@ -43,7 +43,9 @@ export function IdleWindow() {
   const [idleTime, setIdleTime] = useState(0);
   const [isLoading, setIsLoading] = useState(false);
   const [idlePauseStartTime, setIdlePauseStartTime] = useState<number | null>(null);
+  const [idlePauseStartPerfRef, setIdlePauseStartPerfRef] = useState<number | null>(null);
   const [lastActivityTime, setLastActivityTime] = useState<number | null>(null);
+  const [lastActivityPerfRef, setLastActivityPerfRef] = useState<number | null>(null);
   const [projectName, setProjectName] = useState<string | null>(null);
   
   // BUG FIX: Track component mount state to prevent setState after unmount
@@ -74,7 +76,14 @@ export function IdleWindow() {
     
     const MAX_IDLE_SECONDS = 24 * 60 * 60; // 24 hours = 86400 seconds
     
-    const updateState = (pauseTime: number | null, loading: boolean, lastActivity: number | null, project: string | null) => {
+    const updateState = (
+      pauseTime: number | null,
+      pausePerfRef: number | null,
+      loading: boolean,
+      lastActivity: number | null,
+      lastActivityPerf: number | null,
+      project: string | null
+    ) => {
       // BUG FIX: Check if component is still mounted before updating state
       if (!isMounted) return;
       
@@ -105,22 +114,27 @@ export function IdleWindow() {
       if (!isMounted) return;
       
       setIdlePauseStartTime(validPauseTime);
+      setIdlePauseStartPerfRef(pausePerfRef);
       setLastActivityTime(validLastActivity);
+      setLastActivityPerfRef(lastActivityPerf);
       setProjectName(project ?? null);
-      // Only set isLoading if it's actually a loading operation (not from screenshots)
-      // Screenshots should not block buttons
       setIsLoading(loading);
       
-      // Calculate initial time: prefer lastActivityTime (total idle) over idlePauseStartTime (window open time)
-      const baseTime = validLastActivity ?? validPauseTime;
-      if (baseTime !== null && baseTime > 0) {
+      // performance.now() для монотонного elapsed (не прыгает при NTP)
+      const basePerfRef = lastActivityPerf ?? pausePerfRef;
+      if (basePerfRef !== null && basePerfRef > 0) {
+        const perfNow = typeof performance !== 'undefined' ? performance.now() : Date.now();
+        const idleSeconds = Math.floor((perfNow - basePerfRef) / 1000);
+        const validIdleSeconds = isNaN(idleSeconds) ? 0 : Math.max(0, idleSeconds);
+        const displaySeconds = validIdleSeconds >= MAX_IDLE_SECONDS ? 0 : validIdleSeconds;
+        setIdleTime(displaySeconds);
+      } else if (validLastActivity ?? validPauseTime) {
+        // Fallback: baseTime без perfRef — используем Date.now()
+        const baseTime = validLastActivity ?? validPauseTime!;
         const now = Date.now();
         const idleSeconds = Math.floor((now - baseTime) / 1000);
-        // Validate: ensure no NaN or negative values
         const validIdleSeconds = isNaN(idleSeconds) ? 0 : Math.max(0, idleSeconds);
-        // Reset to 0 after 24 hours
         const displaySeconds = validIdleSeconds >= MAX_IDLE_SECONDS ? 0 : validIdleSeconds;
-        logger.debug('IDLE_WINDOW', `Calculated initial idle time: ${idleSeconds}s (base: ${validLastActivity ? 'lastActivity' : 'pauseStart'}), displaying: ${displaySeconds}s (max 24h)`);
         setIdleTime(displaySeconds);
       } else {
         logger.debug('IDLE_WINDOW', 'No valid base time, resetting idle time to 0');
@@ -133,7 +147,14 @@ export function IdleWindow() {
         logger.debug('IDLE_WINDOW', 'Setting up idle-state-update listener...');
         
         // Listen for state updates (pause start time, last activity time, loading state, project name)
-        const unlistenStateFn = await listen<{ idlePauseStartTime: number | null; lastActivityTime?: number | null; isLoading: boolean; projectName?: string | null }>('idle-state-update', (event) => {
+        const unlistenStateFn = await listen<{
+          idlePauseStartTime: number | null;
+          idlePauseStartPerfRef?: number | null;
+          lastActivityTime?: number | null;
+          lastActivityPerfRef?: number | null;
+          isLoading: boolean;
+          projectName?: string | null;
+        }>('idle-state-update', (event) => {
           logger.debug('IDLE_WINDOW', 'State update received', event.payload);
           
           // Handle null values correctly
@@ -158,9 +179,12 @@ export function IdleWindow() {
               lastActivity = numValue;
             }
           }
-          
+          const pausePerfRef = event.payload.idlePauseStartPerfRef != null && !isNaN(Number(event.payload.idlePauseStartPerfRef))
+            ? Number(event.payload.idlePauseStartPerfRef) : null;
+          const lastActivityPerf = event.payload.lastActivityPerfRef != null && !isNaN(Number(event.payload.lastActivityPerfRef))
+            ? Number(event.payload.lastActivityPerfRef) : null;
           const project = typeof event.payload.projectName === 'string' ? event.payload.projectName : null;
-          updateState(pauseTime, event.payload.isLoading, lastActivity, project);
+          updateState(pauseTime, pausePerfRef, event.payload.isLoading, lastActivity, lastActivityPerf, project);
         });
         
         // FIX: If unmounted while listen() was pending, clean up immediately
@@ -208,21 +232,19 @@ export function IdleWindow() {
     };
   }, []);
 
-  // Local timer that updates every second; use lastActivityTime (total idle) when available, else idlePauseStartTime
-  // Timer resets to 0 after 24 hours (86400 seconds)
-  const baseTime = lastActivityTime ?? idlePauseStartTime;
+  // Local timer: performance.now() для монотонного elapsed (не прыгает при NTP)
+  const basePerfRef = lastActivityPerfRef ?? idlePauseStartPerfRef;
+  const hasBase = (lastActivityTime ?? idlePauseStartTime) && basePerfRef;
   useEffect(() => {
     let isMounted = true;
     
-    if (baseTime !== null && baseTime > 0 && !isNaN(baseTime) && isFinite(baseTime)) {
+    if (hasBase && basePerfRef) {
       const MAX_IDLE_SECONDS = 24 * 60 * 60; // 24 hours = 86400 seconds
       
       const updateTime = () => {
-        // BUG FIX: Check if component is still mounted before updating state
         if (!isMounted) return;
-        
-        const now = Date.now();
-        const idleSeconds = Math.floor((now - baseTime) / 1000);
+        const perfNow = typeof performance !== 'undefined' ? performance.now() : Date.now();
+        const idleSeconds = Math.floor((perfNow - basePerfRef) / 1000);
         
         // Validate: ensure no NaN or negative values
         const validIdleSeconds = isNaN(idleSeconds) ? 0 : Math.max(0, idleSeconds);
@@ -250,7 +272,7 @@ export function IdleWindow() {
         isMounted = false;
       };
     }
-  }, [baseTime]);
+  }, [basePerfRef, hasBase]);
   
   const handleResume = async () => {
     if (isLoading) return;

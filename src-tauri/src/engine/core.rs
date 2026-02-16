@@ -6,6 +6,18 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
 
 impl TimerEngine {
+    /// Порог для sleep detection (минуты) — из app_meta или default 5
+    fn get_sleep_gap_threshold_seconds(&self) -> u64 {
+        if let Some(ref db) = self.db {
+            if let Ok(Some(val)) = db.get_app_meta("sleep_gap_threshold_minutes") {
+                if let Ok(m) = val.parse::<u64>() {
+                    return m.saturating_mul(60).max(60); // min 1 minute
+                }
+            }
+        }
+        5 * 60 // default 5 minutes
+    }
+
     /// Обработка системного sleep (вызывается при обнаружении большого пропуска времени в get_state)
     /// Если RUNNING → pause и сохранить состояние
     fn handle_system_sleep(&self) -> Result<(), String> {
@@ -19,17 +31,17 @@ impl TimerEngine {
                 // Допустимый переход: Running → Paused (из-за sleep)
                 drop(state); // Освобождаем lock перед вызовом pause()
 
-                eprintln!("[SLEEP] System sleep detected, pausing timer");
+                info!("[SLEEP] System sleep detected, pausing timer");
 
                 // Используем существующий метод pause() для корректного перехода FSM
                 self.pause()?;
 
-                eprintln!("[SLEEP] Timer paused successfully due to system sleep");
+                info!("[SLEEP] Timer paused successfully due to system sleep");
                 Ok(())
             }
             TimerState::Paused | TimerState::Stopped => {
                 // Уже на паузе или остановлен - ничего не делаем (идемпотентно)
-                eprintln!("[SLEEP] System sleep detected, but timer is already paused/stopped");
+                info!("[SLEEP] System sleep detected, but timer is already paused/stopped");
                 Ok(())
             }
         }
@@ -38,7 +50,7 @@ impl TimerEngine {
     /// Обработка системного wake (вызывается из setup_sleep_wake_handlers при старте приложения)
     /// НЕ возобновляем автоматически - оставляем PAUSED
     pub fn handle_system_wake(&self) -> Result<(), String> {
-        eprintln!("[WAKE] System wake detected");
+        info!("[WAKE] System wake detected");
 
         // Проверяем текущее состояние
         let state = self
@@ -58,7 +70,7 @@ impl TimerEngine {
             error!("[WAKE] Failed to save state after wake: {}", e);
         }
 
-        eprintln!(
+        info!(
             "[WAKE] Timer state after wake: {} (user can resume manually)",
             state_str
         );
@@ -106,6 +118,7 @@ impl TimerEngine {
                 // Сохраняем состояние в БД
                 if let Err(e) = self.save_state() {
                     error!("[TIMER] Failed to save state after start: {}", e);
+                    return Err(format!("Failed to save state after start: {}", e));
                 }
                 // Сбрасываем флаг восстановления после wake
                 if let Ok(mut f) = self.restored_from_running.lock() {
@@ -135,6 +148,7 @@ impl TimerEngine {
                         "[TIMER] Failed to save state after start (Paused→Running): {}",
                         e
                     );
+                    return Err(format!("Failed to save state after start: {}", e));
                 }
                 // Сбрасываем флаг восстановления после wake — пользователь явно возобновил
                 if let Ok(mut f) = self.restored_from_running.lock() {
@@ -287,6 +301,7 @@ impl TimerEngine {
                 // FIX: Сохраняем состояние в БД (как в start(), pause(), stop())
                 if let Err(e) = self.save_state() {
                     error!("[TIMER] Failed to save state after resume: {}", e);
+                    return Err(format!("Failed to save state after resume: {}", e));
                 }
                 // Сбрасываем флаг восстановления после wake — пользователь явно возобновил
                 if let Ok(mut f) = self.restored_from_running.lock() {
@@ -398,6 +413,7 @@ impl TimerEngine {
                 // Сохраняем состояние в БД
                 if let Err(e) = self.save_state() {
                     error!("[TIMER] Failed to save state after stop: {}", e);
+                    return Err(format!("Failed to save state after stop: {}", e));
                 }
 
                 Ok(())
@@ -451,10 +467,6 @@ impl TimerEngine {
             .lock()
             .map_err(|e| format!("Mutex poisoned: {}", e))?;
 
-        let _now_wall = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
         let now_wall_f64 = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs_f64())
@@ -475,13 +487,14 @@ impl TimerEngine {
                 let wall_elapsed_f64 = (now_wall_f64 - (*started_at_ms as f64) / 1000.0).max(0.0);
 
                 // Sleep detection: реальный сон = разрыв между wall-clock и monotonic.
-                const SLEEP_GAP_THRESHOLD_SECONDS: u64 = 5 * 60; // 5 минут разрыва = сон
+                // Порог настраивается через app_meta "sleep_gap_threshold_minutes" (default 5)
+                let threshold_secs = self.get_sleep_gap_threshold_seconds();
                 let is_sleep = wall_elapsed > monotonic_elapsed
-                    && (wall_elapsed - monotonic_elapsed) >= SLEEP_GAP_THRESHOLD_SECONDS;
+                    && (wall_elapsed - monotonic_elapsed) >= threshold_secs;
 
-                // Для отображения: буфер 150ms — не показывать новую секунду до N.15
+                // Буфер 1.15s — устраняет опережение на 1с (Hubnity 34 при системных 33)
                 let displayed_elapsed =
-                    ((wall_elapsed_f64 - 0.15).floor().max(0.0)) as u64;
+                    ((wall_elapsed_f64 - 1.15).floor().max(0.0)) as u64;
 
                 // Защита от переполнения при вычислении elapsed_seconds
                 let elapsed = accumulated.saturating_add(displayed_elapsed);
@@ -521,7 +534,7 @@ impl TimerEngine {
             .unwrap_or(false);
 
         // today_seconds: для "Today" display. При rollover (started_at_ms/1000 == day_start) — только время с полуночи.
-        // Буфер 150ms как у elapsed — иначе today_seconds (целые сек) может опережать elapsed и ломать today <= elapsed.
+        // Буфер 1.15s как у elapsed — иначе today_seconds может опережать elapsed и ломать today <= elapsed.
         let today_seconds = match &*state {
             TimerState::Running { started_at_ms, .. } => {
                 let rolled_over = day_start.map_or(false, |ds| *started_at_ms / 1000 == ds);
@@ -529,7 +542,7 @@ impl TimerEngine {
                     day_start
                         .map(|ds| {
                             let raw = (now_wall_f64 - (ds as f64)).max(0.0);
-                            ((raw - 0.15).floor().max(0.0)) as u64
+                            ((raw - 1.15).floor().max(0.0)) as u64
                         })
                         .unwrap_or(accumulated)
                 } else {
