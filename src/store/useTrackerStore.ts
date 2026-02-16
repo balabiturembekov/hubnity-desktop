@@ -31,6 +31,8 @@ export interface TrackerState {
   lastResumeTime: number | null; // Timestamp when timer was last resumed (for sync protection)
   /** Состояние таймера от Rust после start/resume — единая точка отсчёта session_start */
   lastTimerStateFromStart: TimerStateResponse | null;
+  /** Момент клика Start/Resume (ms) — точнее Rust as_secs(), устраняет рассинхрон */
+  clientSessionStartMs: number | null;
 
   // Actions
   loadProjects: () => Promise<void>;
@@ -75,6 +77,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
   localTimerStartTime: null, // Track when timer was started locally
   lastResumeTime: null, // Track when timer was last resumed (for sync protection)
   lastTimerStateFromStart: null,
+  clientSessionStartMs: null,
 
   loadProjects: async () => {
     try {
@@ -713,15 +716,19 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       };
       
       let timerState: TimerStateResponse | null = null;
+      let clientStartMs: number | null = null;
       try {
         const currentTimerState = await TimerEngineAPI.getState();
         if (currentTimerState.state === 'STOPPED') {
+          clientStartMs = Date.now();
           timerState = await TimerEngineAPI.start();
         } else if (currentTimerState.state === 'PAUSED') {
+          clientStartMs = Date.now();
           timerState = await TimerEngineAPI.resume();
         } else if (currentTimerState.state === 'RUNNING') {
           timerState = currentTimerState;
         } else {
+          clientStartMs = Date.now();
           timerState = await TimerEngineAPI.start();
         }
       } catch (timerError: any) {
@@ -744,7 +751,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       
       const isStarted = timerState?.state === 'RUNNING' || timerState?.state === 'PAUSED' || false;
       
-      // OPTIMISTIC: Обновляем UI сразу. session_start из Rust — единая точка отсчёта.
+      // OPTIMISTIC: Обновляем UI сразу. clientSessionStartMs точнее Rust as_secs().
       set({
         currentTimeEntry: optimisticEntry,
         isTracking: isStarted,
@@ -755,6 +762,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         localTimerStartTime: isStarted ? now : null,
         idlePauseStartTime: null, // FIX: Starting — not idle
         lastTimerStateFromStart: timerState?.state === 'RUNNING' ? timerState : null,
+        clientSessionStartMs: isStarted && clientStartMs != null ? clientStartMs : null,
       });
       
       invoke('start_activity_monitoring').catch((e) => {
@@ -1015,16 +1023,22 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       }
       logger.info('PAUSE', 'Pausing Timer Engine without time entry (no RUNNING entry on server)');
       try {
-        if (isIdlePause && timerState?.state === 'RUNNING' && timerState?.session_start != null) {
-          const { lastActivityTime } = get();
-          const workElapsedSecs = Math.max(
-            0,
-            Math.min(
-              Math.floor(lastActivityTime / 1000) - timerState.session_start,
-              (timerState.elapsed_seconds ?? 0) - (timerState.accumulated_seconds ?? 0)
-            )
-          );
-          await TimerEngineAPI.pauseIdle(workElapsedSecs);
+        if (isIdlePause && timerState?.state === 'RUNNING') {
+          const { lastActivityTime, clientSessionStartMs } = get();
+          const sessionStartMs = timerState.session_start_ms ?? clientSessionStartMs ?? (timerState.session_start != null ? timerState.session_start * 1000 : 0);
+          const sessionStartSec = sessionStartMs / 1000;
+          if (sessionStartSec > 0) {
+            const workElapsedSecs = Math.max(
+              0,
+              Math.min(
+                Math.floor(lastActivityTime / 1000 - sessionStartSec),
+                (timerState.elapsed_seconds ?? 0) - (timerState.accumulated_seconds ?? 0)
+              )
+            );
+            await TimerEngineAPI.pauseIdle(workElapsedSecs);
+          } else {
+            await TimerEngineAPI.pause();
+          }
         } else {
           await TimerEngineAPI.pause();
         }
@@ -1092,16 +1106,22 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           // Timer Engine is still RUNNING but we don't have entry - try to pause anyway
           logger.warn('PAUSE', 'Timer Engine is RUNNING but no entry - attempting pause anyway');
           try {
-            if (isIdlePause && finalTimerState.state === 'RUNNING' && finalTimerState.session_start != null) {
-              const { lastActivityTime } = get();
-              const workElapsedSecs = Math.max(
-                0,
-                Math.min(
-                  Math.floor(lastActivityTime / 1000) - finalTimerState.session_start,
-                  (finalTimerState.elapsed_seconds ?? 0) - (finalTimerState.accumulated_seconds ?? 0)
-                )
-              );
-              await TimerEngineAPI.pauseIdle(workElapsedSecs);
+            if (isIdlePause && finalTimerState.state === 'RUNNING') {
+              const { lastActivityTime, clientSessionStartMs } = get();
+              const sessionStartMs = finalTimerState.session_start_ms ?? clientSessionStartMs ?? (finalTimerState.session_start != null ? finalTimerState.session_start * 1000 : 0);
+              const sessionStartSec = sessionStartMs / 1000;
+              if (sessionStartSec > 0) {
+                const workElapsedSecs = Math.max(
+                  0,
+                  Math.min(
+                    Math.floor(lastActivityTime / 1000 - sessionStartSec),
+                    (finalTimerState.elapsed_seconds ?? 0) - (finalTimerState.accumulated_seconds ?? 0)
+                  )
+                );
+                await TimerEngineAPI.pauseIdle(workElapsedSecs);
+              } else {
+                await TimerEngineAPI.pause();
+              }
             } else {
               await TimerEngineAPI.pause();
             }
@@ -1158,16 +1178,22 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         if (isIdlePause) {
           const { lastActivityTime } = get();
           const preState = await TimerEngineAPI.getState();
-          if (preState.state === 'RUNNING' && preState.session_start != null) {
-            const sessionStart = preState.session_start;
-            const workElapsedSecs = Math.max(
-              0,
-              Math.min(
-                Math.floor(lastActivityTime / 1000) - sessionStart,
-                preState.elapsed_seconds - preState.accumulated_seconds
-              )
-            );
-            timerState = await TimerEngineAPI.pauseIdle(workElapsedSecs);
+          if (preState.state === 'RUNNING') {
+            const { clientSessionStartMs } = get();
+            const sessionStartMs = preState.session_start_ms ?? clientSessionStartMs ?? (preState.session_start != null ? preState.session_start * 1000 : 0);
+            const sessionStartSec = sessionStartMs / 1000;
+            if (sessionStartSec > 0) {
+              const workElapsedSecs = Math.max(
+                0,
+                Math.min(
+                  Math.floor(lastActivityTime / 1000 - sessionStartSec),
+                  preState.elapsed_seconds - preState.accumulated_seconds
+                )
+              );
+              timerState = await TimerEngineAPI.pauseIdle(workElapsedSecs);
+            } else {
+              timerState = await TimerEngineAPI.pause();
+            }
           } else {
             timerState = await TimerEngineAPI.pause();
           }
@@ -1205,6 +1231,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         localTimerStartTime: null,
         idlePauseStartTime: pauseStartTime,
         lastTimerStateFromStart: null,
+        clientSessionStartMs: null,
       });
       
       // Stop monitoring immediately (local, fast)
@@ -1544,6 +1571,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       
       // OPTIMISTIC: Сначала Timer Engine (локально), сразу обновляем UI
       const entryIdToResume = timeEntryToResume.id;
+      const clientResumeMs = Date.now();
       let timerState: import('../lib/timer-engine').TimerStateResponse | null = null;
       try {
         timerState = await TimerEngineAPI.resume();
@@ -1578,6 +1606,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         lastResumeTime: isResumed ? resumeTime : get().lastResumeTime,
         localTimerStartTime: isResumed ? resumeTime : get().localTimerStartTime,
         lastTimerStateFromStart: timerState?.state === 'RUNNING' ? timerState : null,
+        clientSessionStartMs: isResumed ? clientResumeMs : null,
       });
       
       if (isResumed) {
@@ -1829,6 +1858,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         localTimerStartTime: null,
         lastResumeTime: null,
         lastTimerStateFromStart: null,
+        clientSessionStartMs: null,
       });
       
       invoke('stop_activity_monitoring').catch((e) => {
@@ -2373,6 +2403,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       localTimerStartTime: null,
       lastResumeTime: null,
       lastTimerStateFromStart: null,
+      clientSessionStartMs: null,
     });
   },
 
@@ -2450,6 +2481,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       localTimerStartTime: null, // Clear local timer start time
       lastResumeTime: null, // Clear resume time on stop
       lastTimerStateFromStart: null,
+      clientSessionStartMs: null,
     });
     try {
       await invoke('hide_idle_window');

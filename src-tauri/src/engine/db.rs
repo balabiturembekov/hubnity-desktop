@@ -51,10 +51,10 @@ impl TimerEngine {
             Local::now().format("%Y-%m-%d").to_string()
         };
 
-        // Определяем строковое представление состояния и started_at
+        // Определяем строковое представление состояния и started_at_ms (миллисекунды для точной синхронизации)
         let (state_str, started_at) = match &*state {
             TimerState::Stopped => ("stopped", None),
-            TimerState::Running { started_at, .. } => ("running", Some(*started_at)),
+            TimerState::Running { started_at_ms, .. } => ("running", Some(*started_at_ms)),
             TimerState::Paused => ("paused", None),
         };
 
@@ -101,26 +101,32 @@ impl TimerEngine {
                 if day_str == today_local {
                     // CRITICAL FIX: Если было running, добавляем elapsed time к accumulated
                     // С защитой от clock skew
+                    // Миграция: saved_started_at < 1e12 = секунды (старый формат), иначе миллисекунды
                     let final_accumulated = if state_str == "running" && saved_started_at.is_some()
                     {
-                        let started_at = saved_started_at.unwrap();
+                        let raw = saved_started_at.unwrap();
+                        let started_at_secs = if raw < 1_000_000_000_000 {
+                            raw // старый формат: секунды
+                        } else {
+                            raw / 1000 // новый формат: миллисекунды
+                        };
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap()
                             .as_secs();
 
                         // CRITICAL FIX: Clock skew detection
-                        // ДОКАЗАНО: Если now < started_at, часы были переведены назад
-                        if now < started_at {
+                        // ДОКАЗАНО: Если now < started_at_secs, часы были переведены назад
+                        if now < started_at_secs {
                             // ДОКАЗАНО: Clock skew detected - часы переведены назад
                             warn!(
                                 "[RECOVERY] Clock skew detected: now ({}) < started_at ({}). Not adding elapsed time to prevent time loss.",
-                                now, started_at
+                                now, started_at_secs
                             );
                             // НЕ добавляем elapsed time - используем только saved accumulated
                             accumulated
                         } else {
-                            let elapsed_since_save = now.saturating_sub(started_at);
+                            let elapsed_since_save = now.saturating_sub(started_at_secs);
 
                             // CRITICAL FIX: Проверка на нереалистично большое время (> 24 часов)
                             // ДОКАЗАНО: Если elapsed > 24 часов, вероятно clock skew или системная ошибка
@@ -138,7 +144,7 @@ impl TimerEngine {
                                     accumulated.saturating_add(elapsed_since_save);
                                 info!(
                                     "[RECOVERY] Timer was running: accumulated={}s, started_at={}, elapsed_since_save={}s, final_accumulated={}s",
-                                    accumulated, started_at, elapsed_since_save, new_accumulated
+                                    accumulated, started_at_secs, elapsed_since_save, new_accumulated
                                 );
                                 new_accumulated
                             }

@@ -80,10 +80,11 @@ impl TimerEngine {
             TimerState::Stopped => {
                 // Допустимый переход: Stopped → Running
                 let now_instant = Instant::now();
-                let now_timestamp = std::time::SystemTime::now()
+                let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_err(|e| format!("Failed to get timestamp: {}", e))?
-                    .as_secs();
+                    .as_millis() as u64;
+                let now_secs = now_ms / 1000;
 
                 // Если это первый старт за день, фиксируем начало дня
                 let mut day_start = self
@@ -91,13 +92,13 @@ impl TimerEngine {
                     .lock()
                     .map_err(|e| format!("Mutex poisoned: {}", e))?;
                 if day_start.is_none() {
-                    *day_start = Some(now_timestamp);
+                    *day_start = Some(now_secs);
                 }
                 drop(day_start); // Освобождаем lock
 
-                // Переход в Running с данными внутри
+                // Переход в Running с данными внутри (milliseconds для точной синхронизации)
                 *state = TimerState::Running {
-                    started_at: now_timestamp,
+                    started_at_ms: now_ms,
                     started_at_instant: now_instant,
                 };
                 drop(state); // Освобождаем lock перед сохранением
@@ -116,14 +117,14 @@ impl TimerEngine {
             TimerState::Paused => {
                 // Допустимый переход: Paused → Running (resume через start)
                 let now_instant = Instant::now();
-                let now_timestamp = std::time::SystemTime::now()
+                let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_err(|e| format!("Failed to get timestamp: {}", e))?
-                    .as_secs();
+                    .as_millis() as u64;
 
                 // Переход в Running (accumulated сохраняется)
                 *state = TimerState::Running {
-                    started_at: now_timestamp,
+                    started_at_ms: now_ms,
                     started_at_instant: now_instant,
                 };
                 drop(state); // Освобождаем lock перед сохранением
@@ -173,18 +174,18 @@ impl TimerEngine {
 
         match &*state {
             TimerState::Running {
-                started_at,
+                started_at_ms,
                 started_at_instant,
                 ..
             } => {
                 // Допустимый переход: Running → Paused
                 let now = Instant::now();
                 let monotonic_elapsed = now.duration_since(*started_at_instant).as_secs();
-                let now_wall = SystemTime::now()
+                let now_wall_ms = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs())
+                    .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
-                let wall_elapsed = now_wall.saturating_sub(*started_at);
+                let wall_elapsed = now_wall_ms.saturating_sub(*started_at_ms) / 1000;
                 let base_elapsed = wall_elapsed.min(monotonic_elapsed); // min для sleep protection
                 let session_elapsed = match work_elapsed_override {
                     Some(work) => {
@@ -271,14 +272,14 @@ impl TimerEngine {
             TimerState::Paused => {
                 // Допустимый переход: Paused → Running
                 let now_instant = Instant::now();
-                let now_timestamp = std::time::SystemTime::now()
+                let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_err(|e| format!("Failed to get timestamp: {}", e))?
-                    .as_secs();
+                    .as_millis() as u64;
 
                 // Переход в Running (accumulated сохраняется)
                 *state = TimerState::Running {
-                    started_at: now_timestamp,
+                    started_at_ms: now_ms,
                     started_at_instant: now_instant,
                 };
                 drop(state); // Освобождаем lock перед сохранением
@@ -325,18 +326,18 @@ impl TimerEngine {
 
         match &*state {
             TimerState::Running {
-                started_at,
+                started_at_ms,
                 started_at_instant,
                 ..
             } => {
                 // Допустимый переход: Running → Stopped
                 let now = Instant::now();
                 let monotonic_elapsed = now.duration_since(*started_at_instant).as_secs();
-                let now_wall = SystemTime::now()
+                let now_wall_ms = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs())
+                    .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
-                let wall_elapsed = now_wall.saturating_sub(*started_at);
+                let wall_elapsed = now_wall_ms.saturating_sub(*started_at_ms) / 1000;
                 let session_elapsed = wall_elapsed.min(monotonic_elapsed); // min для sleep protection
 
                 // CRITICAL FIX: Вычисляем новый accumulated БЕЗ обновления в памяти
@@ -450,7 +451,7 @@ impl TimerEngine {
             .lock()
             .map_err(|e| format!("Mutex poisoned: {}", e))?;
 
-        let now_wall = SystemTime::now()
+        let _now_wall = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
@@ -462,15 +463,16 @@ impl TimerEngine {
         // Расчет elapsed только для RUNNING состояния
         // Только wall clock (SystemTime) — синхронно с системным временем и Hubstaff.
         // Буфер 150ms: показываем секунду N только после N.15 (Stack Overflow — избежать «опережения»).
-        let (elapsed_seconds, session_start, needs_sleep_handling) = match &*state {
+        let (elapsed_seconds, session_start, session_start_ms, needs_sleep_handling) = match &*state {
             TimerState::Running {
-                started_at,
+                started_at_ms,
                 started_at_instant,
             } => {
                 let now = Instant::now();
+                let now_wall_ms = (now_wall_f64 * 1000.0) as u64;
                 let monotonic_elapsed = now.duration_since(*started_at_instant).as_secs();
-                let wall_elapsed = now_wall.saturating_sub(*started_at);
-                let wall_elapsed_f64 = (now_wall_f64 - (*started_at as f64)).max(0.0);
+                let wall_elapsed = (now_wall_ms.saturating_sub(*started_at_ms) / 1000) as u64;
+                let wall_elapsed_f64 = (now_wall_f64 - (*started_at_ms as f64) / 1000.0).max(0.0);
 
                 // Sleep detection: реальный сон = разрыв между wall-clock и monotonic.
                 const SLEEP_GAP_THRESHOLD_SECONDS: u64 = 5 * 60; // 5 минут разрыва = сон
@@ -483,11 +485,11 @@ impl TimerEngine {
 
                 // Защита от переполнения при вычислении elapsed_seconds
                 let elapsed = accumulated.saturating_add(displayed_elapsed);
-                (elapsed, Some(*started_at), is_sleep)
+                (elapsed, Some(*started_at_ms / 1000), Some(*started_at_ms), is_sleep)
             }
             TimerState::Paused | TimerState::Stopped => {
                 // В PAUSED и STOPPED показываем только accumulated
-                (accumulated, None, false)
+                (accumulated, None, None, false)
             }
         };
 
@@ -503,8 +505,8 @@ impl TimerEngine {
         // Создаем упрощенную версию state для API (без Instant)
         let state_for_response = match &*state {
             TimerState::Stopped => TimerStateForAPI::Stopped,
-            TimerState::Running { started_at, .. } => TimerStateForAPI::Running {
-                started_at: *started_at,
+            TimerState::Running { started_at_ms, .. } => TimerStateForAPI::Running {
+                started_at: *started_at_ms / 1000,
             },
             TimerState::Paused => TimerStateForAPI::Paused,
         };
@@ -518,11 +520,11 @@ impl TimerEngine {
             .map(|f| *f)
             .unwrap_or(false);
 
-        // today_seconds: для "Today" display. При rollover (started_at == day_start) — только время с полуночи.
+        // today_seconds: для "Today" display. При rollover (started_at_ms/1000 == day_start) — только время с полуночи.
         // Буфер 150ms как у elapsed — иначе today_seconds (целые сек) может опережать elapsed и ломать today <= elapsed.
         let today_seconds = match &*state {
-            TimerState::Running { started_at, .. } => {
-                let rolled_over = day_start.map_or(false, |ds| *started_at == ds);
+            TimerState::Running { started_at_ms, .. } => {
+                let rolled_over = day_start.map_or(false, |ds| *started_at_ms / 1000 == ds);
                 if rolled_over {
                     day_start
                         .map(|ds| {
@@ -542,6 +544,7 @@ impl TimerEngine {
             elapsed_seconds,
             accumulated_seconds: accumulated,
             session_start,
+            session_start_ms,
             day_start,
             today_seconds,
             restored_from_running,
@@ -637,24 +640,25 @@ impl TimerEngine {
                 .ok_or_else(|| "Failed to create old day end timestamp".to_string())?
                 .timestamp() as u64;
 
-            // Получаем started_at и started_at_instant из состояния
+            // Получаем started_at_ms и started_at_instant из состояния
             // GUARD: Проверка расхождения между SystemTime и Instant (clock skew detection)
-            let (started_at, started_at_instant) = {
+            let (started_at_ms, started_at_instant) = {
                 let state = self
                     .state
                     .lock()
                     .map_err(|e| format!("Mutex poisoned: {}", e))?;
                 match &*state {
                     TimerState::Running {
-                        started_at,
+                        started_at_ms,
                         started_at_instant,
-                    } => (*started_at, *started_at_instant),
+                    } => (*started_at_ms, *started_at_instant),
                     _ => {
                         drop(state);
                         return Err("Timer state changed during rollover".to_string());
                     }
                 }
             };
+            let started_at_secs = started_at_ms / 1000;
 
             // GUARD: Clock skew detection - сравниваем SystemTime и Instant
             let now_system = std::time::SystemTime::now()
@@ -663,7 +667,7 @@ impl TimerEngine {
                 .as_secs();
             let now_instant = Instant::now();
 
-            let system_time_elapsed = now_system.saturating_sub(started_at);
+            let system_time_elapsed = now_system.saturating_sub(started_at_secs);
             let instant_elapsed = now_instant.duration_since(started_at_instant).as_secs();
 
             // Вычисляем расхождение (clock skew)
@@ -684,11 +688,11 @@ impl TimerEngine {
             }
 
             // Вычисляем время до полуночи (если started_at был до полуночи)
-            // ВАЖНО: Для расчета времени до полуночи используем SystemTime (started_at),
+            // ВАЖНО: Для расчета времени до полуночи используем SystemTime (started_at_secs),
             // так как Instant не имеет связи с календарным временем.
             // Но при наличии clock skew мы ограничиваем результат Instant elapsed.
-            if started_at < old_day_end {
-                let time_until_midnight = old_day_end - started_at;
+            if started_at_secs < old_day_end {
+                let time_until_midnight = old_day_end - started_at_secs;
 
                 // GUARD: Проверка на разумность времени до полуночи (не более 24 часов)
                 // Дополнительно: если есть clock skew, ограничиваем Instant elapsed
@@ -755,7 +759,7 @@ impl TimerEngine {
                 .lock()
                 .map_err(|e| format!("Mutex poisoned: {}", e))?;
             *state = TimerState::Running {
-                started_at: old_day_end,
+                started_at_ms: old_day_end * 1000,
                 started_at_instant: new_started_at_instant,
             };
             drop(state);

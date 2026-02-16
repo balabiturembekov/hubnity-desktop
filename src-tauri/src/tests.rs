@@ -815,15 +815,16 @@ mod tests {
             // Симулируем сон: wall-clock ушёл на 25 мин вперёд, monotonic только на 5 мин (20 мин "сна")
             {
                 let mut state = engine.state.lock().unwrap();
-                if let TimerState::Running { started_at: _, .. } = &*state {
+                if let TimerState::Running { started_at_ms: _, .. } = &*state {
                     let now_wall = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
                         .as_secs();
                     let started_at_wall = now_wall.saturating_sub(25 * 60); // 25 мин назад по wall
+                    let started_at_ms = started_at_wall * 1000;
                     let started_at_instant = Instant::now() - Duration::from_secs(5 * 60); // 5 мин по monotonic
                     *state = TimerState::Running {
-                        started_at: started_at_wall,
+                        started_at_ms,
                         started_at_instant,
                     };
                 }

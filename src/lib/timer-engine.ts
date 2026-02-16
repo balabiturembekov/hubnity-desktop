@@ -34,6 +34,8 @@ export type TimerStateResponse = (
       day_start: number | null;
     }
 ) & {
+  /** Unix timestamp начала сессии в миллисекундах — точная синхронизация с системными часами */
+  session_start_ms?: number | null;
   /** Секунды за текущий календарный день (для "Today" display). После rollover — только время с полуночи */
   today_seconds?: number;
   /** Этап 4: true если таймер восстановлен из RUNNING как PAUSED после перезапуска (показать уведомление один раз) */

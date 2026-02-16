@@ -28,7 +28,7 @@ pub enum TimerState {
     Stopped,
     /// Таймер работает - хранит Instant начала сессии
     Running {
-        started_at: u64,             // Unix timestamp (секунды) для API
+        started_at_ms: u64,          // Unix timestamp в миллисекундах — точность для синхронизации
         started_at_instant: Instant, // Монотонное время (для расчетов)
     },
     /// Таймер на паузе
@@ -41,7 +41,8 @@ pub struct TimerStateResponse {
     pub state: TimerStateForAPI,
     pub elapsed_seconds: u64,
     pub accumulated_seconds: u64,   // Накопленное время за день
-    pub session_start: Option<u64>, // Unix timestamp начала сессии (только для Running)
+    pub session_start: Option<u64>,     // Unix timestamp начала сессии в секундах (для совместимости)
+    pub session_start_ms: Option<u64>,  // Unix timestamp в миллисекундах — точная синхронизация
     pub day_start: Option<u64>,     // Unix timestamp начала дня
     /// Секунды за текущий календарный день (для "Today" display). После rollover — только время с полуночи.
     pub today_seconds: u64,
@@ -56,7 +57,7 @@ pub struct TimerStateResponse {
 #[serde(tag = "state")]
 pub enum TimerStateForAPI {
     Stopped,
-    Running { started_at: u64 },
+    Running { started_at: u64 }, // секунды, для совместимости
     Paused,
 }
 
@@ -82,11 +83,11 @@ impl Serialize for TimerState {
     {
         match self {
             TimerState::Stopped => serializer.serialize_unit_variant("TimerState", 0, "STOPPED"),
-            TimerState::Running { started_at, .. } => {
+            TimerState::Running { started_at_ms, .. } => {
                 use serde::ser::SerializeStruct;
                 let mut state = serializer.serialize_struct("Running", 2)?;
                 state.serialize_field("state", "RUNNING")?;
-                state.serialize_field("started_at", started_at)?;
+                state.serialize_field("started_at", &(started_at_ms / 1000))?;
                 state.end()
             }
             TimerState::Paused => serializer.serialize_unit_variant("TimerState", 2, "PAUSED"),
