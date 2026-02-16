@@ -42,14 +42,18 @@ export function Timer() {
   const isOnline = useSyncStore((s) => s.status?.is_online ?? true);
 
   // Состояние таймера из Rust (единственный source of truth).
-  // lastTimerStateFromStart — сразу после start/resume, session_start от Rust.
+  // При start/resume: poll ещё STOPPED/PAUSED ~200ms — приоритет lastTimerStateFromStart (RUNNING) чтобы не было рассинхрона секунд.
   const [timerState, setTimerState] = useState<TimerStateResponse | null>(null);
-  const effectiveTimerState = timerState ?? lastTimerStateFromStart;
+  const pollStaleAfterStartResume =
+    lastTimerStateFromStart?.state === 'RUNNING' &&
+    (timerState?.state === 'PAUSED' || timerState?.state === 'STOPPED');
+  const effectiveTimerState = pollStaleAfterStartResume
+    ? lastTimerStateFromStart
+    : (timerState ?? lastTimerStateFromStart);
   const [idleTime, setIdleTime] = useState(0);
   const [isProcessing, setIsProcessing] = useState(false);
 
-  // Получаем состояние таймера из Rust. Stack Overflow / MDN: setInterval неточен,
-  // опрос каждые 200ms + Date.now() на бэкенде даёт стабильную синхронизацию с системными часами.
+  // Получаем состояние таймера из Rust. Poll 200ms — без интерполяции, только Rust (избегаем опережения).
   const POLL_MS = 200;
   useEffect(() => {
     let isMounted = true;
@@ -352,8 +356,7 @@ export function Timer() {
             statusColor: undefined as undefined,
           };
 
-  // RUNNING: используем elapsed_seconds из Rust (poll 200ms) — без рассинхрона из-за задержки invoke.
-  // Клиентский расчёт через Date.now() давал diff=1s: Rust считает при вызове, JS — при получении ответа (~100ms позже).
+  // RUNNING: только elapsed_seconds из Rust — без интерполяции (она опережала из‑за разной частоты effect vs poll).
   const elapsedSeconds = effectiveTimerState?.elapsed_seconds ?? 0;
   const totalTodaySeconds = effectiveTimerState?.today_seconds ?? elapsedSeconds;
 
