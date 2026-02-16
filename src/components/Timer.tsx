@@ -37,28 +37,30 @@ export function Timer() {
     isTakingScreenshot,
     idlePauseStartTime,
     lastActivityTime,
+    lastTimerStateFromStart,
   } = useTrackerStore();
   const isOnline = useSyncStore((s) => s.status?.is_online ?? true);
 
-  // Состояние таймера из Rust (единственный source of truth)
+  // Состояние таймера из Rust (единственный source of truth).
+  // lastTimerStateFromStart — сразу после start/resume, session_start от Rust.
   const [timerState, setTimerState] = useState<TimerStateResponse | null>(null);
+  const effectiveTimerState = timerState ?? lastTimerStateFromStart;
   const [idleTime, setIdleTime] = useState(0);
   const [isProcessing, setIsProcessing] = useState(false);
 
-  // Получаем состояние таймера из Rust — синхронно с границами секунд (как системные часы)
+  // Получаем состояние таймера из Rust. Stack Overflow / MDN: setInterval неточен,
+  // опрос каждые 200ms + Date.now() на бэкенде даёт стабильную синхронизацию с системными часами.
+  const POLL_MS = 200;
   useEffect(() => {
     let isMounted = true;
     let timeoutId: ReturnType<typeof setTimeout>;
 
     const scheduleNext = () => {
-      const now = Date.now();
-      const msInSecond = now % 1000;
-      const msUntilNextSecond = msInSecond === 0 ? 1000 : 1000 - msInSecond;
       timeoutId = setTimeout(() => {
         if (!isMounted) return;
         updateTimerState();
         scheduleNext();
-      }, msUntilNextSecond);
+      }, POLL_MS);
     };
 
     const updateTimerState = async () => {
@@ -142,9 +144,9 @@ export function Timer() {
     let isMounted = true;
     
     const checkDayChange = async () => {
-      if (!timerState?.day_start || !isMounted) return;
+      if (!effectiveTimerState?.day_start || !isMounted) return;
 
-      const dayStartTimestamp = timerState.day_start;
+      const dayStartTimestamp = effectiveTimerState.day_start;
       const today = new Date();
       const todayLocal = new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime();
       const dayStartDate = new Date(dayStartTimestamp * 1000);
@@ -172,14 +174,14 @@ export function Timer() {
       isMounted = false;
       clearInterval(dayCheckInterval);
     };
-  }, [timerState?.day_start]);
+  }, [effectiveTimerState?.day_start]);
 
   // Обновление idle time — используем lastActivityTime (общее время простоя) когда есть, иначе idlePauseStartTime
   const idleBaseTime = lastActivityTime ?? idlePauseStartTime;
   useEffect(() => {
     let isMounted = true;
     
-    if (timerState?.state === 'PAUSED' && idleBaseTime) {
+    if (effectiveTimerState?.state === 'PAUSED' && idleBaseTime) {
       const updateIdleTime = () => {
         // BUG FIX: Check if component is still mounted before updating state
         if (!isMounted) return;
@@ -202,7 +204,7 @@ export function Timer() {
         isMounted = false;
       };
     }
-  }, [timerState?.state, idleBaseTime]);
+  }, [effectiveTimerState?.state, idleBaseTime]);
 
   // BUG FIX: Track component mount state to prevent setState after unmount
   const isMountedRef = useRef(true);
@@ -321,8 +323,8 @@ export function Timer() {
   // loadActiveTimeEntry is async — user may see Start before sync completes. Show Resume/Stop if store
   // has currentTimeEntry with isTracking (server had PAUSED/RUNNING entry).
   const effectiveState =
-    timerState?.state === 'RUNNING' || timerState?.state === 'PAUSED'
-      ? timerState.state
+    effectiveTimerState?.state === 'RUNNING' || effectiveTimerState?.state === 'PAUSED'
+      ? effectiveTimerState.state
       : currentTimeEntry && isTracking
         ? (isPaused ? 'PAUSED' as const : 'RUNNING' as const)
         : 'STOPPED';
@@ -350,8 +352,34 @@ export function Timer() {
             statusColor: undefined as undefined,
           };
 
-  const elapsedSeconds = timerState?.elapsed_seconds ?? 0;
-  const totalTodaySeconds = timerState?.today_seconds ?? elapsedSeconds;
+  // Для RUNNING: считаем на фронте через Date.now() (тот же источник, что системные часы)
+  // session_start — всегда из Rust (start_timer/get_timer_state), единая точка отсчёта.
+  // Буфер 300ms устраняет «опережение». PAUSED/STOPPED — из бэкенда.
+  const [displaySeconds, setDisplaySeconds] = useState(0);
+  useEffect(() => {
+    const s = effectiveTimerState;
+    if (!s || s.state !== 'RUNNING' || s.session_start == null) {
+      setDisplaySeconds(s?.elapsed_seconds ?? 0);
+      return;
+    }
+    const acc = s.accumulated_seconds ?? 0;
+    const tick = () => {
+      const nowSec = Date.now() / 1000;
+      const sessionElapsed = Math.max(0, nowSec - s.session_start! - 0.3);
+      const computed = acc + Math.floor(sessionElapsed);
+      // Защита: в первую секунду (now - session_start < 0.3) computed может быть < acc
+      setDisplaySeconds(Math.max(acc, computed));
+    };
+    tick();
+    const id = setInterval(tick, 100);
+    return () => clearInterval(id);
+  }, [effectiveTimerState?.state, effectiveTimerState?.session_start, effectiveTimerState?.accumulated_seconds, effectiveTimerState?.elapsed_seconds]);
+
+  const elapsedSeconds =
+    effectiveTimerState?.state === 'RUNNING' && effectiveTimerState?.session_start != null
+      ? displaySeconds
+      : (effectiveTimerState?.elapsed_seconds ?? 0);
+  const totalTodaySeconds = effectiveTimerState?.today_seconds ?? elapsedSeconds;
 
   // FIX: Показываем таймер если есть active time entry, даже если selectedProject не установлен
   // Это исправляет ситуацию когда таймер работает, но UI показывает "No projects"
@@ -390,7 +418,7 @@ export function Timer() {
   return (
     <div className="flex flex-col items-center space-y-4 py-4">
       {/* Error message - hide when offline + project selected + timer working (expected offline state) */}
-      {error && !(!isOnline && (selectedProject || currentTimeEntry) && (timerState?.state === 'RUNNING' || timerState?.state === 'PAUSED')) && (
+      {error && !(!isOnline && (selectedProject || currentTimeEntry) && (effectiveTimerState?.state === 'RUNNING' || effectiveTimerState?.state === 'PAUSED')) && (
         <div className="w-full max-w-md p-3 rounded-lg bg-muted/50 border border-border animate-in fade-in flex gap-2">
           <AlertCircle className="h-5 w-5 text-muted-foreground flex-shrink-0 mt-0.5" />
           <div className="flex-1 min-w-0">
@@ -425,7 +453,7 @@ export function Timer() {
       )}
 
       {/* Уведомление при восстановлении RUNNING → PAUSED после перезапуска */}
-      {timerState?.state === 'PAUSED' && timerState?.restored_from_running && (
+      {effectiveTimerState?.state === 'PAUSED' && effectiveTimerState?.restored_from_running && (
         <div className="w-full max-w-md p-3 rounded-md bg-muted/50 border border-muted-foreground/20 text-center text-sm text-muted-foreground animate-in fade-in">
           Timer was paused after restarting the application. Click "Resume" to continue.
         </div>
@@ -442,7 +470,7 @@ export function Timer() {
         </div>
         
         {/* Idle time (если приостановлено из-за idle) */}
-        {timerState?.state === 'PAUSED' && idlePauseStartTime && (
+        {effectiveTimerState?.state === 'PAUSED' && idlePauseStartTime && (
           <div className="flex flex-col items-center space-y-1">
             <div className="text-xs text-muted-foreground font-medium">
               Idle:
@@ -455,13 +483,13 @@ export function Timer() {
         
         {/* Статус и дневная сводка */}
         <div className="flex items-center gap-2 text-sm text-muted-foreground">
-          {timerState && timerState.state === 'RUNNING' && (
+          {effectiveTimerState && effectiveTimerState.state === 'RUNNING' && (
             <div className={cn(
               "w-2 h-2 rounded-full bg-timer-running dark:bg-timer-running-dark",
               "animate-pulse"
             )} />
           )}
-          {timerState && timerState.state === 'PAUSED' && (
+          {effectiveTimerState && effectiveTimerState.state === 'PAUSED' && (
             <div className="w-2 h-2 rounded-full bg-muted-foreground/40" />
           )}
           {isTakingScreenshot && (

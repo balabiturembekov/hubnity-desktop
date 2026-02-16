@@ -454,11 +454,14 @@ impl TimerEngine {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        let now_wall_f64 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
 
         // Расчет elapsed только для RUNNING состояния
         // Только wall clock (SystemTime) — синхронно с системным временем и Hubstaff.
-        // Instant (QPC/CLOCK_UPTIME) может идти быстрее на Windows и macOS (TSC drift, Rust docs).
-        // Sleep detection: при сне паузим до возврата, не показываем время сна.
+        // Буфер 150ms: показываем секунду N только после N.15 (Stack Overflow — избежать «опережения»).
         let (elapsed_seconds, session_start, needs_sleep_handling) = match &*state {
             TimerState::Running {
                 started_at,
@@ -467,16 +470,19 @@ impl TimerEngine {
                 let now = Instant::now();
                 let monotonic_elapsed = now.duration_since(*started_at_instant).as_secs();
                 let wall_elapsed = now_wall.saturating_sub(*started_at);
+                let wall_elapsed_f64 = (now_wall_f64 - (*started_at as f64)).max(0.0);
 
                 // Sleep detection: реальный сон = разрыв между wall-clock и monotonic.
                 const SLEEP_GAP_THRESHOLD_SECONDS: u64 = 5 * 60; // 5 минут разрыва = сон
                 let is_sleep = wall_elapsed > monotonic_elapsed
                     && (wall_elapsed - monotonic_elapsed) >= SLEEP_GAP_THRESHOLD_SECONDS;
 
-                let session_elapsed = wall_elapsed;
+                // Для отображения: буфер 150ms — не показывать новую секунду до N.15
+                let displayed_elapsed =
+                    ((wall_elapsed_f64 - 0.15).floor().max(0.0)) as u64;
 
                 // Защита от переполнения при вычислении elapsed_seconds
-                let elapsed = accumulated.saturating_add(session_elapsed);
+                let elapsed = accumulated.saturating_add(displayed_elapsed);
                 (elapsed, Some(*started_at), is_sleep)
             }
             TimerState::Paused | TimerState::Stopped => {
@@ -513,12 +519,16 @@ impl TimerEngine {
             .unwrap_or(false);
 
         // today_seconds: для "Today" display. При rollover (started_at == day_start) — только время с полуночи.
+        // Буфер 150ms как у elapsed — иначе today_seconds (целые сек) может опережать elapsed и ломать today <= elapsed.
         let today_seconds = match &*state {
             TimerState::Running { started_at, .. } => {
                 let rolled_over = day_start.map_or(false, |ds| *started_at == ds);
                 if rolled_over {
                     day_start
-                        .map(|ds| now_wall.saturating_sub(ds))
+                        .map(|ds| {
+                            let raw = (now_wall_f64 - (ds as f64)).max(0.0);
+                            ((raw - 0.15).floor().max(0.0)) as u64
+                        })
                         .unwrap_or(accumulated)
                 } else {
                     elapsed_seconds

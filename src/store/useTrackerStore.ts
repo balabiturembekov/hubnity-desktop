@@ -29,6 +29,8 @@ export interface TrackerState {
   urlActivities: UrlActivity[]; // Accumulated URL activities waiting to be sent
   localTimerStartTime: number | null; // Timestamp when timer was started locally (for sync protection)
   lastResumeTime: number | null; // Timestamp when timer was last resumed (for sync protection)
+  /** Состояние таймера от Rust после start/resume — единая точка отсчёта session_start */
+  lastTimerStateFromStart: TimerStateResponse | null;
 
   // Actions
   loadProjects: () => Promise<void>;
@@ -72,6 +74,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
   urlActivities: [], // Accumulated URL activities
   localTimerStartTime: null, // Track when timer was started locally
   lastResumeTime: null, // Track when timer was last resumed (for sync protection)
+  lastTimerStateFromStart: null,
 
   loadProjects: async () => {
     try {
@@ -741,7 +744,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       
       const isStarted = timerState?.state === 'RUNNING' || timerState?.state === 'PAUSED' || false;
       
-      // OPTIMISTIC: Обновляем UI сразу
+      // OPTIMISTIC: Обновляем UI сразу. session_start из Rust — единая точка отсчёта.
       set({
         currentTimeEntry: optimisticEntry,
         isTracking: isStarted,
@@ -751,6 +754,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         error: !isStarted ? 'Could not start timer' : null,
         localTimerStartTime: isStarted ? now : null,
         idlePauseStartTime: null, // FIX: Starting — not idle
+        lastTimerStateFromStart: timerState?.state === 'RUNNING' ? timerState : null,
       });
       
       invoke('start_activity_monitoring').catch((e) => {
@@ -1200,6 +1204,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         error: !isPaused ? 'Could not pause' : null,
         localTimerStartTime: null,
         idlePauseStartTime: pauseStartTime,
+        lastTimerStateFromStart: null,
       });
       
       // Stop monitoring immediately (local, fast)
@@ -1572,6 +1577,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         idlePauseStartTime: isResumed ? null : (get().idlePauseStartTime ?? null), // FIX: Preserve idle when resume failed
         lastResumeTime: isResumed ? resumeTime : get().lastResumeTime,
         localTimerStartTime: isResumed ? resumeTime : get().localTimerStartTime,
+        lastTimerStateFromStart: timerState?.state === 'RUNNING' ? timerState : null,
       });
       
       if (isResumed) {
@@ -1822,6 +1828,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         idlePauseStartTime: null,
         localTimerStartTime: null,
         lastResumeTime: null,
+        lastTimerStateFromStart: null,
       });
       
       invoke('stop_activity_monitoring').catch((e) => {
@@ -2365,6 +2372,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       urlActivities: [],
       localTimerStartTime: null,
       lastResumeTime: null,
+      lastTimerStateFromStart: null,
     });
   },
 
@@ -2441,6 +2449,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       idlePauseStartTime: null,
       localTimerStartTime: null, // Clear local timer start time
       lastResumeTime: null, // Clear resume time on stop
+      lastTimerStateFromStart: null,
     });
     try {
       await invoke('hide_idle_window');
