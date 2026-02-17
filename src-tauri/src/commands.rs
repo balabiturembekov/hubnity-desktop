@@ -978,6 +978,11 @@ pub async fn get_sync_status(
         .flatten()
         .and_then(|s| s.parse::<i64>().ok());
 
+    debug!(
+        "[SYNC] get_sync_status: pending={}, failed={}, is_online={}",
+        pending_count, failed_count, is_online
+    );
+
     Ok(SyncStatusResponse {
         pending_count,
         failed_count,
@@ -1119,16 +1124,22 @@ pub async fn get_last_time_entry_id(
 pub async fn start_timer(
     engine: State<'_, Arc<TimerEngine>>,
 ) -> Result<TimerStateResponse, String> {
+    let prev = engine.get_state().ok().map(|s| format!("{:?}", s.state));
     engine.start()?;
-    engine.get_state()
+    let state = engine.get_state()?;
+    info!("[TIMER] state: {:?} -> {:?}", prev.as_deref().unwrap_or("?"), state.state);
+    Ok(state)
 }
 
 #[tauri::command]
 pub async fn pause_timer(
     engine: State<'_, Arc<TimerEngine>>,
 ) -> Result<TimerStateResponse, String> {
+    let prev = engine.get_state().ok().map(|s| format!("{:?}", s.state));
     engine.pause()?;
-    engine.get_state()
+    let state = engine.get_state()?;
+    info!("[TIMER] state: {:?} -> {:?}", prev.as_deref().unwrap_or("?"), state.state);
+    Ok(state)
 }
 
 /// Пауза при idle — исключаем время простоя из accumulated
@@ -1138,22 +1149,31 @@ pub async fn pause_timer_idle(
     work_elapsed_secs: u64,
     engine: State<'_, Arc<TimerEngine>>,
 ) -> Result<TimerStateResponse, String> {
+    let prev = engine.get_state().ok().map(|s| format!("{:?}", s.state));
     engine.pause_with_work_elapsed(work_elapsed_secs)?;
-    engine.get_state()
+    let state = engine.get_state()?;
+    info!("[TIMER] state: {:?} -> {:?} (idle)", prev.as_deref().unwrap_or("?"), state.state);
+    Ok(state)
 }
 
 #[tauri::command]
 pub async fn resume_timer(
     engine: State<'_, Arc<TimerEngine>>,
 ) -> Result<TimerStateResponse, String> {
+    let prev = engine.get_state().ok().map(|s| format!("{:?}", s.state));
     engine.resume()?;
-    engine.get_state()
+    let state = engine.get_state()?;
+    info!("[TIMER] state: {:?} -> {:?}", prev.as_deref().unwrap_or("?"), state.state);
+    Ok(state)
 }
 
 #[tauri::command]
 pub async fn stop_timer(engine: State<'_, Arc<TimerEngine>>) -> Result<TimerStateResponse, String> {
+    let prev = engine.get_state().ok().map(|s| format!("{:?}", s.state));
     engine.stop()?;
-    engine.get_state()
+    let state = engine.get_state()?;
+    info!("[TIMER] state: {:?} -> {:?}", prev.as_deref().unwrap_or("?"), state.state);
+    Ok(state)
 }
 
 #[tauri::command]

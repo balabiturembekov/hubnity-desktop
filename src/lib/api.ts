@@ -4,6 +4,15 @@ import { logger } from './logger';
 
 const API_BASE_URL = 'https://app.automatonsoft.de/api';
 
+/** Включить логи API в терминал (dev или localStorage DEBUG_API=1) */
+const isDebugApi = () =>
+  import.meta.env.DEV || (typeof localStorage !== 'undefined' && localStorage.getItem('DEBUG_API') === '1');
+
+const logToTerminal = (msg: string) => {
+  if (!isDebugApi()) return;
+  invoke('log_message', { message: msg }).catch(() => {});
+};
+
 // Роли пользователей (значения, которые приходят с сервера)
 // ВАЖНО: Если сервер возвращает другие значения, нужно обновить эти константы
 export const USER_ROLES = {
@@ -164,8 +173,36 @@ class ApiClient {
       if (config.data instanceof FormData) {
         delete config.headers['Content-Type'];
       }
+      logToTerminal(`[API] -> ${(config.method || 'GET').toUpperCase()} ${config.url || ''}`);
       return config;
     });
+
+    // Debug: log responses to terminal
+    this.client.interceptors.response.use(
+      (response) => {
+        const url = response.config.url || '';
+        const status = response.status;
+        let summary = '';
+        if (Array.isArray(response.data)) {
+          summary = `[${response.data.length} items]`;
+          if (response.data.length > 0 && response.data[0]?.userId) {
+            summary += ` userIds: ${[...new Set(response.data.map((x: { userId?: string }) => x.userId))].join(', ')}`;
+          }
+        } else if (response.data && typeof response.data === 'object') {
+          const keys = Object.keys(response.data).filter((k) => !['access_token', 'refresh_token'].includes(k));
+          summary = `{${keys.slice(0, 5).join(', ')}${keys.length > 5 ? '...' : ''}}`;
+        }
+        logToTerminal(`[API] <- ${(response.config.method || 'GET').toUpperCase()} ${url} ${status} ${summary}`);
+        return response;
+      },
+      (error) => {
+        const url = error.config?.url || '?';
+        const status = error.response?.status || 'ERR';
+        const msg = error.response?.data?.message || error.message || String(error);
+        logToTerminal(`[API] <- ${(error.config?.method || '?').toUpperCase()} ${url} ${status} ${msg}`);
+        return Promise.reject(error);
+      }
+    );
 
     // Add response interceptor to handle 401 errors and refresh token
     let isRefreshing = false;
@@ -228,6 +265,7 @@ class ApiClient {
             
             const { access_token, refresh_token: newRefreshToken } = response.data;
             this.setToken(access_token);
+            logger.info('API', '[AUTH] token refreshed');
             // Always update refresh_token if provided, or clear it if not (token rotation)
             if (newRefreshToken) {
               localStorage.setItem('refresh_token', newRefreshToken);

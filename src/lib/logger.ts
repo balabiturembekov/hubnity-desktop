@@ -112,6 +112,18 @@ class Logger {
       this.debug('Logger', `Failed to log to Rust: ${message}`, e);
     }
   }
+
+  /**
+   * Отладка: вывод в терминал (dev или localStorage DEBUG=1).
+   * Используется для поиска багов — все ключевые решения и данные.
+   */
+  debugTerminal(tag: string, msg: string): void {
+    const enabled =
+      import.meta.env.DEV ||
+      (typeof localStorage !== 'undefined' && localStorage.getItem('DEBUG') === '1');
+    if (!enabled) return;
+    invoke('log_message', { message: `[DEBUG:${tag}] ${msg}` }).catch(() => {});
+  }
 }
 
 export const logger = new Logger();

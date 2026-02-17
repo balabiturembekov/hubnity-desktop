@@ -120,8 +120,9 @@ export function Settings() {
     invoke<number>('get_sleep_gap_threshold_minutes')
       .then((m) => {
         if (isMountedRef.current) {
-          setSleepGapThreshold(m);
-          setLoadedSleepGap(m);
+          const val = Number.isFinite(m) ? Math.max(1, Math.min(120, m)) : 5;
+          setSleepGapThreshold(val);
+          setLoadedSleepGap(val);
         }
       })
       .catch(() => {});
@@ -275,7 +276,7 @@ export function Settings() {
               </div>
               <div>
                 <Label className="text-xs text-muted-foreground">Company</Label>
-                <p className="text-sm font-medium mt-0.5">{user.company.name}</p>
+                <p className="text-sm font-medium mt-0.5">{user.company?.name ?? '—'}</p>
               </div>
             </div>
           )}

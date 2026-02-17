@@ -104,12 +104,22 @@ export function Timer() {
       invoke('plugin:tray|set_tooltip', { id: 'main', tooltip }).catch(() => {});
     };
 
+    const shouldSkipStalePaused = (state: TimerStateResponse) => {
+      if (state.state !== 'PAUSED') return false;
+      const store = useTrackerStore.getState();
+      const lastFromStore = store.lastTimerStateFromStart;
+      if (lastFromStore?.state !== 'RUNNING') return false;
+      // Skip only if user just resumed (< 5s) — prevents stale PAUSED from overwriting fresh RUNNING
+      // After wake, lastResumeTime is null or old — accept PAUSED
+      const lastResumeTime = store.lastResumeTime;
+      if (!lastResumeTime) return false;
+      return Date.now() - lastResumeTime < 5000;
+    };
+
     listen<TimerStateResponse>('timer-state-update', (ev) => {
       if (!isMounted) return;
       const state = ev.payload;
-      // Не перезаписывать RUNNING (после resume из idle) устаревшим PAUSED из очереди событий
-      const lastFromStore = useTrackerStore.getState().lastTimerStateFromStart;
-      if (lastFromStore?.state === 'RUNNING' && state.state === 'PAUSED') return;
+      if (shouldSkipStalePaused(state)) return;
       processState(state);
     }).then((fn) => {
       unlistenTimer = fn;
@@ -120,8 +130,7 @@ export function Timer() {
       try {
         const state = await useTrackerStore.getState().getTimerState();
         if (!isMounted) return;
-        const lastFromStore = useTrackerStore.getState().lastTimerStateFromStart;
-        if (lastFromStore?.state === 'RUNNING' && state.state === 'PAUSED') return;
+        if (shouldSkipStalePaused(state)) return;
         processState(state);
       } catch (e) {
         logger.error('TIMER', 'Failed to get timer state', e);

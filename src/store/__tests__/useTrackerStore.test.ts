@@ -84,6 +84,7 @@ vi.mock('../../lib/logger', () => ({
     debug: vi.fn(),
     safeLogToRust: vi.fn().mockResolvedValue(undefined),
     logError: vi.fn(),
+    debugTerminal: vi.fn(),
   },
 }));
 
@@ -617,6 +618,31 @@ describe('useTrackerStore', () => {
       // When only engine fails, store still clears entry from API; either error or entry cleared
       const state = useTrackerStore.getState();
       expect(state.error != null || state.currentTimeEntry === null).toBeTruthy();
+    });
+  });
+
+  describe('loadActiveTimeEntry', () => {
+    it('ignores active entries from other users (SECURITY)', async () => {
+      mockGetTimerState.mockResolvedValue({ state: 'STOPPED', elapsed_seconds: 0, accumulated_seconds: 0, session_start: null, day_start: Math.floor(Date.now() / 1000) });
+      mockGetActiveTimeEntries.mockResolvedValue([
+        {
+          id: 'foreign-entry-id',
+          userId: 'other-user-id',
+          projectId: '1',
+          startTime: new Date().toISOString(),
+          endTime: null,
+          duration: 0,
+          description: '',
+          status: 'RUNNING',
+          createdAt: '',
+          updatedAt: '',
+        },
+      ]);
+      useTrackerStore.setState({ currentTimeEntry: null, isTracking: false });
+      await useTrackerStore.getState().loadActiveTimeEntry();
+      const state = useTrackerStore.getState();
+      expect(state.currentTimeEntry).toBeNull();
+      expect(state.currentTimeEntry?.userId).not.toBe('other-user-id');
     });
   });
 

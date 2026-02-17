@@ -101,6 +101,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       // FIX: Fallback to useAuthStore.user — getCurrentUser() can be null on app reload
       // because it's set asynchronously in restoreTokens, which runs in parallel with loadActiveTimeEntry
       const currentUser = getCurrentUser() ?? useAuthStore.getState().user;
+      logger.debugTerminal('LOAD', `start currentUser=${currentUser?.id ?? 'null'}`);
       if (!currentUser) {
         logger.warn('LOAD', 'Cannot load active time entry: no current user');
         return;
@@ -118,6 +119,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       }
       
       const activeEntries = await api.getActiveTimeEntries();
+      logger.debugTerminal('LOAD', `getActiveTimeEntries: ${activeEntries.length} items, userIds=${activeEntries.map((e) => e.userId).join(', ')}`);
       if (activeEntries.length === 0) {
         // BUG FIX: Don't auto-stop timer if it's PAUSED or RUNNING without server entry
         // PAUSED: after system wake, user can resume manually
@@ -144,12 +146,13 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       // SECURITY: Filter out entries that don't belong to current user
       const userEntries = activeEntries.filter(entry => entry.userId === currentUser.id);
       const foreignEntries = activeEntries.filter(entry => entry.userId !== currentUser.id);
-      
+      logger.debugTerminal('LOAD', `filter: userEntries=${userEntries.length} (ids=${userEntries.map((e) => e.id).join(',')}), foreignEntries=${foreignEntries.length}`);
       if (foreignEntries.length > 0) {
         logger.error('LOAD', `SECURITY: Found ${foreignEntries.length} active time entries belonging to other users. Current user: ${currentUser.id}, Foreign entries: ${foreignEntries.map(e => `${e.id} (user: ${e.userId})`).join(', ')}`);
       }
 
       if (userEntries.length === 0) {
+        logger.debugTerminal('LOAD', 'early return: userEntries=0');
         // No entries for current user - check Timer Engine state before clearing
         // BUG FIX: Don't auto-stop timer if it's PAUSED or RUNNING without server entry
         try {
@@ -177,7 +180,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         // FIX: Если несколько активных записей, выбираем самую свежую и останавливаем остальные
         // NOTE: userEntries уже отфильтрованы по userId текущего пользователя
         if (userEntries.length > 1) {
-          logger.warn('LOAD', `Multiple active time entries found (${userEntries.length}), resolving duplicates...`);
+          logger.warn('LOAD', `Multiple active time entries for current user (${userEntries.length}), stopping duplicates. userId=${currentUser.id}, ids=${userEntries.map((e) => e.id).join(', ')}`);
           
           // Сортируем по startTime (самая свежая первая)
           const sortedEntries = [...userEntries].sort((a, b) => 
@@ -198,13 +201,13 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           for (const duplicate of duplicateEntries) {
             try {
               if (duplicate.status === 'RUNNING') {
-                // Останавливаем дубликаты, которые еще работают
+                // Останавливаем дубликаты, которые еще работают (только свои — userEntries уже отфильтрованы)
                 await api.stopTimeEntry(duplicate.id);
-                logger.info('LOAD', `Stopped duplicate time entry: ${duplicate.id}`);
+                logger.info('LOAD', `Stopped duplicate time entry: ${duplicate.id} (userId=${duplicate.userId})`);
               } else if (duplicate.status === 'PAUSED') {
                 // Если на паузе, тоже останавливаем для консистентности
                 await api.stopTimeEntry(duplicate.id);
-                logger.info('LOAD', `Stopped duplicate paused entry: ${duplicate.id}`);
+                logger.info('LOAD', `Stopped duplicate paused entry: ${duplicate.id} (userId=${duplicate.userId})`);
               }
             } catch (error: any) {
               // Логируем ошибку, но продолжаем работу с основной записью
@@ -221,7 +224,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           }
           activeEntry = userEntries[0];
         }
-        
+        logger.debugTerminal('LOAD', `activeEntry=${activeEntry?.id ?? 'null'} status=${activeEntry?.status ?? '?'}`);
         // Validate entry data
         if (!activeEntry || !activeEntry.id || !activeEntry.startTime) {
           logger.error('LOAD', 'Invalid active entry data', activeEntry);
@@ -483,6 +486,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
     try {
       const now = Date.now();
       const nowStr = new Date(now).toISOString();
+      logger.debugTerminal('START', `userId=${user.id} projectId=${selectedProject.id} fromSync=${fromSync ?? false}`);
       const optimisticEntry: TimeEntry = {
         id: `temp-${now}`,
         userId: user.id,
@@ -591,10 +595,8 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           if (foreignEntries.length > 0) {
             logger.error('START', `SECURITY: Found ${foreignEntries.length} active time entries belonging to other users`);
           }
-          if (userEntries.length > 0) {
-            activeEntries.length = 0;
-            activeEntries.push(...userEntries);
-          }
+          // CRITICAL: Use ONLY our entries. If none — clear activeEntries to skip restore/duplicate logic
+          activeEntries = userEntries;
         }
 
         if (activeEntries.length > 0) {
@@ -841,17 +843,16 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
               try {
                 const activeEntries = await api.getActiveTimeEntries();
                 const userEntries = activeEntries.filter(e => e.userId === user.id);
-                const activeEntry = userEntries[0] ?? activeEntries[0];
-                if (activeEntry) {
-                  set({
-                    currentTimeEntry: activeEntry,
-                    localTimerStartTime: null,
-                    error: null,
-                    idlePauseStartTime: null,
-                    idlePauseStartPerfRef: null,
-                  });
-                  return;
-                }
+                const activeEntry = userEntries[0];
+                if (!activeEntry) return;
+                set({
+                  currentTimeEntry: activeEntry,
+                  localTimerStartTime: null,
+                  error: null,
+                  idlePauseStartTime: null,
+                  idlePauseStartPerfRef: null,
+                });
+                return;
               } catch (_) {}
             }
             // OFFLINE FIX: Don't stop timer — enqueue already happened, sync will create entry when online
@@ -881,15 +882,12 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       if (entryCreated) {
         // Запись уже существует - пытаемся синхронизировать состояние
         try {
+          const currentUserForSync = getCurrentUser() ?? useAuthStore.getState().user;
+          if (!currentUserForSync) return;
           const activeEntries = await api.getActiveTimeEntries();
-          if (activeEntries.length > 0) {
-            // BUG FIX: Ensure array is not empty before accessing
-            const activeEntry = activeEntries[0];
-            if (!activeEntry) {
-              logger.error('START', 'activeEntries[0] is undefined, this should not happen');
-              set({ error: 'Invalid active entries data', isLoading: false });
-              return;
-            }
+          const userEntries = activeEntries.filter((e) => e.userId === currentUserForSync.id);
+          if (userEntries.length > 0) {
+            const activeEntry = userEntries[0];
             const timerState = await TimerEngineAPI.getState();
             set({
               currentTimeEntry: activeEntry,
@@ -1007,6 +1005,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
     // loadActiveTimeEntry might have failed (network) or store might be desynced — API might have RUNNING entry
     if (!timeEntryToPause && timerState.state === 'RUNNING') {
       const currentUser = getCurrentUser() ?? useAuthStore.getState().user;
+      logger.debugTerminal('PAUSE', `no currentEntry, fetching. userId=${currentUser?.id}`);
       if (currentUser) {
         try {
           const activeEntries = await api.getActiveTimeEntries();
@@ -1307,6 +1306,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           return null;
         });
       }
+      if (isPaused) logger.debugTerminal('PAUSE', `entryIdToPause=${entryIdToPause} userId=${timeEntryToPause?.userId ?? '?'}`);
       if (isPaused && !entryIdToPause.startsWith('temp-')) (async () => {
         try {
           await get().sendUrlActivities();
@@ -1869,6 +1869,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
             const userEntry = activeEntries.find((e) => e.userId === currentUser.id);
             if (userEntry) {
               timeEntryToStop = userEntry;
+              logger.debugTerminal('STOP', `entryId from getActiveTimeEntries: ${userEntry.id} userId=${userEntry.userId}`);
             }
           } catch (_) {}
         }
@@ -1876,8 +1877,24 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
     }
 
     // Если по-прежнему нет currentTimeEntry — останавливаем движок и enqueue stop (офлайн)
+    // SECURITY: НЕ enqueue stop с lastId когда userEntries=0 — lastId может быть из очереди (fallback)
+    // и относиться к чужой записи. Останавливаем только движок и очищаем состояние.
     if (!timeEntryToStop) {
-      const lastId = await invoke<string | null>('get_last_time_entry_id').catch(() => null);
+      const currentUser = getCurrentUser() ?? useAuthStore.getState().user;
+      let hasUserEntriesOnServer = false;
+      if (currentUser) {
+        try {
+          const activeEntries = await api.getActiveTimeEntries();
+          hasUserEntriesOnServer = activeEntries.some((e) => e.userId === currentUser.id);
+        } catch (_) {}
+      }
+      // Only use lastId when current user has entries on server — otherwise lastId may be foreign (from queue fallback)
+      const lastId = hasUserEntriesOnServer
+        ? await invoke<string | null>('get_last_time_entry_id').catch(() => null)
+        : null;
+      if (!hasUserEntriesOnServer) {
+        logger.debugTerminal('STOP', 'no-entry path: hasUserEntriesOnServer=false, skipping enqueue');
+      }
       if (lastId && !lastId.startsWith('temp-')) {
         const accessToken = api.getAccessToken() || localStorage.getItem('access_token') || '';
         const refreshToken = localStorage.getItem('refresh_token');
@@ -1921,6 +1938,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
 
     try {
       const entryIdToStop = timeEntryToStop.id;
+      logger.debugTerminal('STOP', `entryIdToStop=${entryIdToStop} userId=${timeEntryToStop.userId} source=currentTimeEntry`);
       
       // OPTIMISTIC: Сначала Timer Engine (локально), сразу обновляем UI
       let timerState: import('../lib/timer-engine').TimerStateResponse | null = null;
@@ -2680,6 +2698,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           return;
         }
         
+        logger.debugTerminal('INVARIANT', `desync: store isTracking=${storeState.isTracking} isPaused=${storeState.isPaused} engine=${timerState.state}`);
         logger.warn('STATE_INVARIANT', 'State desync detected, auto-syncing', {
           store: { isTracking: storeState.isTracking, isPaused: storeState.isPaused, hasEntry: !!storeState.currentTimeEntry, idlePauseStartTime: storeState.idlePauseStartTime },
           timerEngine: { state: timerState.state, expectedTracking, expectedPaused },
@@ -2718,7 +2737,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
               : {}),
         });
         
-        await logger.safeLogToRust(`[STATE_INVARIANT] Auto-synced: isTracking=${expectedTracking}, isPaused=${expectedPaused} (was: store=${storeState.isTracking}/${storeState.isPaused}, engine=${timerState.state})`).catch((e) => {
+        await logger.safeLogToRust(`[INVARIANT] fixed: isTracking=${expectedTracking} isPaused=${expectedPaused} (was store=${storeState.isTracking}/${storeState.isPaused} engine=${timerState.state})`).catch((e) => {
           logger.debug('STATE_INVARIANT', 'Failed to log (non-critical)', e);
         });
         if (timerState.state === 'RUNNING' || timerState.state === 'STOPPED') {

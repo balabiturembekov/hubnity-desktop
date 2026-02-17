@@ -76,7 +76,7 @@ function App() {
       .catch(error => {
         logger.debug('APP', 'Failed to get app version', error);
         // Fallback to package.json version if available
-        setAppVersion('0.1.23'); // Fallback when get_app_version fails
+        setAppVersion('0.1.26'); // Fallback when get_app_version fails
       });
   }, []);
 
@@ -95,8 +95,9 @@ function App() {
           refreshToken,
           userId: user ? String(user.id) : null,
         });
+        const syncStatus = await invoke<{ pending_count: number; failed_count: number; is_online: boolean }>('get_sync_status');
         const synced = await invoke<number>('sync_queue_now');
-        await logger.safeLogToRust(`[SYNC-FRONT] sync_queue_now returned: ${synced}`).catch(() => {});
+        await logger.safeLogToRust(`[SYNC-FRONT] queue: pending=${syncStatus.pending_count} failed=${syncStatus.failed_count} synced=${synced}`).catch(() => {});
         if (synced > 0) logger.info('APP', `Sync: ${synced} task(s) sent`);
       } catch (e) {
         logger.warn('APP', 'pushTokensAndSync failed', e);
@@ -219,13 +220,14 @@ function App() {
       try {
         // FIX: Не синхронизировать с сервером при отсутствии интернета — таймер должен работать офлайн
         try {
-          const syncStatus = await invoke<{ is_online: boolean }>('get_sync_status');
+          const syncStatus = await invoke<{ is_online: boolean; pending_count: number; failed_count: number }>('get_sync_status');
+          logger.debugTerminal('SYNC', `queue: pending=${syncStatus.pending_count} failed=${syncStatus.failed_count}`);
           if (!syncStatus.is_online) {
-            logger.debug('APP', 'syncTimerState: offline, skipping (timer continues locally)');
+            logger.debugTerminal('SYNC', 'decision: SKIP reason=offline');
             return;
           }
         } catch (e) {
-          logger.debug('APP', 'syncTimerState: failed to check online status, skipping', e);
+          logger.debugTerminal('SYNC', 'decision: SKIP reason=failed to check online status');
           return;
         }
 
@@ -240,7 +242,7 @@ function App() {
             useTrackerStore.setState({ isLoading: false });
             syncSkippedDueToLoading = 0;
           } else {
-            logger.debug('APP', 'Skipping sync: operation in progress');
+            logger.debugTerminal('SYNC', 'decision: SKIP reason=isLoading');
             return;
           }
         } else {
@@ -262,21 +264,32 @@ function App() {
         
         // Если локально нет активной записи и таймер остановлен, не нужно синхронизировать
         if (!currentTimeEntry && !isTracking) {
+          logger.debugTerminal('SYNC', 'decision: SKIP reason=noEntryAndNotTracking');
           return;
         }
         
         // НЕ синхронизируем автоматически если локально на паузе из-за idle
         // Пользователь должен сам решить возобновлять или останавливать через idle окно
         if (isPaused && idlePauseStartTime !== null) {
-          logger.debug('APP', 'Skipping sync: timer paused due to idle, user must decide via idle window');
+          logger.debugTerminal('SYNC', 'decision: SKIP reason=idlePauseUserMustDecide');
           return;
         }
         
         const activeEntries = await api.getActiveTimeEntries();
-        
-        if (activeEntries.length > 0) {
+        const currentUser = useAuthStore.getState().user;
+        // SECURITY: Filter to current user only — API may return workspace-wide entries
+        const userEntries = currentUser
+          ? activeEntries.filter((e) => e.userId === currentUser.id)
+          : [];
+        const foreignEntries = activeEntries.filter((e) => e.userId !== currentUser?.id);
+        logger.debugTerminal('SYNC', `currentUser=${currentUser?.id ?? 'null'} userEntries=${userEntries.length} foreign=${foreignEntries.length} timerState=${timerState?.state ?? '?'} currentEntry=${currentTimeEntry?.id ?? 'null'}`);
+        if (foreignEntries.length > 0) {
+          logger.warn('APP', `Sync: ignoring ${foreignEntries.length} active entries from other users`);
+        }
+
+        if (userEntries.length > 0) {
           // BUG FIX: Сортируем по startTime (самая свежая первая), как в loadActiveTimeEntry
-          const sortedEntries = [...activeEntries].sort((a, b) =>
+          const sortedEntries = [...userEntries].sort((a, b) =>
             new Date(b.startTime).getTime() - new Date(a.startTime).getTime()
           );
           const activeEntry = sortedEntries[0];
@@ -304,6 +317,7 @@ function App() {
           // Синхронизируем состояние таймера с сервером
           if (activeEntry.status === 'RUNNING' && timerState.state !== 'RUNNING') {
             // На сервере RUNNING, но локально не RUNNING - запускаем
+            logger.debugTerminal('SYNC', `decision: RESUME/START (server RUNNING, local ${timerState.state}) activeEntryId=${activeEntry.id}`);
             // BUG FIX: Check if timer is paused before resuming (resumeTracking requires isPaused=true)
             const currentStoreState = useTrackerStore.getState();
             if (currentStoreState.isPaused || timerState.state === 'PAUSED') {
@@ -338,8 +352,7 @@ function App() {
               const FIVE_SECONDS = 5 * 1000;
               const timeSinceResume = Date.now() - storeState.lastResumeTime;
               if (timeSinceResume < FIVE_SECONDS) {
-                const secondsSinceResume = Math.round(timeSinceResume / 1000);
-                logger.info('APP', `Skipping sync pause: idle window was recently closed (${secondsSinceResume}s ago), user might have just resumed`);
+                logger.debugTerminal('SYNC', 'decision: SKIP reason=idleWindowRecentlyClosed');
                 return;
               }
             }
@@ -350,8 +363,7 @@ function App() {
             // Increased to 15 seconds to cover at least one sync cycle (10s interval)
             const FIFTEEN_SECONDS = 15 * 1000; // 15 seconds in milliseconds
             if (storeState.lastResumeTime && (Date.now() - storeState.lastResumeTime) < FIFTEEN_SECONDS) {
-              const timeSinceResume = Math.round((Date.now() - storeState.lastResumeTime) / 1000);
-              logger.info('APP', `Skipping sync pause: timer was just resumed (${timeSinceResume}s ago), server may not have updated yet`);
+              logger.debugTerminal('SYNC', 'decision: SKIP reason=timerJustResumed');
               return;
             }
             
@@ -363,7 +375,7 @@ function App() {
                 // Check if there are any resume operations pending
                 const queueStats = await invoke<{ pending_by_type: Record<string, number> }>('get_sync_queue_stats').catch(() => null);
                 if (queueStats?.pending_by_type?.['time_entry_resume'] && queueStats.pending_by_type['time_entry_resume'] > 0) {
-                  logger.info('APP', `Skipping sync pause: ${queueStats.pending_by_type['time_entry_resume']} pending resume operation(s) in queue, waiting for sync`);
+                  logger.debugTerminal('SYNC', 'decision: SKIP reason=pendingResumeInQueue');
                   return;
                 }
               }
@@ -379,12 +391,12 @@ function App() {
               const THIRTY_SECONDS = 30 * 1000; // 30 seconds in milliseconds
               const timeSinceStart = Date.now() - storeState.localTimerStartTime;
               if (timeSinceStart < THIRTY_SECONDS) {
-                const secondsSinceStart = Math.round(timeSinceStart / 1000);
-                logger.info('APP', `Skipping sync pause: timer was started/resumed locally recently (${secondsSinceStart}s ago), server may not have updated yet`);
+                logger.debugTerminal('SYNC', 'decision: SKIP reason=timerStartedLocallyRecently');
                 return;
               }
             }
             
+            logger.debugTerminal('SYNC', `decision: PAUSE (server PAUSED, local RUNNING) activeEntryId=${activeEntry.id}`);
             logger.info('APP', 'Syncing timer: server is PAUSED, pausing local timer (auto-sync)');
             const { pauseTracking } = useTrackerStore.getState();
             await pauseTracking().catch((e) => {
@@ -393,6 +405,7 @@ function App() {
           } else if (activeEntry.status === 'STOPPED' && timerState.state !== 'STOPPED') {
             // На сервере STOPPED, но локально не STOPPED - останавливаем
             // currentEntry уже проверен выше
+            logger.debugTerminal('SYNC', `decision: STOP (server STOPPED, local ${timerState.state})`);
             logger.info('APP', 'Syncing timer: server is STOPPED, stopping local timer');
             const { stopTracking } = useTrackerStore.getState();
             await stopTracking().catch((e) => {
@@ -401,8 +414,10 @@ function App() {
           }
         } else {
           // Нет активных записей на сервере — проверяем, нужно ли останавливать таймер
+          logger.debugTerminal('SYNC', `decision: userEntries=0, checking stop. currentEntry=${currentTimeEntry?.id ?? 'null'} timerState=${timerState?.state ?? '?'}`);
           const { currentTimeEntry: currentEntry, getTimerState, clearTrackingStateFromServer, localTimerStartTime } = useTrackerStore.getState();
           if (!currentEntry) {
+            logger.debugTerminal('SYNC', 'decision: SKIP reason=userEntries0NoCurrentEntry');
             return; // Уже остановлено локально
           }
           
@@ -410,16 +425,16 @@ function App() {
           // This protects against stopping timer when API call failed but Timer Engine is running
           const TWO_MINUTES = 2 * 60 * 1000; // 2 minutes in milliseconds
           if (localTimerStartTime && (Date.now() - localTimerStartTime) < TWO_MINUTES) {
-            logger.debug('APP', 'Syncing timer: timer started locally recently, skipping auto-stop (API may still be syncing)');
+            logger.debugTerminal('SYNC', 'decision: SKIP reason=localTimerStartedRecently');
             return; // Don't stop timer if it was started locally recently
           }
           
-          const timerState = await getTimerState();
-          if (timerState.state !== 'STOPPED') {
+          const timerStateNow = await getTimerState();
+          if (timerStateNow.state !== 'STOPPED') {
             // BUG FIX: Don't auto-stop timer if it's PAUSED after system wake (restored_from_running)
             // User should be able to resume manually; only skip when we know it's wake-restore
-            if (timerState.state === 'PAUSED' && timerState.restored_from_running) {
-              logger.info('APP', 'Syncing timer: timer is PAUSED after wake (restored_from_running), allowing user to resume manually');
+            if (timerStateNow.state === 'PAUSED' && timerStateNow.restored_from_running) {
+              logger.debugTerminal('SYNC', 'decision: SKIP reason=restoredFromRunningWake');
               return;
             }
             
