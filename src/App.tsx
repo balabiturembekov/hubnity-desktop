@@ -76,14 +76,17 @@ function App() {
       .catch(error => {
         logger.debug('APP', 'Failed to get app version', error);
         // Fallback to package.json version if available
-        setAppVersion('0.1.26'); // Fallback when get_app_version fails
+        setAppVersion('0.1.27'); // Fallback when get_app_version fails
       });
   }, []);
 
   // Критично: каждые 30 с передаём токены в Rust (если есть) и запускаем синхронизацию.
   // Не полагаемся на isAuthenticated — токен может быть в localStorage до регидрации Zustand.
   useEffect(() => {
+    let pushInProgress = false;
     const pushTokensAndSync = async () => {
+      if (pushInProgress) return;
+      pushInProgress = true;
       try {
         const accessToken = api.getAccessToken() || localStorage.getItem('access_token');
         const refreshToken = localStorage.getItem('refresh_token');
@@ -102,6 +105,8 @@ function App() {
       } catch (e) {
         logger.warn('APP', 'pushTokensAndSync failed', e);
         await logger.safeLogToRust(`[SYNC-FRONT] pushTokensAndSync error: ${String(e)}`).catch(() => {});
+      } finally {
+        pushInProgress = false;
       }
     };
     pushTokensAndSync();

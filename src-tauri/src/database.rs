@@ -692,34 +692,40 @@ impl Database {
     /// Получить задачи для повторной попытки (exponential backoff)
     /// Получить задачи для синхронизации с адаптивным batch size и приоритетами
     /// PRODUCTION: Exponential backoff: 10 сек → 20 сек → 40 сек → 80 сек → 120 сек (max)
-    /// CRITICAL FIX: Возвращает idempotency_key для предотвращения дубликатов
+    /// CRITICAL FIX: aggressive_retry=true — при восстановлении сети используем 5 сек вместо полного backoff
     pub fn get_retry_tasks(
         &self,
         max_retries: i32,
         batch_size: i32,
+        aggressive_retry: bool,
     ) -> SqliteResult<Vec<(i64, String, String, i32, Option<String>)>> {
         let conn = self.lock_conn()?;
         let now = Utc::now().timestamp();
 
-        // PRODUCTION: Исправленный exponential backoff
-        // Минимум: 10 секунд, максимум: 120 секунд (2 минуты)
-        // Формула: min(10 * 2^retry_count, 120)
-        // CRITICAL FIX: Включаем idempotency_key в SELECT
-        let mut stmt = conn.prepare(
-            "SELECT id, entity_type, payload, retry_count, idempotency_key FROM sync_queue
-     WHERE status = 'pending' AND retry_count < ?1
-     AND (last_retry_at IS NULL OR 
-          last_retry_at + CASE 
+        // aggressive_retry: при online — 5 сек, чтобы сразу повторить после восстановления сети
+        let backoff_sql = if aggressive_retry {
+            "5"
+        } else {
+            "CASE 
               WHEN retry_count = 0 THEN 10
               WHEN retry_count = 1 THEN 20
               WHEN retry_count = 2 THEN 40
               WHEN retry_count = 3 THEN 80
               WHEN retry_count >= 4 THEN 120
               ELSE 120
-          END <= ?2)
+          END"
+        };
+
+        let sql = format!(
+            "SELECT id, entity_type, payload, retry_count, idempotency_key FROM sync_queue
+     WHERE status = 'pending' AND retry_count < ?1
+     AND (last_retry_at IS NULL OR last_retry_at + {} <= ?2)
      ORDER BY priority ASC, created_at ASC
      LIMIT ?3",
-        )?;
+            backoff_sql
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
 
         let rows = stmt.query_map(params![max_retries, now, batch_size], |row| {
             let id = row.get::<_, i64>(0)?;

@@ -508,9 +508,13 @@ impl SyncManager {
             pending_count, stats_info, batch_size
         );
 
+        // При online — aggressive retry (5 сек), чтобы сразу повторить после восстановления сети
+        let is_online = crate::network::check_online_status().await;
+        let aggressive_retry = is_online;
+
         let tasks = self
             .db
-            .get_retry_tasks(max_retries, batch_size)
+            .get_retry_tasks(max_retries, batch_size, aggressive_retry)
             .map_err(|e| SyncError::Db(format!("get retry tasks: {}", e)))?;
 
         if tasks.is_empty() {

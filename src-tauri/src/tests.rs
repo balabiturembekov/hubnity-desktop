@@ -1214,7 +1214,7 @@ mod tests {
 
             // Проверяем, что get_retry_tasks не паникует
             // (результат может быть пустым, если не прошло достаточно времени для retry)
-            let _retry_tasks = db.get_retry_tasks(5, 10).unwrap();
+            let _retry_tasks = db.get_retry_tasks(5, 10, false).unwrap();
         }
 
         #[test]
@@ -1229,7 +1229,7 @@ mod tests {
             db.update_sync_status(queue_id, "pending", 5).unwrap();
 
             // Получаем retry задачи с max_retries = 5
-            let retry_tasks = db.get_retry_tasks(5, 10).unwrap();
+            let retry_tasks = db.get_retry_tasks(5, 10, false).unwrap();
             // Задача с retry_count = 5 не должна быть в списке (retry_count < max_retries)
             assert!(!retry_tasks.iter().any(|(id, _, _, _, _)| *id == queue_id));
         }
@@ -1594,7 +1594,7 @@ mod tests {
                 .unwrap();
 
             // Проверяем, что retry_count увеличился
-            let retry_tasks = sync_manager.db.get_retry_tasks(5, 10).unwrap();
+            let retry_tasks = sync_manager.db.get_retry_tasks(5, 10, false).unwrap();
             let retry_task = retry_tasks.iter().find(|(id, _, _, _, _)| *id == queue_id);
 
             if let Some((_, _, _, retry_count, _)) = retry_task {
@@ -1622,7 +1622,7 @@ mod tests {
                 .unwrap();
 
             // Задача НЕ должна быть доступна для retry (retry_count >= max_retries)
-            let retry_tasks = sync_manager.db.get_retry_tasks(5, 10).unwrap();
+            let retry_tasks = sync_manager.db.get_retry_tasks(5, 10, false).unwrap();
             assert!(
                 !retry_tasks.iter().any(|(id, _, _, _, _)| *id == queue_id),
                 "Task with retry_count=5 should NOT be available for retry"
@@ -1668,7 +1668,7 @@ mod tests {
                 "Sent task should NOT be in pending tasks"
             );
 
-            let retry_tasks = sync_manager.db.get_retry_tasks(5, 10).unwrap();
+            let retry_tasks = sync_manager.db.get_retry_tasks(5, 10, false).unwrap();
             assert!(
                 !retry_tasks.iter().any(|(id, _, _, _, _)| *id == queue_id),
                 "Sent task should NOT be in retry tasks"
@@ -1711,7 +1711,7 @@ mod tests {
                 drop(conn);
 
                 // Проверяем, что задача доступна для retry (retry_count < max_retries=5)
-                let retry_tasks = sync_manager.db.get_retry_tasks(5, 10).unwrap();
+                let retry_tasks = sync_manager.db.get_retry_tasks(5, 10, false).unwrap();
                 let task = retry_tasks.iter().find(|(id, _, _, _, _)| *id == queue_id);
 
                 if retry_count < 5 {
@@ -1731,7 +1731,7 @@ mod tests {
                 .db
                 .update_sync_status(queue_id, "pending", 5)
                 .unwrap();
-            let retry_tasks = sync_manager.db.get_retry_tasks(5, 10).unwrap();
+            let retry_tasks = sync_manager.db.get_retry_tasks(5, 10, false).unwrap();
             assert!(
                 !retry_tasks.iter().any(|(id, _, _, _, _)| *id == queue_id),
                 "Task with retry_count=5 should NOT be available for retry"
@@ -2163,7 +2163,7 @@ mod tests {
 
             // Сразу после обновления задача может быть доступна или нет
             // (зависит от времени, но важно что функция не паникует)
-            let _retry_tasks = db.get_retry_tasks(5, 10).unwrap();
+            let _retry_tasks = db.get_retry_tasks(5, 10, false).unwrap();
             // Проверяем, что функция не паникует и возвращает корректный результат
 
             // Устанавливаем last_retry_at на 2 минуты назад (больше чем 1 минута для retry_count=0)
@@ -2177,7 +2177,7 @@ mod tests {
             drop(conn);
 
             // Теперь задача должна быть доступна для retry
-            let retry_tasks = db.get_retry_tasks(5, 10).unwrap();
+            let retry_tasks = db.get_retry_tasks(5, 10, false).unwrap();
             assert!(
                 retry_tasks.iter().any(|(id, _, _, _, _)| *id == queue_id),
                 "Task should be available for retry after 2 minutes with retry_count=0"
@@ -2213,7 +2213,7 @@ mod tests {
             .unwrap();
             drop(conn);
 
-            let retry_tasks = db.get_retry_tasks(5, 10).unwrap();
+            let retry_tasks = db.get_retry_tasks(5, 10, false).unwrap();
             let retry_ids: Vec<i64> = retry_tasks.iter().map(|(id, _, _, _, _)| *id).collect();
 
             // id0 (retry_count=0, задержка 10 сек) должна быть доступна
@@ -2242,7 +2242,7 @@ mod tests {
             let queue_id = db.enqueue_sync("test_task", r#"{"data": "test"}"#).unwrap();
 
             // Задача должна быть доступна для retry (last_retry_at IS NULL)
-            let retry_tasks = db.get_retry_tasks(5, 10).unwrap();
+            let retry_tasks = db.get_retry_tasks(5, 10, false).unwrap();
             assert!(
                 retry_tasks.iter().any(|(id, _, _, _, _)| *id == queue_id),
                 "Task without last_retry_at should be available for retry"
@@ -2294,7 +2294,7 @@ mod tests {
             db.update_sync_status(queue_id, "pending", 4).unwrap();
 
             // Задача должна быть доступна для retry (retry_count < max_retries)
-            let _retry_tasks = db.get_retry_tasks(5, 10).unwrap();
+            let _retry_tasks = db.get_retry_tasks(5, 10, false).unwrap();
             // Проверяем, что функция не паникует и может вернуть задачу
             // (зависит от времени, но важно что функция работает)
 
@@ -2302,7 +2302,7 @@ mod tests {
             db.update_sync_status(queue_id, "pending", 5).unwrap();
 
             // Задача НЕ должна быть доступна для retry (retry_count >= max_retries)
-            let retry_tasks = db.get_retry_tasks(5, 10).unwrap();
+            let retry_tasks = db.get_retry_tasks(5, 10, false).unwrap();
             assert!(
                 !retry_tasks.iter().any(|(id, _, _, _, _)| *id == queue_id),
                 "Task with retry_count=5 should NOT be available when max_retries=5"
