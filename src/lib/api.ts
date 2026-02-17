@@ -567,8 +567,21 @@ class ApiClient {
     return response.data;
   }
 
-  // Heartbeat
+  // Heartbeat — throttle: skip if same active sent within 500ms
+  private lastHeartbeatAt = 0;
+  private lastHeartbeatActive: boolean | null = null;
+  private static readonly HEARTBEAT_THROTTLE_MS = 500;
+
   async sendHeartbeat(isActive: boolean): Promise<HeartbeatResponse> {
+    const now = Date.now();
+    if (
+      now - this.lastHeartbeatAt < ApiClient.HEARTBEAT_THROTTLE_MS &&
+      this.lastHeartbeatActive === isActive
+    ) {
+      return { success: true, timestamp: new Date().toISOString() };
+    }
+    this.lastHeartbeatAt = now;
+    this.lastHeartbeatActive = isActive;
     const response = await this.client.post<HeartbeatResponse>('/idle/heartbeat', {
       isActive,
     });

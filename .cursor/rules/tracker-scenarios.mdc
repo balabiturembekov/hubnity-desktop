@@ -1,0 +1,28 @@
+---
+description: Перед изменениями в трекере — читать TRACKER_SCENARIOS.md
+globs: src/store/useTrackerStore.ts,src/App.tsx,src/components/Timer.tsx,src/components/IdleWindow.tsx,src-tauri/src/commands.rs,src-tauri/src/engine/**/*.rs,src-tauri/src/sync/**/*.rs
+alwaysApply: false
+---
+
+# Трекер — сценарии и зависимости
+
+## Обязательно перед изменением
+
+1. **Первым действием** — прочитать `docs/TRACKER_SCENARIOS.md` (Read tool). Там все сценарии, цепочки вызовов и матрица «меняю X → проверяю Y».
+2. **Определить** затронутые сценарии по матрице (раздел 4).
+3. **Проверить** инварианты (раздел 3) — не нарушаются ли они.
+4. **После изменения** — прогнать `pnpm test` и по возможности ручную проверку затронутых сценариев.
+5. **Доказать корректность** — завершить задачу только после: тесты зелёные, затронутые сценарии проверены (или описан ожидаемый результат).
+
+## Ключевые связи (не забывать)
+
+- **startTracking** → офлайн (getActiveTimeEntries try/catch), start_activity_monitoring, mark_task_sent_by_id
+- **pauseTracking** → stop_activity_monitoring, hide_idle_window при idle
+- **checkIdleStatus** → lastActivityTime (Rust + DOM fallback), idleThreshold ≥ 1, skip при idlePauseStartTime
+- **loadActiveTimeEntry** → при офлайне не ломать store
+- **Sync** → не гасить только что восстановленный таймер, не синкать при idle
+
+## Источник истины
+
+- Состояние таймера: **Rust TimerEngine** (get_timer_state)
+- UI синхронизирует isTracking/isPaused из get_timer_state, не наоборот

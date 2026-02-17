@@ -10,6 +10,9 @@ import { logger } from '../lib/logger';
 // Prevents concurrent checkIdleStatus pause flows (multiple intervals / React Strict Mode)
 let isIdleCheckPausing = false;
 
+// Coalesces concurrent loadActiveTimeEntry calls — один запрос вместо нескольких
+let loadActiveTimeEntryPromise: Promise<void> | null = null;
+
 // BUG FIX: Tracks consecutive skips of assertStateInvariant due to isLoading — prevents permanent block if isLoading gets stuck
 let assertStateInvariantSkippedDueToLoading = 0;
 const ASSERT_STATE_INVARIANT_LOADING_STUCK_THRESHOLD = 12; // 12 * 5s = 60s
@@ -96,6 +99,8 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
   },
 
   loadActiveTimeEntry: async () => {
+    if (loadActiveTimeEntryPromise) return loadActiveTimeEntryPromise;
+    loadActiveTimeEntryPromise = (async () => {
     try {
       // SECURITY: Get current user first to verify ownership
       // FIX: Fallback to useAuthStore.user — getCurrentUser() can be null on app reload
@@ -403,7 +408,11 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       } catch (engineError) {
         logger.warn('LOAD', 'Failed to sync from Timer Engine after API error', engineError);
       }
+    } finally {
+      loadActiveTimeEntryPromise = null;
     }
+  })();
+  return loadActiveTimeEntryPromise;
   },
 
   selectProject: async (project: Project) => {
