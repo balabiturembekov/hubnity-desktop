@@ -5,6 +5,7 @@ import { useSyncStore } from '../store/useSyncStore';
 import { Play, Pause, Square, RotateCcw, Camera, AlertCircle, Coffee } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { TrayIcon } from '@tauri-apps/api/tray';
 import { logger } from '../lib/logger';
 import { cn } from '../lib/utils';
 
@@ -44,6 +45,7 @@ export function Timer() {
     clientSessionStartMs,
   } = useTrackerStore();
   const isOnline = useSyncStore((s) => s.status?.is_online ?? true);
+  const isWindowVisible = useTrackerStore((s) => s.isWindowVisible);
 
   // Состояние таймера из Rust (единственный source of truth).
   // При start/resume: poll ещё STOPPED/PAUSED ~200ms — приоритет lastTimerStateFromStart (RUNNING) чтобы не было рассинхрона секунд.
@@ -57,8 +59,9 @@ export function Timer() {
   const [idleTime, setIdleTime] = useState(0);
   const [isProcessing, setIsProcessing] = useState(false);
 
-  // Состояние из Rust: push (timer-state-update каждые 200ms) + poll fallback. Push не throttлится в фоне.
-  const POLL_MS = 200;
+  // Rust emits timer-state-update every 200ms when RUNNING/PAUSED. Poll is safety fallback only.
+  // Visible: 5s (rely on emit). Hidden: 2s (reduce IPC when in tray).
+  const POLL_MS = isWindowVisible ? 5000 : 2000;
   useEffect(() => {
     let isMounted = true;
     let timeoutId: ReturnType<typeof setTimeout>;
@@ -84,10 +87,10 @@ export function Timer() {
               : {}),
         });
         if (state.state === 'RUNNING' || state.state === 'STOPPED') {
-          invoke('hide_idle_window').catch(() => {});
+          invoke('hide_idle_window').catch(e => logger.error('INVOKE', 'hide_idle_window failed', e));
         }
         if (state.state === 'RUNNING') {
-          invoke('start_activity_monitoring').catch(() => {});
+          invoke('start_activity_monitoring').catch(e => logger.error('INVOKE', 'start_activity_monitoring failed', e));
         }
         if ((isRunning || isPaused) && !currentTimeEntry) {
           useTrackerStore.getState().loadActiveTimeEntry().catch((e) => {
@@ -101,16 +104,31 @@ export function Timer() {
           : state.state === 'PAUSED'
             ? `⏸ ${formatTime(state.elapsed_seconds)}`
             : '⏹ 00:00:00';
-      invoke('plugin:tray|set_tooltip', { id: 'main', tooltip }).catch(() => {});
+      invoke('plugin:tray|set_tooltip', { id: 'main', tooltip }).catch(e => logger.error('INVOKE', 'plugin:tray|set_tooltip failed', e));
+
+      // Update tray icon by state: play for RUNNING, pause/gray for PAUSED/STOPPED
+      (async () => {
+        const iconPath = await invoke<string | null>('get_tray_icon_path', {
+          state: state.state,
+        }).catch(() => null);
+        if (iconPath) {
+          const tray = await TrayIcon.getById('main');
+          if (tray) tray.setIcon(iconPath).catch(() => {});
+        }
+      })();
     };
 
     const shouldSkipStalePaused = (state: TimerStateResponse) => {
       if (state.state !== 'PAUSED') return false;
+      // Exception: system-triggered pauses (sleep/idle) — never skip
+      if (state.reason === 'sleep' || state.reason === 'idle') return false;
       const store = useTrackerStore.getState();
       const lastFromStore = store.lastTimerStateFromStart;
       if (lastFromStore?.state !== 'RUNNING') return false;
+      // Exception: elapsed jumped > 10s — likely sleep, accept PAUSED
+      const elapsedDiff = Math.abs((state.elapsed_seconds ?? 0) - (lastFromStore?.elapsed_seconds ?? 0));
+      if (elapsedDiff > 10) return false;
       // Skip only if user just resumed (< 5s) — prevents stale PAUSED from overwriting fresh RUNNING
-      // After wake, lastResumeTime is null or old — accept PAUSED
       const lastResumeTime = store.lastResumeTime;
       if (!lastResumeTime) return false;
       return Date.now() - lastResumeTime < 5000;
@@ -152,7 +170,7 @@ export function Timer() {
       clearTimeout(timeoutId);
       unlistenTimer?.();
     };
-  }, []);
+  }, [POLL_MS]);
 
   // Проверка смены дня (локальная дата — как в Rust ensure_correct_day)
   useEffect(() => {

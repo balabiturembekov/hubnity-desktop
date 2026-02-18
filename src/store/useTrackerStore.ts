@@ -28,6 +28,8 @@ export interface TrackerState {
   lastActivityPerfRef: number;
   idleThreshold: number; // in minutes, default 2
   isLoading: boolean;
+  /** Lock: true while loadActiveTimeEntry is running — prevents checkIdleStatus/auto-pause from racing */
+  isInitializingEntry: boolean;
   error: string | null;
   isTakingScreenshot: boolean; // Indicates if screenshot is being taken
   idlePauseStartTime: number | null; // Timestamp when paused due to inactivity
@@ -40,6 +42,8 @@ export interface TrackerState {
   lastTimerStateFromStart: TimerStateResponse | null;
   /** Момент клика Start/Resume (ms) — точнее Rust as_secs(), устраняет рассинхрон */
   clientSessionStartMs: number | null;
+  /** Window visible (not hidden/minimized) — for throttling polls when in tray */
+  isWindowVisible: boolean;
 
   // Actions
   loadProjects: () => Promise<void>;
@@ -66,6 +70,7 @@ export interface TrackerState {
   clearTrackingStateFromServer: () => Promise<void>;
   /** Проверяет инварианты состояния и автоматически синхронизирует при рассинхронизации. */
   assertStateInvariant: () => Promise<void>;
+  setWindowVisibility: (visible: boolean) => void;
 }
 
 export const useTrackerStore = create<TrackerState>((set, get) => ({
@@ -78,6 +83,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
   lastActivityPerfRef: typeof performance !== 'undefined' ? performance.now() : Date.now(),
   idleThreshold: 2,
   isLoading: false,
+  isInitializingEntry: false,
   error: null,
   isTakingScreenshot: false,
   idlePauseStartTime: null,
@@ -87,6 +93,9 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
   lastResumeTime: null, // Track when timer was last resumed (for sync protection)
   lastTimerStateFromStart: null,
   clientSessionStartMs: null,
+  isWindowVisible: true,
+
+  setWindowVisibility: (visible: boolean) => set({ isWindowVisible: visible }),
 
   loadProjects: async () => {
     try {
@@ -101,6 +110,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
   loadActiveTimeEntry: async () => {
     if (loadActiveTimeEntryPromise) return loadActiveTimeEntryPromise;
     loadActiveTimeEntryPromise = (async () => {
+    set({ isInitializingEntry: true });
     try {
       // SECURITY: Get current user first to verify ownership
       // FIX: Fallback to useAuthStore.user — getCurrentUser() can be null on app reload
@@ -383,7 +393,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
   idlePauseStartPerfRef: null, // FIX: Restoring from server — not idle state
         });
         if (!activeEntry.id.startsWith('temp-')) {
-          invoke('persist_time_entry_id', { id: activeEntry.id }).catch(() => {});
+          invoke('persist_time_entry_id', { id: activeEntry.id }).catch(e => logger.error('INVOKE', 'persist_time_entry_id failed', e));
         }
         // Don't set lastActivityTime here — restore/sync is not real user activity.
         // Activity monitor will update it when user actually interacts.
@@ -409,6 +419,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         logger.warn('LOAD', 'Failed to sync from Timer Engine after API error', engineError);
       }
     } finally {
+      set({ isInitializingEntry: false });
       loadActiveTimeEntryPromise = null;
     }
   })();
@@ -724,7 +735,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
   idlePauseStartPerfRef: null, // FIX: Restoring from server — not idle
           });
           if (!activeEntry.id.startsWith('temp-')) {
-            invoke('persist_time_entry_id', { id: activeEntry.id }).catch(() => {});
+            invoke('persist_time_entry_id', { id: activeEntry.id }).catch(e => logger.error('INVOKE', 'persist_time_entry_id failed', e));
           }
           // Don't set lastActivityTime — restore is not real user activity
           // Start activity monitoring
@@ -811,7 +822,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
   idlePauseStartPerfRef: null, // FIX: Restoring from server — not idle
           });
           if (!activeEntry.id.startsWith('temp-')) {
-            invoke('persist_time_entry_id', { id: activeEntry.id }).catch(() => {});
+            invoke('persist_time_entry_id', { id: activeEntry.id }).catch(e => logger.error('INVOKE', 'persist_time_entry_id failed', e));
           }
           
           return; // Exit - don't create new entry
@@ -836,7 +847,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           const timeEntry = await api.startTimeEntry(requestData);
             await api.sendHeartbeat(true);
             if (queueId != null) {
-              await invoke('mark_task_sent_by_id', { id: queueId }).catch(() => {});
+              await invoke('mark_task_sent_by_id', { id: queueId }).catch(e => logger.error('INVOKE', 'mark_task_sent_by_id failed', e));
             }
             const state = get();
             if (state.isTracking && state.currentTimeEntry?.id?.startsWith('temp-')) {
@@ -844,7 +855,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
                 currentTimeEntry: timeEntry,
                 localTimerStartTime: null,
               });
-              invoke('persist_time_entry_id', { id: timeEntry.id }).catch(() => {});
+              invoke('persist_time_entry_id', { id: timeEntry.id }).catch(e => logger.error('INVOKE', 'persist_time_entry_id failed', e));
             }
           } catch (apiError: any) {
             if (apiError.message?.includes('already running') ||
@@ -940,7 +951,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       timerState = await TimerEngineAPI.getState();
       if (timerState.state === 'PAUSED' && !isIdlePause) {
         set({ isLoading: false, idlePauseStartTime: null }); // FIX: Manual pause — not idle
-        invoke('hide_idle_window').catch(() => {});
+        invoke('hide_idle_window').catch(e => logger.error('INVOKE', 'hide_idle_window failed', e));
         invoke('log_message', { message: '[PAUSE] Already paused (Timer Engine check), skipping' }).catch((e) => {
           logger.debug('PAUSE', 'Failed to log message (non-critical)', e);
         });
@@ -964,7 +975,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
               await api.stopTimeEntry(entry.id);
               await api.sendHeartbeat(false);
               if (queueId != null) {
-                await invoke('mark_task_sent_by_id', { id: queueId }).catch(() => {});
+                await invoke('mark_task_sent_by_id', { id: queueId }).catch(e => logger.error('INVOKE', 'mark_task_sent_by_id failed', e));
               }
             } catch (e: any) {
               logger.warn('PAUSE', 'API stop failed (engine STOPPED)', e);
@@ -981,7 +992,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           lastResumeTime: null,
           localTimerStartTime: null,
         });
-        invoke('hide_idle_window').catch(() => {}); // FIX: Idle window must be hidden when STOPPED
+        invoke('hide_idle_window').catch(e => logger.error('INVOKE', 'hide_idle_window failed', e)); // FIX: Idle window must be hidden when STOPPED
         await logger.safeLogToRust('[PAUSE] Timer Engine is STOPPED, syncing store').catch((e) => {
           logger.debug('PAUSE', 'Failed to log (non-critical)', e);
         });
@@ -1035,7 +1046,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
               await api.pauseTimeEntry(runningEntry.id);
               await api.sendHeartbeat(false);
               if (queueId != null) {
-                await invoke('mark_task_sent_by_id', { id: queueId }).catch(() => {});
+                await invoke('mark_task_sent_by_id', { id: queueId }).catch(e => logger.error('INVOKE', 'mark_task_sent_by_id failed', e));
               }
             } catch (apiErr: any) {
               logger.warn('PAUSE', 'API pause failed (will retry via queue)', apiErr);
@@ -1049,7 +1060,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
               idlePauseStartTime: isIdlePause ? Date.now() : null,
               idlePauseStartPerfRef: isIdlePause ? (typeof performance !== 'undefined' ? performance.now() : Date.now()) : null,
             });
-            await invoke('stop_activity_monitoring').catch(() => {});
+            await invoke('stop_activity_monitoring').catch(e => logger.error('INVOKE', 'stop_activity_monitoring failed', e));
             return;
           }
         } catch (fetchErr) {
@@ -1112,7 +1123,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
             idlePauseStartPerfRef: isIdlePause ? (typeof performance !== 'undefined' ? performance.now() : Date.now()) : null,
             ...(entryForStop ? { currentTimeEntry: entryForStop } : {}),
           });
-          await invoke('stop_activity_monitoring').catch(() => {});
+          await invoke('stop_activity_monitoring').catch(e => logger.error('INVOKE', 'stop_activity_monitoring failed', e));
           await logger.safeLogToRust('[PAUSE] Timer Engine paused without time entry').catch(() => {});
           return;
         } else {
@@ -1135,7 +1146,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
               idlePauseStartTime: isIdlePause ? Date.now() : null,
               idlePauseStartPerfRef: isIdlePause ? (typeof performance !== 'undefined' ? performance.now() : Date.now()) : null,
             });
-            await invoke('stop_activity_monitoring').catch(() => {});
+            await invoke('stop_activity_monitoring').catch(e => logger.error('INVOKE', 'stop_activity_monitoring failed', e));
             return;
           }
         } catch (stateError) {
@@ -1184,7 +1195,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
               error: null,
               idlePauseStartTime: isIdlePause ? Date.now() : null,
             });
-            await invoke('stop_activity_monitoring').catch(() => {});
+            await invoke('stop_activity_monitoring').catch(e => logger.error('INVOKE', 'stop_activity_monitoring failed', e));
             return;
           } catch (finalPauseError) {
             logger.error('PAUSE', 'Final attempt to pause Timer Engine failed', finalPauseError);
@@ -1207,7 +1218,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
     });
 
     if (!timeEntryToPause.id.startsWith('temp-')) {
-      invoke('persist_time_entry_id', { id: timeEntryToPause.id }).catch(() => {});
+      invoke('persist_time_entry_id', { id: timeEntryToPause.id }).catch(e => logger.error('INVOKE', 'persist_time_entry_id failed', e));
     }
 
     try {
@@ -1327,7 +1338,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           await api.pauseTimeEntry(entryIdToPause);
           await api.sendHeartbeat(false);
           if (queueId != null) {
-            await invoke('mark_task_sent_by_id', { id: queueId }).catch(() => {});
+            await invoke('mark_task_sent_by_id', { id: queueId }).catch(e => logger.error('INVOKE', 'mark_task_sent_by_id failed', e));
           }
         } catch (apiError: any) {
           if (apiError.message?.includes('Only running entries can be paused') ||
@@ -1338,7 +1349,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           invoke('show_notification', {
             title: 'Sync',
             body: 'Pause completed, but could not sync with server',
-          }).catch(() => {});
+          }).catch(e => logger.error('INVOKE', 'show_notification failed', e));
         }
       })();
       
@@ -1461,7 +1472,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           logger.debug('RESUME', 'Failed to log (non-critical)', e);
         });
         set({ isLoading: false, idlePauseStartTime: null }); // FIX: Clear idle — we're running
-        invoke('hide_idle_window').catch(() => {});
+        invoke('hide_idle_window').catch(e => logger.error('INVOKE', 'hide_idle_window failed', e));
         return;
       }
     }
@@ -1473,7 +1484,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         logger.debug('RESUME', 'Failed to log (non-critical)', e);
       });
       set({ isLoading: false, idlePauseStartTime: null }); // FIX: Clear idle — we're running
-      invoke('hide_idle_window').catch(() => {});
+      invoke('hide_idle_window').catch(e => logger.error('INVOKE', 'hide_idle_window failed', e));
       return;
     }
 
@@ -1515,7 +1526,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         invoke('start_activity_monitoring').catch((e) => {
           logger.error('RESUME', 'Failed to start activity monitoring on resume (no entry)', e);
         });
-        invoke('hide_idle_window').catch(() => {});
+        invoke('hide_idle_window').catch(e => logger.error('INVOKE', 'hide_idle_window failed', e));
         // BUG FIX: Await loadActiveTimeEntry before reading currentTimeEntry — otherwise entryAfterLoad is always null
         await get().loadActiveTimeEntry().catch((e) => logger.warn('RESUME', 'loadActiveTimeEntry failed', e));
         // FIX: Sync resume with server — loadActiveTimeEntry может установить entry, тогда API вызов в фоне
@@ -1541,7 +1552,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
               await api.resumeTimeEntry(entryAfterLoad.id);
               await api.sendHeartbeat(true);
               if (queueId != null) {
-                await invoke('mark_task_sent_by_id', { id: queueId }).catch(() => {});
+                await invoke('mark_task_sent_by_id', { id: queueId }).catch(e => logger.error('INVOKE', 'mark_task_sent_by_id failed', e));
               }
             } catch (e: any) {
               if (!e?.message?.includes('already running') && !e?.message?.includes('Only paused entries')) {
@@ -1654,14 +1665,14 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         clientSessionStartMs: isResumed ? clientResumeMs : null,
       });
       if (!timeEntryToResume.id.startsWith('temp-')) {
-        invoke('persist_time_entry_id', { id: timeEntryToResume.id }).catch(() => {});
+        invoke('persist_time_entry_id', { id: timeEntryToResume.id }).catch(e => logger.error('INVOKE', 'persist_time_entry_id failed', e));
       }
       
       if (isResumed) {
         invoke('start_activity_monitoring').catch((e) => {
           logger.error('RESUME', 'Failed to start activity monitoring on resume', e);
         });
-        invoke('hide_idle_window').catch(() => {});
+        invoke('hide_idle_window').catch(e => logger.error('INVOKE', 'hide_idle_window failed', e));
       }
       
       // FIX: Enqueue СРАЗУ (до любых сетевых вызовов), чтобы при офлайне задача попадала в очередь
@@ -1708,7 +1719,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
               lastResumeTime: null,
               localTimerStartTime: null,
             });
-            invoke('hide_idle_window').catch(() => {});
+            invoke('hide_idle_window').catch(e => logger.error('INVOKE', 'hide_idle_window failed', e));
             try { await invoke('stop_activity_monitoring'); } catch (_) { /* ignore */ }
             return;
           }
@@ -1719,7 +1730,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           await api.resumeTimeEntry(entryIdToResume);
           await api.sendHeartbeat(true);
           if (queueId != null) {
-            await invoke('mark_task_sent_by_id', { id: queueId }).catch(() => {});
+            await invoke('mark_task_sent_by_id', { id: queueId }).catch(e => logger.error('INVOKE', 'mark_task_sent_by_id failed', e));
           }
         } catch (apiError: any) {
           if (apiError.message?.includes('already running') ||
@@ -1758,8 +1769,8 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
               lastResumeTime: resumeTimeForSync, // BUG FIX: Track resume time to prevent sync from pausing immediately after resume
               localTimerStartTime: resumeTimeForSync, // BUG FIX: Track local resume time to prevent auto-pause from syncTimerState
             });
-            invoke('start_activity_monitoring').catch(() => {}); // FIX: Sync to RUNNING — start monitoring
-            invoke('hide_idle_window').catch(() => {});
+            invoke('start_activity_monitoring').catch(e => logger.error('INVOKE', 'start_activity_monitoring failed', e)); // FIX: Sync to RUNNING — start monitoring
+            invoke('hide_idle_window').catch(e => logger.error('INVOKE', 'hide_idle_window failed', e));
             return;
           }
         } catch (_) {
@@ -1920,7 +1931,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           await TimerEngineAPI.stop();
         }
         await invoke('stop_activity_monitoring');
-        invoke('persist_time_entry_id', { id: null }).catch(() => {});
+        invoke('persist_time_entry_id', { id: null }).catch(e => logger.error('INVOKE', 'persist_time_entry_id failed', e));
         set({
           currentTimeEntry: null,
           isTracking: false,
@@ -1932,7 +1943,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           localTimerStartTime: null,
           lastResumeTime: null,
         });
-        invoke('hide_idle_window').catch(() => {});
+        invoke('hide_idle_window').catch(e => logger.error('INVOKE', 'hide_idle_window failed', e));
       } catch (e: any) {
         // BUG FIX: Log error instead of silently ignoring (already logging, but ensure isLoading is reset)
         // Игнорируем ошибку "already stopped" - это нормально
@@ -1981,7 +1992,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
       }
       
       // OPTIMISTIC: Обновляем UI сразу
-      invoke('persist_time_entry_id', { id: null }).catch(() => {});
+      invoke('persist_time_entry_id', { id: null }).catch(e => logger.error('INVOKE', 'persist_time_entry_id failed', e));
       set({
         currentTimeEntry: null,
         isTracking: timerState?.state === 'RUNNING' || timerState?.state === 'PAUSED' || false,
@@ -2000,7 +2011,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         logger.warn('STOP', 'Failed to stop activity monitoring', e);
       });
       
-      invoke('hide_idle_window').catch(() => {});
+      invoke('hide_idle_window').catch(e => logger.error('INVOKE', 'hide_idle_window failed', e));
       
       // FIX: Enqueue СРАЗУ (до любых сетевых вызовов), чтобы при офлайне задача попадала в очередь
       let queueIdStop: number | null = null;
@@ -2024,14 +2035,14 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           await api.stopTimeEntry(entryIdToStop);
           await api.sendHeartbeat(false);
           if (queueId != null) {
-            await invoke('mark_task_sent_by_id', { id: queueId }).catch(() => {});
+            await invoke('mark_task_sent_by_id', { id: queueId }).catch(e => logger.error('INVOKE', 'mark_task_sent_by_id failed', e));
           }
         } catch (apiError: any) {
           logger.warn('STOP', 'API failed (background), queue will retry', apiError);
           invoke('show_notification', {
             title: 'Sync',
             body: 'Timer stopped, but could not sync with server',
-          }).catch(() => {});
+          }).catch(e => logger.error('INVOKE', 'show_notification failed', e));
         }
       })();
     } catch (error: any) {
@@ -2082,7 +2093,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
   idlePauseStartPerfRef: null, lastResumeTime: null, localTimerStartTime: null } : {}),
           });
           if (timerState.state === 'STOPPED') {
-            invoke('hide_idle_window').catch(() => {}); // FIX: Sync to STOPPED — ensure idle window hidden
+            invoke('hide_idle_window').catch(e => logger.error('INVOKE', 'hide_idle_window failed', e)); // FIX: Sync to STOPPED — ensure idle window hidden
           }
         } catch (e) {
           // Если не удалось проверить Timer Engine, только устанавливаем ошибку
@@ -2123,6 +2134,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
   },
 
   checkIdleStatus: async () => {
+    if (get().isInitializingEntry) return;
     const { lastActivityTime, lastActivityPerfRef, idleThreshold, isLoading, idlePauseStartTime } = get();
     
     // FIX: Skip immediately if already in idle state (idle window shown, user hasn't resumed/stopped)
@@ -2186,7 +2198,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
               ? { currentTimeEntry: null, lastResumeTime: null, localTimerStartTime: null }
               : {}),
           });
-          invoke('hide_idle_window').catch(() => {}); // FIX: Ensure idle window hidden when syncing
+          invoke('hide_idle_window').catch(e => logger.error('INVOKE', 'hide_idle_window failed', e)); // FIX: Ensure idle window hidden when syncing
           return;
         }
         // Если Timer Engine RUNNING, продолжаем с паузой
@@ -2591,7 +2603,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
         : {}),
     });
     if (state.state === 'STOPPED') {
-      invoke('hide_idle_window').catch(() => {}); // FIX: Idle window visible when day changed
+      invoke('hide_idle_window').catch(e => logger.error('INVOKE', 'hide_idle_window failed', e)); // FIX: Idle window visible when day changed
     }
     return state;
   },
@@ -2702,7 +2714,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
               idlePauseStartTime: null,
   idlePauseStartPerfRef: null,
             });
-            invoke('hide_idle_window').catch(() => {});
+            invoke('hide_idle_window').catch(e => logger.error('INVOKE', 'hide_idle_window failed', e));
           }
           return;
         }
@@ -2750,10 +2762,10 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           logger.debug('STATE_INVARIANT', 'Failed to log (non-critical)', e);
         });
         if (timerState.state === 'RUNNING' || timerState.state === 'STOPPED') {
-          invoke('hide_idle_window').catch(() => {}); // FIX: Idle window must be hidden when not in idle
+          invoke('hide_idle_window').catch(e => logger.error('INVOKE', 'hide_idle_window failed', e)); // FIX: Idle window must be hidden when not in idle
         }
         if (timerState.state === 'RUNNING') {
-          invoke('start_activity_monitoring').catch(() => {}); // FIX: Sync to RUNNING — ensure monitoring
+          invoke('start_activity_monitoring').catch(e => logger.error('INVOKE', 'start_activity_monitoring failed', e)); // FIX: Sync to RUNNING — ensure monitoring
         }
       }
     } catch (error) {

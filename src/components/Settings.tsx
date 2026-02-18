@@ -37,6 +37,9 @@ export function Settings() {
   }, []);
   const [queueStats, setQueueStats] = useState<QueueStats | null>(null);
   const [isLoadingStats, setIsLoadingStats] = useState(false);
+  const [notifyOnScreenshot, setNotifyOnScreenshot] = useState(
+    () => localStorage.getItem('hubnity_notify_on_screenshot') === 'true'
+  );
 
   // Проверка прав доступа: только owner или admin могут видеть настройки
   // Используем константы USER_ROLES для проверки (case-sensitive, как приходит с сервера)
@@ -231,6 +234,22 @@ export function Settings() {
             <p className="text-xs text-muted-foreground">
               Auto-pause after {idleThreshold} {idleThreshold === 1 ? 'minute' : 'minutes'} of inactivity
             </p>
+          </div>
+          <div className="space-y-2 pt-2 border-t flex items-center gap-2">
+            <input
+              type="checkbox"
+              id="notify-screenshot"
+              checked={notifyOnScreenshot}
+              onChange={(e) => {
+                const v = e.target.checked;
+                setNotifyOnScreenshot(v);
+                localStorage.setItem('hubnity_notify_on_screenshot', String(v));
+              }}
+              className="h-4 w-4 rounded border-input"
+            />
+            <Label htmlFor="notify-screenshot" className="text-sm font-normal cursor-pointer">
+              Notify when screenshot is captured
+            </Label>
           </div>
           <div className="space-y-2 pt-2 border-t">
             <Label htmlFor="sleep-gap" className="text-sm text-foreground">

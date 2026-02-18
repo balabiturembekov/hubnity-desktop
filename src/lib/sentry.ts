@@ -57,22 +57,47 @@ export function initSentry() {
     // Release tracking
     release: import.meta.env.VITE_APP_VERSION || undefined,
 
-    // Фильтрация данных перед отправкой
+    // Фильтрация данных перед отправкой — рекурсивная очистка чувствительных ключей
     beforeSend(event, _hint) {
-      // Фильтруем токены из URL и других мест
+      const SENSITIVE_KEYS = [
+        'access_token',
+        'refresh_token',
+        'password',
+        'payload',
+        'timerstate',
+        'syncqueue',
+        'currenttimeentry',
+        'authorization',
+        'x-auth-token',
+      ];
+
+      function scrub(obj: unknown): unknown {
+        if (obj === null || obj === undefined) return obj;
+        if (typeof obj !== 'object') return obj;
+        if (Array.isArray(obj)) return obj.map(scrub);
+
+        const result: Record<string, unknown> = {};
+        for (const [key, value] of Object.entries(obj)) {
+          const keyLower = key.toLowerCase();
+          if (SENSITIVE_KEYS.some((s) => keyLower.includes(s))) {
+            result[key] = '***';
+          } else {
+            result[key] = scrub(value);
+          }
+        }
+        return result;
+      }
+
       if (event.request) {
-        // Удаляем токены из URL
         if (event.request.url) {
           event.request.url = event.request.url.replace(
             /(access_token|refresh_token|token)=[^&]*/gi,
             '$1=***'
           );
         }
-        
-        // Фильтруем headers
         if (event.request?.headers) {
           const sensitiveHeaders = ['authorization', 'x-auth-token'];
-          sensitiveHeaders.forEach(header => {
+          sensitiveHeaders.forEach((header) => {
             if (event.request!.headers![header]) {
               event.request!.headers![header] = '***';
             }
@@ -80,29 +105,21 @@ export function initSentry() {
         }
       }
 
-      // Фильтруем токены из breadcrumbs
       if (event.breadcrumbs) {
-        event.breadcrumbs = event.breadcrumbs.map(breadcrumb => {
+        event.breadcrumbs = event.breadcrumbs.map((breadcrumb) => {
           if (breadcrumb.data) {
-            Object.keys(breadcrumb.data).forEach(key => {
-              if (key.toLowerCase().includes('token') || 
-                  key.toLowerCase().includes('password')) {
-                breadcrumb.data![key] = '***';
-              }
-            });
+            breadcrumb.data = scrub(breadcrumb.data) as Record<string, unknown>;
           }
           return breadcrumb;
         });
       }
 
-      // Фильтруем токены из extra data
       if (event.extra) {
-        Object.keys(event.extra).forEach(key => {
-          if (key.toLowerCase().includes('token') || 
-              key.toLowerCase().includes('password')) {
-            event.extra![key] = '***';
-          }
-        });
+        event.extra = scrub(event.extra) as Record<string, unknown>;
+      }
+
+      if (event.contexts) {
+        event.contexts = scrub(event.contexts) as Sentry.Contexts;
       }
 
       return event;

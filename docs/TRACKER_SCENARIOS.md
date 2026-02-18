@@ -135,7 +135,7 @@ App (каждые 30 с, задержка 30 с после старта)
 Закрытие: tauri://close-requested → engine.save_state()
 Периодически: каждые 30 с → engine.save_state()
 beforeunload: saveTimerState() [fallback, может не успеть]
-Сон: get_state видит time gap → handle_system_sleep → pause + save
+Сон: get_state видит time gap (wall vs awake-время) → handle_system_sleep → pause + save. macOS: monotonic. Windows: GetTickCount64 (не тикает во сне, в отличие от QPC).
 ```
 
 ---

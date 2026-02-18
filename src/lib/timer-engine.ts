@@ -15,23 +15,23 @@ export type TimerStateResponse = (
       state: 'STOPPED';
       elapsed_seconds: number;
       accumulated_seconds: number;
-      session_start: null;
-      day_start: number | null;
+      session_start?: number | null;
+      day_start?: number | null;
     }
   | {
       state: 'RUNNING';
       started_at: number;
       elapsed_seconds: number;
       accumulated_seconds: number;
-      session_start: number;
-      day_start: number | null;
+      session_start?: number | null;
+      day_start?: number | null;
     }
   | {
       state: 'PAUSED';
       elapsed_seconds: number;
       accumulated_seconds: number;
-      session_start: null;
-      day_start: number | null;
+      session_start?: number | null;
+      day_start?: number | null;
     }
 ) & {
   /** Unix timestamp начала сессии в миллисекундах — точная синхронизация с системными часами */
@@ -40,6 +40,8 @@ export type TimerStateResponse = (
   today_seconds?: number;
   /** Этап 4: true если таймер восстановлен из RUNNING как PAUSED после перезапуска (показать уведомление один раз) */
   restored_from_running?: boolean;
+  /** Причина перехода: "sleep" | "idle" | undefined (ручной) */
+  reason?: string | null;
 };
 
 /**
