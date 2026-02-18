@@ -2,7 +2,7 @@
  * Unit тесты для IdleWindow
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { IdleWindow } from '../IdleWindow';
 
@@ -32,8 +32,8 @@ describe('IdleWindow', () => {
     render(<IdleWindow />);
     expect(screen.getByText('Idle time alert')).toBeInTheDocument();
     expect(screen.getByText(/You have been idle for/i)).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /resume timer/i })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /stop timer/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /resume/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /stop.*discard/i })).toBeInTheDocument();
   });
 
   it('shows 0 minutes initially (Hubstaff-style format)', () => {
@@ -41,17 +41,35 @@ describe('IdleWindow', () => {
     expect(screen.getByText('0 minutes')).toBeInTheDocument();
   });
 
-  it('calls resume_tracking_from_idle when Resume timer clicked', async () => {
-    const user = userEvent.setup();
+  it('disables Resume and Stop buttons during 1.5s cooldown', () => {
     render(<IdleWindow />);
-    await user.click(screen.getByRole('button', { name: /resume timer/i }));
-    expect(mockInvoke).toHaveBeenCalledWith('resume_tracking_from_idle');
+    expect(screen.getByRole('button', { name: /resume/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /stop.*discard/i })).toBeDisabled();
   });
 
-  it('calls stop_tracking_from_idle when Stop timer clicked', async () => {
+  it('calls resume_tracking_from_idle when Resume clicked (after cooldown)', async () => {
     const user = userEvent.setup();
     render(<IdleWindow />);
-    await user.click(screen.getByRole('button', { name: /stop timer/i }));
+    await waitFor(
+      () => {
+        expect(screen.getByRole('button', { name: /resume/i })).toBeEnabled();
+      },
+      { timeout: 2000 }
+    );
+    await user.click(screen.getByRole('button', { name: /resume/i }));
+    expect(mockInvoke).toHaveBeenCalledWith('resume_tracking_from_idle');
+  }, 3000);
+
+  it('calls stop_tracking_from_idle when Stop clicked (after cooldown)', async () => {
+    const user = userEvent.setup();
+    render(<IdleWindow />);
+    await waitFor(
+      () => {
+        expect(screen.getByRole('button', { name: /stop.*discard/i })).toBeEnabled();
+      },
+      { timeout: 2000 }
+    );
+    await user.click(screen.getByRole('button', { name: /stop.*discard/i }));
     expect(mockInvoke).toHaveBeenCalledWith('stop_tracking_from_idle');
-  });
+  }, 3000);
 });

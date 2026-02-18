@@ -1,12 +1,12 @@
+use crate::check_online_status;
 use crate::engine::{TimerEngine, TimerStateResponse};
+#[cfg(target_os = "macos")]
+use crate::extract_url_from_title;
 use crate::models::ActiveWindowInfo;
 use crate::models::{FailedTaskInfo, QueueStats};
 use crate::monitor::ActivityMonitor;
 use crate::sync::SyncManager;
 use crate::SyncStatusResponse;
-use crate::check_online_status;
-#[cfg(target_os = "macos")]
-use crate::extract_url_from_title;
 use std::sync::Arc;
 use std::time::Instant;
 #[allow(unused_imports)] // Emitter used in #[cfg(not(target_os = "macos"))] activity branch
@@ -23,13 +23,28 @@ pub(crate) mod activity_emit {
 
     /// Returns true if we should emit activity-detected: idle < threshold and enough time since last emit.
     pub fn should_emit(idle_duration: Duration, last_emit_time: Instant) -> bool {
-        idle_duration < ACTIVITY_THRESHOLD && Instant::now().duration_since(last_emit_time) >= MIN_EMIT_INTERVAL
+        idle_duration < ACTIVITY_THRESHOLD
+            && Instant::now().duration_since(last_emit_time) >= MIN_EMIT_INTERVAL
+    }
+
+    /// Adaptive poll interval for battery: poll less often when user is away.
+    /// < 4 min -> 1s; 4-15 min -> 5s; > 15 min -> 10s.
+    pub fn adaptive_sleep_duration(idle_duration: Duration) -> Duration {
+        if idle_duration >= Duration::from_secs(15 * 60) {
+            Duration::from_secs(10)
+        } else if idle_duration >= Duration::from_secs(4 * 60) {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_secs(1)
+        }
     }
 }
 
 #[cfg(test)]
 mod activity_emit_tests {
-    use super::activity_emit::{should_emit, ACTIVITY_THRESHOLD, MIN_EMIT_INTERVAL};
+    use super::activity_emit::{
+        adaptive_sleep_duration, should_emit, ACTIVITY_THRESHOLD, MIN_EMIT_INTERVAL,
+    };
     use std::time::{Duration, Instant};
 
     #[test]
@@ -78,6 +93,34 @@ mod activity_emit_tests {
     fn test_constants() {
         assert_eq!(ACTIVITY_THRESHOLD, Duration::from_secs(5));
         assert_eq!(MIN_EMIT_INTERVAL, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn test_adaptive_sleep_duration() {
+        assert_eq!(
+            adaptive_sleep_duration(Duration::from_secs(0)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            adaptive_sleep_duration(Duration::from_secs(3 * 60)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            adaptive_sleep_duration(Duration::from_secs(4 * 60)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            adaptive_sleep_duration(Duration::from_secs(10 * 60)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            adaptive_sleep_duration(Duration::from_secs(15 * 60)),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            adaptive_sleep_duration(Duration::from_secs(60 * 60)),
+            Duration::from_secs(10)
+        );
     }
 }
 
@@ -141,9 +184,12 @@ pub async fn start_activity_monitoring(
                         None
                     }
                 };
-                let Some(idle_duration) = idle_duration else {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    continue;
+                let idle_duration = match idle_duration {
+                    Some(d) => d,
+                    None => {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
                 };
 
                 if activity_emit::should_emit(idle_duration, last_emit_time) {
@@ -158,7 +204,8 @@ pub async fn start_activity_monitoring(
                     last_emit_time = now;
                 }
 
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                let sleep_duration = activity_emit::adaptive_sleep_duration(idle_duration);
+                tokio::time::sleep(sleep_duration).await;
             }
         });
     }
@@ -194,9 +241,12 @@ pub async fn start_activity_monitoring(
                         None
                     }
                 };
-                let Some(idle_duration) = idle_duration else {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    continue;
+                let idle_duration = match idle_duration {
+                    Some(d) => d,
+                    None => {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
                 };
 
                 if activity_emit::should_emit(idle_duration, last_emit_time) {
@@ -211,7 +261,8 @@ pub async fn start_activity_monitoring(
                     last_emit_time = now;
                 }
 
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                let sleep_duration = activity_emit::adaptive_sleep_duration(idle_duration);
+                tokio::time::sleep(sleep_duration).await;
             }
         });
     }
@@ -248,9 +299,12 @@ pub async fn start_activity_monitoring(
                         None
                     }
                 };
-                let Some(idle_duration) = idle_duration else {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    continue;
+                let idle_duration = match idle_duration {
+                    Some(d) => d,
+                    None => {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
                 };
 
                 if activity_emit::should_emit(idle_duration, last_emit_time) {
@@ -265,7 +319,8 @@ pub async fn start_activity_monitoring(
                     last_emit_time = now;
                 }
 
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                let sleep_duration = activity_emit::adaptive_sleep_duration(idle_duration);
+                tokio::time::sleep(sleep_duration).await;
             }
         });
     }
@@ -317,12 +372,10 @@ pub async fn request_screenshot_permission() -> Result<bool, String> {
                     // BUG FIX: Use safe access method instead of indexing to prevent panic
                     // This should never fail because we check is_empty above, but defensive programming
                     match screens.first() {
-                        Some(screen) => {
-                            match screen.capture() {
-                                Ok(_) => Ok(true),
-                                Err(_) => Ok(false),
-                            }
-                        }
+                        Some(screen) => match screen.capture() {
+                            Ok(_) => Ok(true),
+                            Err(_) => Ok(false),
+                        },
                         None => Ok(false),
                     }
                 }
@@ -402,10 +455,12 @@ pub async fn enqueue_time_entry(
 
 #[tauri::command]
 pub async fn take_screenshot(_time_entry_id: String) -> Result<Vec<u8>, String> {
-    use image::{ImageBuffer, Rgba};
+    // PERFORMANCE: Capture, resize, and JPEG encode run on a dedicated thread pool.
+    // Prevents blocking the Tokio executor and main UI thread.
+    tokio::task::spawn_blocking(|| {
+        use image::{DynamicImage, ImageBuffer, Rgb, Rgba};
 
-    // Take screenshot using screenshots crate
-    let screens = screenshots::Screen::all().map_err(|e| {
+        let screens = screenshots::Screen::all().map_err(|e| {
         #[cfg(target_os = "macos")]
         let err_msg = format!(
             "Failed to get screens: {:?}. Please grant screen recording permission in System Settings -> Privacy & Security -> Screen Recording.",
@@ -421,16 +476,23 @@ pub async fn take_screenshot(_time_entry_id: String) -> Result<Vec<u8>, String> 
     })?;
 
     // Check if we have any screens available
-    if screens.is_empty() {
-        error!("[SCREENSHOT ERROR] No screens available");
-        return Err("No screens available".to_string());
-    }
+        if screens.is_empty() {
+            error!("[SCREENSHOT ERROR] No screens available");
+            return Err("No screens available".to_string());
+        }
 
-    // BUG FIX: Use safe access method instead of indexing to prevent panic
-    // This should never fail because we check is_empty above, but defensive programming
-    let screen = screens.first().expect("BUG: screens is empty after is_empty check - this should never happen");
+        // Multi-monitor & DPI: Prefer primary display to avoid mixed-DPI distortion.
+        // Fallback to first screen if no primary.
+        let screen = screens
+            .iter()
+            .find(|s| s.display_info.is_primary)
+            .or_else(|| screens.first())
+            .ok_or_else(|| {
+                error!("[SCREENSHOT ERROR] No screen selected");
+                "No screens available (internal error)".to_string()
+            })?;
 
-    // Capture screenshot
+        // Capture screenshot
     let image = screen.capture().map_err(|e| {
         #[cfg(target_os = "macos")]
         let err_msg = format!(
@@ -470,10 +532,10 @@ pub async fn take_screenshot(_time_entry_id: String) -> Result<Vec<u8>, String> 
             "Failed to create ImageBuffer from RGBA data".to_string()
         })?;
 
-    // If image is very large, resize it first to reduce file size
-    // Target: max 1280x720 to keep file size under 1MB (for nginx limit)
-    let max_width = 1280u32;
-    let max_height = 720u32;
+        // Resize for mixed DPI (Retina + external): physical pixels can be 2x.
+        // Target: max 1280x720, output < 300KB.
+        let max_width = 1280u32;
+        let max_height = 720u32;
     let final_buffer = if width > max_width || height > max_height {
         info!(
             "[SCREENSHOT] Image too large ({}x{}), resizing to max {}x{}",
@@ -514,36 +576,47 @@ pub async fn take_screenshot(_time_entry_id: String) -> Result<Vec<u8>, String> 
     let final_height = final_buffer.height();
 
     // Convert RGBA to RGB for JPEG (JPEG doesn't support alpha channel)
-    use image::{DynamicImage, Rgb};
     let rgb_buffer: ImageBuffer<Rgb<u8>, Vec<u8>> =
         ImageBuffer::from_fn(final_width, final_height, |x, y| {
             let pixel = final_buffer.get_pixel(x, y);
             Rgb([pixel[0], pixel[1], pixel[2]])
         });
 
-    // Convert to DynamicImage and encode as JPEG
-    let dynamic_img = DynamicImage::ImageRgb8(rgb_buffer);
-    let mut jpeg_bytes = Vec::new();
-    {
-        let mut cursor = std::io::Cursor::new(&mut jpeg_bytes);
-        dynamic_img
-            .write_to(&mut cursor, image::ImageFormat::Jpeg)
-            .map_err(|e| {
-                let err_msg = format!("Failed to encode JPEG: {:?}", e);
-                error!("[SCREENSHOT ERROR] {}", err_msg);
-                err_msg
-            })?;
-    }
+        // Encode as JPEG with quality loop to stay under 300KB.
+        const MAX_JPEG_BYTES: usize = 300 * 1024;
+        let dynamic_img = DynamicImage::ImageRgb8(rgb_buffer);
+        let mut jpeg_bytes = Vec::new();
+        for quality in [85u8, 75, 60, 45, 30] {
+            jpeg_bytes.clear();
+            let mut cursor = std::io::Cursor::new(&mut jpeg_bytes);
+            let mut encoder =
+                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, quality);
+            encoder
+                .encode_image(&dynamic_img)
+                .map_err(|e| {
+                    let err_msg = format!("Failed to encode JPEG: {:?}", e);
+                    error!("[SCREENSHOT ERROR] {}", err_msg);
+                    err_msg
+                })?;
+            if jpeg_bytes.len() <= MAX_JPEG_BYTES {
+                break;
+            }
+        }
 
-    // Validate that we actually have JPEG data
-    if jpeg_bytes.is_empty() {
-        error!("[SCREENSHOT ERROR] Encoded JPEG data is empty");
-        return Err("Screenshot encoding produced empty result".to_string());
-    }
+        if jpeg_bytes.is_empty() {
+            error!("[SCREENSHOT ERROR] Encoded JPEG data is empty");
+            return Err("Screenshot encoding produced empty result".to_string());
+        }
 
-    info!("[SCREENSHOT] Final JPEG size: {} bytes", jpeg_bytes.len());
+        info!(
+            "[SCREENSHOT] Final JPEG size: {} bytes (target < 300KB)",
+            jpeg_bytes.len()
+        );
 
-    Ok(jpeg_bytes)
+        Ok(jpeg_bytes)
+    })
+    .await
+    .map_err(|e| format!("Screenshot task panicked: {}", e))?
 }
 
 #[tauri::command]
@@ -583,6 +656,23 @@ pub async fn update_tray_time(
     Ok(())
 }
 
+/// Returns the path to the tray icon for the given state (running, paused, stopped).
+/// Uses resolve() for correct production paths (sidecar/bundle). Returns None if icon not found.
+#[tauri::command]
+pub fn get_tray_icon_path(state: &str, app: AppHandle) -> Result<Option<String>, String> {
+    use tauri::path::BaseDirectory;
+    use tauri::Manager;
+    // Use resolve() for correct paths in dev and production (.app, .exe bundle)
+    let icon_name = match state {
+        "RUNNING" => "icons/32x32.png", // Could use icons/tray-play.png when added
+        _ => "icons/32x32.png", // PAUSED/STOPPED: could use icons/tray-pause.png
+    };
+    match app.path().resolve(icon_name, BaseDirectory::Resource) {
+        Ok(path) if path.exists() => Ok(Some(path.to_string_lossy().to_string())),
+        _ => Ok(None),
+    }
+}
+
 #[tauri::command]
 pub async fn show_idle_window(app: AppHandle) -> Result<(), String> {
     use tauri::Manager;
@@ -600,6 +690,10 @@ pub async fn show_idle_window(app: AppHandle) -> Result<(), String> {
         idle_window
             .show()
             .map_err(|e| format!("Failed to show idle window: {}", e))?;
+        // Center on primary monitor (multi-monitor: ensures window appears on main display)
+        idle_window
+            .center()
+            .map_err(|e| format!("Failed to center idle window: {}", e))?;
         idle_window
             .set_focus()
             .map_err(|e| format!("Failed to focus idle window: {}", e))?;
@@ -629,19 +723,6 @@ pub async fn hide_idle_window(app: AppHandle) -> Result<(), String> {
         main_window
             .set_enabled(true)
             .map_err(|e| format!("Failed to enable main window: {}", e))?;
-    }
-
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn update_idle_time(idle_seconds: u64, app: AppHandle) -> Result<(), String> {
-    use tauri::{Emitter, Manager};
-
-    if let Some(idle_window) = app.get_webview_window("idle") {
-        idle_window
-            .emit("idle-time-update", idle_seconds)
-            .map_err(|e| format!("Failed to emit idle time update: {}", e))?;
     }
 
     Ok(())
@@ -724,10 +805,18 @@ pub async fn update_idle_state(
     };
 
     let pause_perf_json = idle_pause_start_perf_ref
-        .map(|v| serde_json::Value::Number(serde_json::Number::from_f64(v).unwrap_or(serde_json::Number::from(0))))
+        .map(|v| {
+            serde_json::Value::Number(
+                serde_json::Number::from_f64(v).unwrap_or(serde_json::Number::from(0)),
+            )
+        })
         .unwrap_or(serde_json::Value::Null);
     let last_activity_perf_json = last_activity_perf_ref
-        .map(|v| serde_json::Value::Number(serde_json::Number::from_f64(v).unwrap_or(serde_json::Number::from(0))))
+        .map(|v| {
+            serde_json::Value::Number(
+                serde_json::Number::from_f64(v).unwrap_or(serde_json::Number::from(0)),
+            )
+        })
         .unwrap_or(serde_json::Value::Null);
     let payload = serde_json::json!({
         "idlePauseStartTime": pause_time_json,
@@ -835,11 +924,13 @@ pub async fn get_active_window_info() -> Result<ActiveWindowInfo, String> {
         // Разделяем результат: "AppName|WindowTitle"
         let parts: Vec<&str> = result.split('|').collect();
         // BUG FIX: Use safe access methods instead of indexing to prevent panic
-        let app_name = parts.first()
+        let app_name = parts
+            .first()
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
-        
-        let window_title = parts.get(1)
+
+        let window_title = parts
+            .get(1)
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
 
@@ -890,7 +981,10 @@ pub async fn set_auth_tokens(
         .get_app_meta("current_user_id")
         .map_err(|e| format!("Failed to get current user: {}", e))?
         .unwrap_or_default();
-    let has_tokens = access_token.as_ref().map(|s| !s.is_empty()).unwrap_or(false);
+    let has_tokens = access_token
+        .as_ref()
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
     // Сброс таймера и данных только при смене пользователя (A → B), не при входе после логаута ("" → A)
     if !new_id.is_empty() && !current_id.is_empty() && new_id != current_id {
         sync_manager
@@ -924,7 +1018,10 @@ pub async fn set_auth_tokens(
         .await;
     // debug вместо info — иначе спам в логах при частых вызовах (pushTokensAndSync, Settings)
     if let Some(token) = &access_token {
-        debug!("[SYNC] Tokens set in AuthManager, token length: {}", token.len());
+        debug!(
+            "[SYNC] Tokens set in AuthManager, token length: {}",
+            token.len()
+        );
     } else {
         debug!("[SYNC] Tokens cleared in AuthManager");
     }
@@ -944,10 +1041,14 @@ pub async fn get_current_user_id(
 
 #[tauri::command]
 pub async fn sync_queue_now(sync_manager: State<'_, SyncManager>) -> Result<usize, String> {
-    let pending = sync_manager.db.get_pending_count()
+    let pending = sync_manager
+        .db
+        .get_pending_count()
         .map_err(|e| format!("Failed to get pending count: {}", e))?;
     info!("[SYNC] sync_queue_now: {} pending tasks", pending);
-    let result = sync_manager.sync_queue(5).await
+    let result = sync_manager
+        .sync_queue(5)
+        .await
         .map_err(|e| e.to_string())?;
     info!("[SYNC] sync_queue_now: synced {} tasks", result);
     Ok(result)
@@ -1002,19 +1103,30 @@ pub async fn get_sync_queue_stats(
         .map_err(|e| format!("Failed to get queue stats: {}", e))
 }
 
+/// Очистить очередь синхронизации (safety valve — для пользователей с проблемами decryption/stuck tasks)
+#[tauri::command]
+pub async fn clear_sync_queue(sync_manager: State<'_, SyncManager>) -> Result<(), String> {
+    sync_manager
+        .db
+        .clear_sync_queue()
+        .map_err(|e| format!("Failed to clear sync queue: {}", e))?;
+    tracing::info!("[SYNC] Sync queue cleared by user");
+    Ok(())
+}
+
 /// Пометить задачу как sent (успешно синхронизированную) — используется при прямом вызове API
 #[tauri::command]
 pub async fn mark_task_sent_by_id(
     id: i64,
     sync_manager: State<'_, SyncManager>,
 ) -> Result<(), String> {
-    sync_manager.db.mark_task_sent(id).map_err(|e| {
-        format!("Failed to mark task sent: {}", e)
-    })?;
-    let _ = sync_manager.db.set_app_meta(
-        "last_sync_at",
-        &chrono::Utc::now().timestamp().to_string(),
-    );
+    sync_manager
+        .db
+        .mark_task_sent(id)
+        .map_err(|e| format!("Failed to mark task sent: {}", e))?;
+    let _ = sync_manager
+        .db
+        .set_app_meta("last_sync_at", &chrono::Utc::now().timestamp().to_string());
     Ok(())
 }
 
@@ -1048,7 +1160,10 @@ pub async fn retry_failed_tasks(
     // PRODUCTION: Запускаем синхронизацию через sync-lock
     // BUG FIX: Log error if sync fails instead of silently ignoring
     if let Err(e) = sync_manager.sync_queue(5).await {
-        warn!("[RETRY] Failed to sync queue after retry (non-critical): {}", e);
+        warn!(
+            "[RETRY] Failed to sync queue after retry (non-critical): {}",
+            e
+        );
     }
 
     Ok(count)
@@ -1122,23 +1237,35 @@ pub async fn get_last_time_entry_id(
 
 #[tauri::command]
 pub async fn start_timer(
+    app: AppHandle,
     engine: State<'_, Arc<TimerEngine>>,
 ) -> Result<TimerStateResponse, String> {
     let prev = engine.get_state().ok().map(|s| format!("{:?}", s.state));
     engine.start()?;
     let state = engine.get_state()?;
-    info!("[TIMER] state: {:?} -> {:?}", prev.as_deref().unwrap_or("?"), state.state);
+    info!(
+        "[TIMER] state: {:?} -> {:?}",
+        prev.as_deref().unwrap_or("?"),
+        state.state
+    );
+    let _ = app.emit("timer-state-update", &state);
     Ok(state)
 }
 
 #[tauri::command]
 pub async fn pause_timer(
+    app: AppHandle,
     engine: State<'_, Arc<TimerEngine>>,
 ) -> Result<TimerStateResponse, String> {
     let prev = engine.get_state().ok().map(|s| format!("{:?}", s.state));
     engine.pause()?;
     let state = engine.get_state()?;
-    info!("[TIMER] state: {:?} -> {:?}", prev.as_deref().unwrap_or("?"), state.state);
+    info!(
+        "[TIMER] state: {:?} -> {:?}",
+        prev.as_deref().unwrap_or("?"),
+        state.state
+    );
+    let _ = app.emit("timer-state-update", &state);
     Ok(state)
 }
 
@@ -1147,32 +1274,53 @@ pub async fn pause_timer(
 #[tauri::command]
 pub async fn pause_timer_idle(
     work_elapsed_secs: u64,
+    app: AppHandle,
     engine: State<'_, Arc<TimerEngine>>,
 ) -> Result<TimerStateResponse, String> {
     let prev = engine.get_state().ok().map(|s| format!("{:?}", s.state));
     engine.pause_with_work_elapsed(work_elapsed_secs)?;
     let state = engine.get_state()?;
-    info!("[TIMER] state: {:?} -> {:?} (idle)", prev.as_deref().unwrap_or("?"), state.state);
+    info!(
+        "[TIMER] state: {:?} -> {:?} (idle)",
+        prev.as_deref().unwrap_or("?"),
+        state.state
+    );
+    let _ = app.emit("timer-state-update", &state);
     Ok(state)
 }
 
 #[tauri::command]
 pub async fn resume_timer(
+    app: AppHandle,
     engine: State<'_, Arc<TimerEngine>>,
 ) -> Result<TimerStateResponse, String> {
     let prev = engine.get_state().ok().map(|s| format!("{:?}", s.state));
     engine.resume()?;
     let state = engine.get_state()?;
-    info!("[TIMER] state: {:?} -> {:?}", prev.as_deref().unwrap_or("?"), state.state);
+    info!(
+        "[TIMER] state: {:?} -> {:?}",
+        prev.as_deref().unwrap_or("?"),
+        state.state
+    );
+    let _ = app.emit("timer-state-update", &state);
     Ok(state)
 }
 
 #[tauri::command]
-pub async fn stop_timer(engine: State<'_, Arc<TimerEngine>>) -> Result<TimerStateResponse, String> {
+pub async fn stop_timer(
+    app: AppHandle,
+    engine: State<'_, Arc<TimerEngine>>,
+) -> Result<TimerStateResponse, String> {
     let prev = engine.get_state().ok().map(|s| format!("{:?}", s.state));
     engine.stop()?;
     let state = engine.get_state()?;
-    info!("[TIMER] state: {:?} -> {:?}", prev.as_deref().unwrap_or("?"), state.state);
+    info!(
+        "[TIMER] state: {:?} -> {:?}",
+        prev.as_deref().unwrap_or("?"),
+        state.state
+    );
+    // CRITICAL: Emit STOPPED immediately — 200ms loop does not emit STOPPED
+    let _ = app.emit("timer-state-update", &state);
     Ok(state)
 }
 

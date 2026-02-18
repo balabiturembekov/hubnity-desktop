@@ -6,6 +6,10 @@ import { RotateCcw, Square } from 'lucide-react';
 import { logger } from '../lib/logger';
 
 /**
+ * Idle Window — shown when user is idle and timer was running.
+ * Logic Lock: The TimerEngine is PAUSED before this window is shown (pause_timer_idle).
+ * No work time is recorded while this window is open — user must choose Resume or Stop.
+ *
  * Hubstaff-style idle time format:
  * - Under 1 hour: minutes (e.g. "11 minutes")
  * - 1–24 hours: hours and minutes (e.g. "1 hour 30 minutes")
@@ -39,6 +43,8 @@ function formatIdleTime(seconds: number): string {
   return totalMinutes === 1 ? '1 minute' : `${totalMinutes} minutes`;
 }
 
+const BUTTON_COOLDOWN_MS = 1500;
+
 export function IdleWindow() {
   const [idleTime, setIdleTime] = useState(0);
   const [isLoading, setIsLoading] = useState(false);
@@ -47,7 +53,8 @@ export function IdleWindow() {
   const [lastActivityTime, setLastActivityTime] = useState<number | null>(null);
   const [lastActivityPerfRef, setLastActivityPerfRef] = useState<number | null>(null);
   const [projectName, setProjectName] = useState<string | null>(null);
-  
+  const [buttonsEnabled, setButtonsEnabled] = useState(false);
+
   // BUG FIX: Track component mount state to prevent setState after unmount
   const isMountedRef = useRef(true);
   
@@ -61,6 +68,25 @@ export function IdleWindow() {
   // Log when component mounts
   useEffect(() => {
     logger.debug('IDLE_WINDOW', 'Component mounted');
+  }, []);
+
+  // Click protection: 1.5s cooldown for Resume/Stop buttons to prevent accidental clicks
+  useEffect(() => {
+    const t = setTimeout(() => {
+      if (isMountedRef.current) setButtonsEnabled(true);
+    }, BUTTON_COOLDOWN_MS);
+    return () => clearTimeout(t);
+  }, []);
+
+  // Re-sync on wake: when system wakes from sleep, refresh idle time calculation
+  useEffect(() => {
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        invoke('request_idle_state').catch((e) => logger.debug('IDLE_WINDOW', 'Re-sync on wake failed', e));
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', onVisibilityChange);
   }, []);
 
   // Listen for state updates from main window via Tauri events
@@ -257,10 +283,10 @@ export function IdleWindow() {
       // Initial update immediately
       updateTime();
       
-      // Update every minute — no seconds shown, so no need for 1s tick
+      // Live tick: update every second so idle duration continues to tick up
       const interval = setInterval(() => {
         updateTime();
-      }, 60_000);
+      }, 1000);
       
       return () => {
         isMounted = false;
@@ -275,7 +301,7 @@ export function IdleWindow() {
   }, [basePerfRef, hasBase]);
   
   const handleResume = async () => {
-    if (isLoading) return;
+    if (isLoading || !buttonsEnabled) return;
     
     try {
       setIsLoading(true);
@@ -299,7 +325,7 @@ export function IdleWindow() {
   };
 
   const handleStop = async () => {
-    if (isLoading) return;
+    if (isLoading || !buttonsEnabled) return;
     
     try {
       setIsLoading(true);
@@ -359,29 +385,28 @@ export function IdleWindow() {
       </div>
 
       <p className="text-xs text-muted-foreground mb-6 text-center">
-        Idle time is not included in the tracked duration.
+        Idle time is not included in the tracked duration. Stop discards it; Resume continues tracking.
       </p>
-
       <div className="flex gap-2 w-full max-w-sm">
         <Button
           onClick={handleStop}
-          disabled={isLoading}
+          disabled={isLoading || !buttonsEnabled}
           size="default"
           variant="outline"
           className="gap-2 flex-1 h-10 text-sm rounded-md"
         >
           <Square className="h-4 w-4" />
-          Stop timer
+          Stop &amp; Discard Idle
         </Button>
         <Button
           onClick={handleResume}
-          disabled={isLoading}
+          disabled={isLoading || !buttonsEnabled}
           size="default"
           variant="default"
           className="gap-2 flex-1 h-10 text-sm rounded-md"
         >
           <RotateCcw className="h-4 w-4" />
-          Resume timer
+          Resume
         </Button>
       </div>
     </div>
