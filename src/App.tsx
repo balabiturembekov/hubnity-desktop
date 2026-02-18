@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useAuthStore } from './store/useAuthStore';
 import { useTrackerStore } from './store/useTrackerStore';
+import { useSyncStore } from './store/useSyncStore';
 import type { TimerStateResponse } from './lib/timer-engine';
 import { Login } from './components/Login';
 import { ProjectSelector } from './components/ProjectSelector';
@@ -32,6 +33,7 @@ function App() {
   const [appVersion, setAppVersion] = useState<string | null>(null);
   const [isCheckingForUpdate, setIsCheckingForUpdate] = useState(false);
   const [updateCheckResult, setUpdateCheckResult] = useState<'idle' | 'latest' | 'available' | 'error'>('idle');
+  const [dbRecoveredBannerVisible, setDbRecoveredBannerVisible] = useState(false);
 
   // Восстанавливаем токены в Rust AuthManager — иначе фоновая синхронизация всегда получает "token not set" и Синхронизировано = 0
   const restoreTokens = useCallback(async () => {
@@ -60,6 +62,16 @@ function App() {
     }
   }, [isAuthenticated]);
 
+  // Track window visibility for throttling (battery/CPU when in tray)
+  useEffect(() => {
+    const onVisibilityChange = () => {
+      useTrackerStore.getState().setWindowVisibility(!document.hidden);
+    };
+    onVisibilityChange();
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', onVisibilityChange);
+  }, []);
+
   // Восстанавливаем токены при монтировании и при смене isAuthenticated
   useEffect(() => {
     restoreTokens();
@@ -76,12 +88,13 @@ function App() {
       .catch(error => {
         logger.debug('APP', 'Failed to get app version', error);
         // Fallback to package.json version if available
-        setAppVersion('0.1.27'); // Fallback when get_app_version fails
+        setAppVersion('0.1.28'); // Fallback when get_app_version fails
       });
   }, []);
 
   // Критично: каждые 30 с передаём токены в Rust (если есть) и запускаем синхронизацию.
-  // Не полагаемся на isAuthenticated — токен может быть в localStorage до регидрации Zustand.
+  // Throttle 2x when window hidden (battery/CPU).
+  const isWindowVisible = useTrackerStore((s) => s.isWindowVisible);
   useEffect(() => {
     let pushInProgress = false;
     const pushTokensAndSync = async () => {
@@ -110,35 +123,47 @@ function App() {
       }
     };
     pushTokensAndSync();
-    const early = setTimeout(pushTokensAndSync, 3000);
-    const interval = setInterval(pushTokensAndSync, 30_000);
+    // Network jitter: 1-3s random delay on initial sync to avoid slamming API on start/wake
+    const jitterMs = 1000 + Math.floor(Math.random() * 2000);
+    const early = setTimeout(pushTokensAndSync, 3000 + jitterMs);
+    const syncIntervalMs = isWindowVisible ? 30_000 : 60_000;
+    const interval = setInterval(pushTokensAndSync, syncIntervalMs);
     return () => {
       clearTimeout(early);
       clearInterval(interval);
     };
-  }, []);
+  }, [isWindowVisible]);
 
   // CRITICAL FIX: Сохраняем состояние таймера при закрытии приложения
   // ДОКАЗАНО: Tauri window close event обрабатывается в Rust (синхронно)
   // Дополнительно: beforeunload handler как fallback
+  // UX: Warn user if they have unsent data before closing
   useEffect(() => {
-    const handleBeforeUnload = async () => {
-      try {
-        // Дополнительная защита: пытаемся сохранить состояние
-        // ДОКАЗАНО: Основное сохранение происходит через Tauri window close event в Rust
-        await useTrackerStore.getState().saveTimerState();
-      } catch (error) {
-        logger.error('APP', 'Failed to save timer state on close (fallback)', error);
-        // ДОКАЗАНО: Ошибка не критична, так как Rust handler уже сохранил состояние
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      const status = useSyncStore.getState().status;
+      const pending = status?.pending_count ?? 0;
+      if (pending > 0) {
+        e.preventDefault();
+        e.returnValue = '';
       }
     };
 
-    // Обработчик для браузерного beforeunload (дополнительная защита)
-    // ДОКАЗАНО: Основное сохранение происходит через Tauri window close event
+    const handleBeforeUnloadAsync = async () => {
+      try {
+        await useTrackerStore.getState().saveTimerState();
+      } catch (error) {
+        logger.error('APP', 'Failed to save timer state on close (fallback)', error);
+      }
+    };
+
     window.addEventListener('beforeunload', handleBeforeUnload);
+
+    // Also run save on pagehide (e.g. closing lid)
+    window.addEventListener('pagehide', handleBeforeUnloadAsync);
 
     return () => {
       window.removeEventListener('beforeunload', handleBeforeUnload);
+      window.removeEventListener('pagehide', handleBeforeUnloadAsync);
     };
   }, []);
 
@@ -216,7 +241,8 @@ function App() {
   }, [isAuthenticated]); // loadActiveTimeEntry is stable from zustand, but we don't want to re-run on every render
 
   // Периодическая синхронизация состояния таймера с сервера (для мультиустройств)
-  // Проверяем каждые 10 секунд, чтобы синхронизировать паузу/возобновление с других устройств
+  // Throttle 2x when window hidden (battery/CPU).
+  const isWindowVisibleForSync = useTrackerStore((s) => s.isWindowVisible);
   useEffect(() => {
     if (!isAuthenticated) return;
 
@@ -460,16 +486,15 @@ function App() {
       }
     };
 
-    // Первая проверка через 30 секунд (не останавливать только что восстановленный таймер сразу)
-    const initialTimeout = setTimeout(syncTimerState, 30000);
-    // Затем каждые 10 секунд
-    const interval = setInterval(syncTimerState, 10000);
+    const syncIntervalMs = isWindowVisibleForSync ? 10_000 : 20_000;
+    const initialTimeout = setTimeout(syncTimerState, isWindowVisibleForSync ? 30_000 : 60_000);
+    const interval = setInterval(syncTimerState, syncIntervalMs);
 
     return () => {
       clearTimeout(initialTimeout);
       clearInterval(interval);
     };
-  }, [isAuthenticated]);
+  }, [isAuthenticated, isWindowVisibleForSync]);
 
   // Периодическая проверка инвариантов состояния (каждые 5 секунд)
   // Автоматически обнаруживает и исправляет рассинхронизацию между Timer Engine и Store
@@ -513,6 +538,24 @@ function App() {
     };
   }, []);
 
+  // Listen for DB recovery from corruption (Rust auto-recovery)
+  // Persistent banner + notification so user understands why local history might be missing
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen('db-recovered-from-corruption', () => {
+      setDbRecoveredBannerVisible(true);
+      invoke('show_notification', {
+        title: 'Hubnity — Database Recovered',
+        body: 'Database was corrupted and has been recovered. Pending sync data may have been lost. Please check your time entries.',
+      }).catch(() => {});
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => {
+      unlisten?.();
+    };
+  }, []);
+
   // Проверка обновлений: первая проверка через 15 с, затем каждые 30 мин
   // Раньше проверяли только раз — пользователи с открытым приложением не видели новые релизы
   useEffect(() => {
@@ -534,6 +577,20 @@ function App() {
         autoInstallTimeoutRef.current = setTimeout(async () => {
           if (cancelled) return;
           if (isInstallingRef.current) return;
+          // GUARD: Don't install while timer is RUNNING — avoid losing unsynced time
+          try {
+            const timerState = await useTrackerStore.getState().getTimerState();
+            if (timerState.state === 'RUNNING') {
+              logger.info('APP', 'Update ready but timer RUNNING — deferring install until user stops');
+              await invoke('show_notification', {
+                title: 'Hubnity',
+                body: `Update ${update.version} ready. Will install after you stop the timer.`,
+              }).catch(() => {});
+              return;
+            }
+          } catch (_) {
+            // If we can't get state, proceed (better to update than block forever)
+          }
           isInstallingRef.current = true;
           
           try {
@@ -627,13 +684,27 @@ function App() {
       logger.debug('APP', 'Update installation already in progress, skipping');
       return;
     }
-    isInstallingRef.current = true;
     
     const update = pendingUpdateRef.current;
     if (!update) {
-      isInstallingRef.current = false;
       return;
     }
+    
+    // GUARD: Don't install while timer is RUNNING — avoid losing unsynced time
+    try {
+      const timerState = await useTrackerStore.getState().getTimerState();
+      if (timerState.state === 'RUNNING') {
+        await invoke('show_notification', {
+          title: 'Hubnity',
+          body: 'Please stop the timer first to install the update.',
+        }).catch(() => {});
+        return;
+      }
+    } catch (_) {
+      // Proceed if we can't get state
+    }
+    
+    isInstallingRef.current = true;
     
     // Отменяем автоматическую установку, если пользователь нажал кнопку вручную
     if (autoInstallTimeoutRef.current) {
@@ -673,6 +744,8 @@ function App() {
   }, []);
 
   // Setup activity monitoring listeners and heartbeat
+  // Throttle 2x when window hidden (battery/CPU).
+  const isWindowVisibleForHeartbeat = useTrackerStore((s) => s.isWindowVisible);
   useEffect(() => {
     if (!isAuthenticated) return;
 
@@ -696,12 +769,14 @@ function App() {
       window.addEventListener(ev, onDomActivity);
     }
 
-    // FIX: Create intervals synchronously so cleanup can clear them (prevents leak on unmount before async)
+    const idleCheckMs = isWindowVisibleForHeartbeat ? 10_000 : 20_000;
+    const heartbeatMs = isWindowVisibleForHeartbeat ? 45_000 : 90_000;
+
     const idleCheckInterval = setInterval(() => {
       if (!isCleanedUp) {
         useTrackerStore.getState().checkIdleStatus();
       }
-    }, 10000);
+    }, idleCheckMs);
 
     const heartbeatInterval = setInterval(async () => {
       if (!isCleanedUp) {
@@ -720,7 +795,7 @@ function App() {
           logger.error('APP', 'Failed to send idle heartbeat', error);
         }
       }
-    }, 45000);
+    }, heartbeatMs);
 
     (async () => {
       try {
@@ -749,7 +824,7 @@ function App() {
       unlistenRef.current?.();
       unlistenRef.current = null;
     };
-  }, [isAuthenticated]);
+  }, [isAuthenticated, isWindowVisibleForHeartbeat]);
 
   // Setup URL activity tracking
   useEffect(() => {
@@ -1121,6 +1196,13 @@ function App() {
             // Emit event to refresh screenshots view
             if (!isCleanedUp) {
               window.dispatchEvent(new CustomEvent('screenshot:uploaded'));
+              // Optional notification for transparency (Settings → Notify when screenshot is captured)
+              if (localStorage.getItem('hubnity_notify_on_screenshot') === 'true') {
+                invoke('show_notification', {
+                  title: 'Screenshot captured',
+                  body: 'Screenshot saved and synced',
+                }).catch(() => {});
+              }
             }
             return; // Success, exit
           }
@@ -1136,9 +1218,15 @@ function App() {
         // Emit event to refresh screenshots view
         if (!isCleanedUp) {
           window.dispatchEvent(new CustomEvent('screenshot:uploaded'));
+          if (localStorage.getItem('hubnity_notify_on_screenshot') === 'true') {
+            invoke('show_notification', {
+              title: 'Screenshot captured',
+              body: 'Screenshot saved and synced',
+            }).catch(() => {});
+          }
         }
         
-        // Don't show notification for every screenshot to avoid spam
+        // Don't show notification by default to avoid spam
         // Notification is only shown on errors
       } catch (error: any) {
         // FIX: Last resort — try to enqueue via Rust so screenshot syncs when online
@@ -1591,6 +1679,21 @@ function App() {
   return (
     <ErrorBoundary>
       <div className="h-screen bg-background overflow-hidden flex flex-col">
+        {dbRecoveredBannerVisible && (
+          <div className="px-4 py-3 bg-amber-500/90 text-amber-950 flex items-center justify-between gap-3 shrink-0">
+            <span className="text-sm font-medium">
+              Database was recovered from corruption. Pending sync data may have been lost. Please verify your time entries.
+            </span>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="shrink-0 text-amber-950 hover:bg-amber-950/20"
+              onClick={() => setDbRecoveredBannerVisible(false)}
+            >
+              Dismiss
+            </Button>
+          </div>
+        )}
         {updateAvailable && (
           <div className="px-4 py-2 bg-primary text-primary-foreground flex items-center justify-between gap-3 shrink-0">
             <span className="text-sm">
