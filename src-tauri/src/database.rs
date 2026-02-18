@@ -3,6 +3,35 @@ use std::sync::{Arc, Mutex};
 use tracing::{error, warn};
 
 use crate::auth::TokenEncryption;
+
+/// Log IO-related DB errors for easier diagnosis (disk full, permission denied).
+/// Does not change error propagation — caller still returns Err.
+fn log_io_error_if_any(context: &str, e: &rusqlite::Error) {
+    use rusqlite::ffi::ErrorCode;
+    if let rusqlite::Error::SqliteFailure(ffi_err, _) = e {
+        match ffi_err.code {
+            ErrorCode::DiskFull => {
+                error!(
+                    "[DB] {}: Disk full. Free space on drive or check app data directory.",
+                    context
+                );
+            }
+            ErrorCode::ReadOnly | ErrorCode::CannotOpen => {
+                error!(
+                    "[DB] {}: Permission denied or read-only. Check app data directory is writable.",
+                    context
+                );
+            }
+            ErrorCode::SystemIoFailure => {
+                error!(
+                    "[DB] {}: I/O error. Check disk and permissions.",
+                    context
+                );
+            }
+            _ => {}
+        }
+    }
+}
 use crate::models::{FailedTaskInfo, QueueStats};
 use crate::sync::TaskPriority;
 use chrono::Utc;
@@ -33,6 +62,17 @@ impl Database {
         #[allow(unused_mut)]
         let mut conn = Connection::open(db_path)?;
 
+        // GUARD: Integrity check on startup — detect corruption before init
+        let integrity: String = conn
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .map_err(|e| InvalidParameterName(format!("Integrity check failed: {}", e)))?;
+        if integrity.to_lowercase() != "ok" {
+            return Err(InvalidParameterName(format!(
+                "Database corruption detected: {}",
+                integrity
+            )));
+        }
+
         // GUARD: Включаем WAL mode для лучшей производительности и безопасности
         // WAL (Write-Ahead Logging) обеспечивает лучшую защиту от corruption
         conn.pragma_update(None, "journal_mode", "WAL")
@@ -45,6 +85,13 @@ impl Database {
             })
             .ok();
 
+        // PERFORMANCE: Reduce disk I/O during sync bursts (safe with WAL)
+        let _ = conn.pragma_update(None, "synchronous", "NORMAL");
+        // 64MB cache (negative = KB) — fewer disk reads
+        let _ = conn.pragma_update(None, "cache_size", "-64000");
+        // Temp tables in RAM
+        let _ = conn.pragma_update(None, "temp_store", "MEMORY");
+
         // GUARD: Включаем foreign_keys для целостности данных
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(|e| {
@@ -52,79 +99,94 @@ impl Database {
             })
             .ok();
 
-        let encryption = TokenEncryption::new().map_err(|e| InvalidParameterName(e))?;
+        let app_data_dir = std::path::Path::new(db_path).parent();
+        let encryption = TokenEncryption::new(app_data_dir).map_err(|e| InvalidParameterName(e))?;
 
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
             encryption: Arc::new(encryption),
         };
-        db.init_schema()?;
+        db.run_migrations()?;
         Ok(db)
     }
 
-    /// Инициализация схемы БД
-    fn init_schema(&self) -> SqliteResult<()> {
+    /// Current schema version (PRAGMA user_version). Bump when adding migrations.
+    const SCHEMA_VERSION: i32 = 5;
+
+    /// Versioned migrations using SQLite user_version pragma.
+    /// When releasing v0.2.0 with new columns (e.g. task_category), add migration 6 and bump SCHEMA_VERSION.
+    fn run_migrations(&self) -> SqliteResult<()> {
         let conn = self.lock_conn()?;
+        let current: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
 
-        // Таблица для сохранения состояния таймера
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS time_entries (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            day TEXT NOT NULL,
-            accumulated_seconds INTEGER NOT NULL DEFAULT 0,
-            state TEXT NOT NULL,
-            last_updated_at INTEGER NOT NULL,
-            started_at INTEGER,
-            UNIQUE(day)
-        )",
-            [],
-        )?;
+        if current < 1 {
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS time_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                day TEXT NOT NULL,
+                accumulated_seconds INTEGER NOT NULL DEFAULT 0,
+                state TEXT NOT NULL,
+                last_updated_at INTEGER NOT NULL,
+                started_at INTEGER,
+                UNIQUE(day)
+            )",
+                [],
+            )?;
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS sync_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_type TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                last_retry_at INTEGER,
+                error_message TEXT,
+                priority INTEGER NOT NULL DEFAULT 2,
+                idempotency_key TEXT
+            )",
+                [],
+            )?;
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT)",
+                [],
+            )?;
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sync_queue_status ON sync_queue(status)",
+                [],
+            )?;
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_time_entries_day ON time_entries(day)",
+                [],
+            )?;
+        }
 
-        // Таблица очереди синхронизации
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS sync_queue (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            entity_type TEXT NOT NULL,
-            payload TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            retry_count INTEGER NOT NULL DEFAULT 0,
-            created_at INTEGER NOT NULL,
-            last_retry_at INTEGER,
-            error_message TEXT,
-            priority INTEGER NOT NULL DEFAULT 2,
-            idempotency_key TEXT
-        )",
-            [],
-        )?;
+        // Migration 2: error_message (idempotent ALTER)
+        if current < 2 {
+            let _ = conn.execute("ALTER TABLE sync_queue ADD COLUMN error_message TEXT", []);
+        }
+        // Migration 3: priority
+        if current < 3 {
+            let _ = conn.execute(
+                "ALTER TABLE sync_queue ADD COLUMN priority INTEGER DEFAULT 2",
+                [],
+            );
+        }
+        // Migration 4: started_at
+        if current < 4 {
+            let _ = conn.execute("ALTER TABLE time_entries ADD COLUMN started_at INTEGER", []);
+        }
+        // Migration 5: idempotency_key
+        if current < 5 {
+            let _ = conn.execute("ALTER TABLE sync_queue ADD COLUMN idempotency_key TEXT", []);
+        }
 
-        // Миграции: добавляем колонки если их нет
-        let _ = conn.execute("ALTER TABLE sync_queue ADD COLUMN error_message TEXT", []);
-        let _ = conn.execute(
-            "ALTER TABLE sync_queue ADD COLUMN priority INTEGER DEFAULT 2",
-            [],
-        );
-        // Миграция: добавляем started_at для восстановления времени при перезапуске
-        let _ = conn.execute("ALTER TABLE time_entries ADD COLUMN started_at INTEGER", []);
-        // CRITICAL FIX: Миграция для idempotency keys
-        let _ = conn.execute("ALTER TABLE sync_queue ADD COLUMN idempotency_key TEXT", []);
+        // Future: Migration 6 (v0.2.0): task_category
+        // if current < 6 {
+        //     let _ = conn.execute("ALTER TABLE sync_queue ADD COLUMN task_category TEXT", []);
+        // }
 
-        // Метаданные приложения (например current_user_id для изоляции данных при смене пользователя)
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT)",
-            [],
-        )?;
-
-        // Индексы для быстрого поиска
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_sync_queue_status ON sync_queue(status)",
-            [],
-        )?;
-
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_time_entries_day ON time_entries(day)",
-            [],
-        )?;
-
+        conn.pragma_update(None, "user_version", Self::SCHEMA_VERSION)?;
         Ok(())
     }
 
@@ -145,6 +207,7 @@ impl Database {
         // и не будет ждать освобождения блокировки
         conn.execute("BEGIN IMMEDIATE TRANSACTION", [])
             .map_err(|e| {
+                log_io_error_if_any("save_timer_state begin", &e);
                 error!("[DB] Failed to begin transaction: {}", e);
                 e
             })?;
@@ -166,6 +229,7 @@ impl Database {
             Ok(_) => {
                 // Успешно - коммитим транзакцию
                 conn.execute("COMMIT", []).map_err(|e| {
+                    log_io_error_if_any("save_timer_state commit", &e);
                     error!("[DB] Failed to commit transaction: {}", e);
                     // Пытаемся откатить
                     let _ = conn.execute("ROLLBACK", []);
@@ -174,7 +238,7 @@ impl Database {
                 Ok(())
             }
             Err(e) => {
-                // Ошибка - откатываем транзакцию
+                log_io_error_if_any("save_timer_state", &e);
                 error!(
                     "[DB] Failed to save timer state: {}. Rolling back transaction.",
                     e
@@ -212,18 +276,32 @@ impl Database {
 
     /// Получить последний time entry ID из очереди (pending или sent) — fallback когда app_meta пуст
     pub fn get_last_time_entry_id_from_queue(&self) -> SqliteResult<Option<String>> {
-        let conn = self.lock_conn()?;
-        let mut stmt = conn.prepare(
-            "SELECT entity_type, payload FROM sync_queue
-             WHERE entity_type IN ('time_entry_pause', 'time_entry_resume', 'time_entry_stop')
-             ORDER BY created_at DESC LIMIT 5",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        for row in rows {
-            let (_entity_type, encrypted) = row?;
-            if let Ok(decrypted) = self.encryption.decrypt(&encrypted) {
+        let raw_rows: Vec<(i64, String, String)> = {
+            let conn = self.lock_conn()?;
+            let mut stmt = conn.prepare(
+                "SELECT id, entity_type, payload FROM sync_queue
+                 WHERE entity_type IN ('time_entry_pause', 'time_entry_resume', 'time_entry_stop')
+                 ORDER BY created_at DESC LIMIT 5",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+
+        for (row_id, _entity_type, encrypted) in raw_rows {
+            if let Ok((decrypted, needs_migration)) =
+                self.encryption.decrypt_with_legacy_fallback(&encrypted)
+            {
+                if needs_migration {
+                    if let Ok(new_encrypted) = self.encryption.encrypt(&decrypted) {
+                        let _ = self.update_sync_payload(row_id, &new_encrypted);
+                    }
+                }
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&decrypted) {
                     if let Some(id) = v.get("id").and_then(|v| v.as_str()) {
                         if !id.is_empty() && !id.starts_with("temp-") {
@@ -322,16 +400,15 @@ impl Database {
                     payload
                 }
             );
-            // Возвращаем ID существующей задачи (находим её)
+            // Возвращаем ID существующей задачи по idempotency_key (payload в БД зашифрован)
             let existing_id: i64 = match conn.query_row(
                 "SELECT id FROM sync_queue 
-                 WHERE entity_type = ?1 
-                 AND payload = ?2 
+                 WHERE idempotency_key = ?1 
                  AND status = 'pending' 
-                 AND created_at > ?3
+                 AND created_at > ?2
                  ORDER BY created_at DESC 
                  LIMIT 1",
-                params![entity_type, payload, now - duplicate_window],
+                params![idempotency_key, now - duplicate_window],
                 |row| row.get(0),
             ) {
                 Ok(id) => {
@@ -411,6 +488,7 @@ impl Database {
             Ok(_) => {
                 // ДОКАЗАНО: INSERT успешен - коммитим транзакцию
                 conn.execute("COMMIT", []).map_err(|e| {
+                    log_io_error_if_any("enqueue_sync commit", &e);
                     error!("[DB] Failed to commit transaction in enqueue_sync: {}", e);
                     let _ = conn.execute("ROLLBACK", []);
                     e
@@ -418,7 +496,7 @@ impl Database {
                 Ok(conn.last_insert_rowid())
             }
             Err(e) => {
-                // ДОКАЗАНО: INSERT не удался - откатываем транзакцию
+                log_io_error_if_any("enqueue_sync", &e);
                 error!(
                     "[DB] Failed to insert task in enqueue_sync: {}. Rolling back transaction.",
                     e
@@ -573,6 +651,16 @@ impl Database {
         })
     }
 
+    /// Обновить payload задачи (для миграции ключа шифрования)
+    pub fn update_sync_payload(&self, id: i64, encrypted_payload: &str) -> SqliteResult<()> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE sync_queue SET payload = ?1 WHERE id = ?2",
+            params![encrypted_payload, id],
+        )?;
+        Ok(())
+    }
+
     /// Обновить статус задачи на "sent" (успешная синхронизация)
     /// PRODUCTION: Partial success - успешные задачи помечаются сразу
     pub fn mark_task_sent(&self, id: i64) -> SqliteResult<()> {
@@ -581,6 +669,23 @@ impl Database {
             "UPDATE sync_queue SET status = 'sent' WHERE id = ?1",
             params![id],
         )?;
+        Ok(())
+    }
+
+    /// Зарезервировать задачи для текущего sync run (обновить last_retry_at)
+    /// Предотвращает повторный выбор тех же задач другим sync в течение backoff окна
+    pub fn claim_tasks_for_sync(&self, ids: &[i64]) -> SqliteResult<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let conn = self.lock_conn()?;
+        let now = Utc::now().timestamp();
+        for id in ids {
+            conn.execute(
+                "UPDATE sync_queue SET last_retry_at = ?1 WHERE id = ?2",
+                params![now, id],
+            )?;
+        }
         Ok(())
     }
 
@@ -667,6 +772,13 @@ impl Database {
         Ok(count as usize)
     }
 
+    /// Очистить всю очередь синхронизации (safety valve для пользователей)
+    pub fn clear_sync_queue(&self) -> SqliteResult<()> {
+        let conn = self.lock_conn()?;
+        conn.execute("DELETE FROM sync_queue", [])?;
+        Ok(())
+    }
+
     /// Сбросить failed задачи обратно в pending для повторной попытки
     pub fn reset_failed_tasks(&self, limit: i32) -> SqliteResult<i32> {
         let conn = self.lock_conn()?;
@@ -727,24 +839,48 @@ impl Database {
 
         let mut stmt = conn.prepare(&sql)?;
 
-        let rows = stmt.query_map(params![max_retries, now, batch_size], |row| {
-            let id = row.get::<_, i64>(0)?;
-            let entity_type = row.get::<_, String>(1)?;
-            let encrypted_payload = row.get::<_, String>(2)?;
-            let retry_count = row.get::<_, i32>(3)?;
-            let idempotency_key = row.get::<_, Option<String>>(4)?;
+        let raw_rows: Vec<(i64, String, String, i32, Option<String>)> = stmt
+            .query_map(params![max_retries, now, batch_size], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i32>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
 
-            let payload = self
-                .encryption
-                .decrypt(&encrypted_payload)
-                .map_err(|e| InvalidParameterName(format!("Decryption error: {}", e)))?;
-
-            Ok((id, entity_type, payload, retry_count, idempotency_key))
-        })?;
+        drop(stmt);
+        drop(conn);
 
         let mut result = Vec::new();
-        for row in rows {
-            result.push(row?);
+        for (id, entity_type, encrypted_payload, retry_count, idempotency_key) in raw_rows {
+            match self
+                .encryption
+                .decrypt_with_legacy_fallback(&encrypted_payload)
+            {
+                Ok((payload, needs_migration)) => {
+                    if needs_migration {
+                        if let Ok(new_encrypted) = self.encryption.encrypt(&payload) {
+                            if self.update_sync_payload(id, &new_encrypted).is_ok() {
+                                tracing::warn!(
+                                    "[DB] Migration successful: task {} re-encrypted with new key",
+                                    id
+                                );
+                            }
+                        }
+                    }
+                    result.push((id, entity_type, payload, retry_count, idempotency_key));
+                }
+                Err(e) => {
+                    warn!(
+                        "[DB] Skipping task {}: decryption failed ({}). One broken task won't block the queue.",
+                        id, e
+                    );
+                }
+            }
         }
 
         Ok(result)
