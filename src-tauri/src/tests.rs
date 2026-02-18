@@ -10,9 +10,14 @@ use std::time::Instant;
 mod tests {
     use super::*;
 
+    fn test_encryption_with_fallback() -> TokenEncryption {
+        let dir = tempfile::tempdir().expect("temp dir");
+        TokenEncryption::new(Some(dir.path())).expect("Failed to create encryption")
+    }
+
     #[test]
     fn test_token_encryption_decryption() {
-        let encryption = TokenEncryption::new().expect("Failed to create encryption");
+        let encryption = test_encryption_with_fallback();
 
         let original_token = "test_access_token_12345";
 
@@ -36,7 +41,7 @@ mod tests {
 
     #[test]
     fn test_token_encryption_different_tokens() {
-        let encryption = TokenEncryption::new().expect("Failed to create encryption");
+        let encryption = test_encryption_with_fallback();
 
         let token1 = "token1";
         let token2 = "token2";
@@ -58,7 +63,7 @@ mod tests {
 
     #[test]
     fn test_token_encryption_invalid_data() {
-        let encryption = TokenEncryption::new().expect("Failed to create encryption");
+        let encryption = test_encryption_with_fallback();
 
         // Попытка расшифровать невалидные данные должна вернуть ошибку
         let invalid_data = "invalid_encrypted_data";
@@ -69,7 +74,7 @@ mod tests {
 
     #[test]
     fn test_token_encryption_empty_token() {
-        let encryption = TokenEncryption::new().expect("Failed to create encryption");
+        let encryption = test_encryption_with_fallback();
 
         let empty_token = "";
         let encrypted = encryption
@@ -84,7 +89,7 @@ mod tests {
 
     #[test]
     fn test_token_encryption_long_token() {
-        let encryption = TokenEncryption::new().expect("Failed to create encryption");
+        let encryption = test_encryption_with_fallback();
 
         // Длинный токен (типичный JWT)
         let long_token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
@@ -196,9 +201,9 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     mod activity_monitoring_tests {
         use super::*;
-        use tauri::Manager;
-        use tauri::webview::InvokeRequest;
         use tauri::ipc::{CallbackFn, InvokeBody};
+        use tauri::webview::InvokeRequest;
+        use tauri::Manager;
 
         fn create_activity_monitor_app() -> tauri::App<tauri::test::MockRuntime> {
             tauri::test::mock_builder()
@@ -578,7 +583,10 @@ mod tests {
 
             // Проверяем, что таймер продолжает работать (Hubstaff-style)
             let state = engine.get_state().unwrap();
-            assert!(matches!(state.state, engine::TimerStateForAPI::Running { .. }));
+            assert!(matches!(
+                state.state,
+                engine::TimerStateForAPI::Running { .. }
+            ));
             // today_seconds = время с полуночи; при rollover <= elapsed (только новая часть дня)
             assert!(state.today_seconds <= state.elapsed_seconds);
         }
@@ -642,7 +650,10 @@ mod tests {
 
             // Проверяем: таймер работает, today_seconds = время с полуночи
             let state = engine.get_state().unwrap();
-            assert!(matches!(state.state, engine::TimerStateForAPI::Running { .. }));
+            assert!(matches!(
+                state.state,
+                engine::TimerStateForAPI::Running { .. }
+            ));
             assert!(state.today_seconds <= state.elapsed_seconds);
             // elapsed_seconds содержит полную длительность (включая до полуночи)
             assert!(state.elapsed_seconds >= 200 / 1000); // Был sleep 200ms
@@ -681,10 +692,11 @@ mod tests {
             // Проверяем, что день обновлен на сегодня (локальная дата)
             let today_local = Local::now().date_naive();
             let day_start = *engine.day_start_timestamp.lock().unwrap();
-            let day_start_date = chrono::DateTime::<Utc>::from_timestamp(day_start.unwrap() as i64, 0)
-                .unwrap()
-                .with_timezone(&Local)
-                .date_naive();
+            let day_start_date =
+                chrono::DateTime::<Utc>::from_timestamp(day_start.unwrap() as i64, 0)
+                    .unwrap()
+                    .with_timezone(&Local)
+                    .date_naive();
             assert_eq!(
                 day_start_date, today_local,
                 "Engine local date must match current local date"
@@ -812,30 +824,38 @@ mod tests {
 
             engine.start().unwrap();
 
-            // Симулируем сон: wall-clock ушёл на 25 мин вперёд, monotonic только на 5 мин (20 мин "сна")
+            // Симулируем сон: wall-clock ушёл на 25 мин вперёд, awake-время только 5 мин (20 мин "сна")
+            // macOS: monotonic (Instant) не тикает во сне. Windows: GetTickCount64 не тикает.
             {
                 let mut state = engine.state.lock().unwrap();
-                if let TimerState::Running { started_at_ms: _, .. } = &*state {
+                if let TimerState::Running {
+                    started_at_ms: _, ..
+                } = &*state
+                {
                     let now_wall = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
                         .as_secs();
                     let started_at_wall = now_wall.saturating_sub(25 * 60); // 25 мин назад по wall
                     let started_at_ms = started_at_wall * 1000;
-                    let started_at_instant = Instant::now() - Duration::from_secs(5 * 60); // 5 мин по monotonic
+                    let started_at_instant = Instant::now() - Duration::from_secs(5 * 60); // 5 мин
+                    #[cfg(target_os = "windows")]
+                    let started_at_tick64_ms = unsafe {
+                        windows_sys::Win32::System::SystemInformation::GetTickCount64()
+                            .saturating_sub(5 * 60 * 1000)
+                    };
                     *state = TimerState::Running {
                         started_at_ms,
                         started_at_instant,
+                        #[cfg(target_os = "windows")]
+                        started_at_tick64_ms,
                     };
                 }
             }
 
             // get_state обнаруживает sleep (gap >= 5 мин) и вызывает handle_system_sleep → Paused
             let state = engine.get_state().unwrap();
-            assert!(matches!(
-                state.state,
-                engine::TimerStateForAPI::Paused { .. }
-            ));
+            assert!(matches!(state.state, engine::TimerStateForAPI::Paused));
         }
 
         #[test]
@@ -1525,18 +1545,12 @@ mod tests {
         #[test]
         fn test_enqueue_time_entry_different_operations() {
             // Тест добавления разных операций
-            // BUG FIX: Функция cancel_opposite_time_entry_operations отменяет все противоположные операции
-            // независимо от ID, поэтому когда добавляется "resume", она отменяет "pause"
-            // Используем разные ID для каждой операции, чтобы они не отменяли друг друга
-            // (функция отменяет по типу операции, но в реальности они для разных entry)
+            // FIX: We no longer cancel opposite Pause/Resume — every state transition must reach the server.
             let (sync_manager, _temp_dir) = create_test_sync_manager();
 
             let operations = vec!["start", "pause", "resume", "stop"];
 
             for operation in operations {
-                // Используем разные ID для каждой операции, чтобы они не отменяли друг друга
-                // В реальности cancel_opposite_time_entry_operations отменяет все противоположные операции,
-                // но в тесте мы проверяем, что разные операции можно добавить
                 let payload = serde_json::json!({
                     "id": format!("entry_{}", operation),
                     "projectId": "123"
@@ -1552,19 +1566,35 @@ mod tests {
                 assert!(result.is_ok(), "Failed to enqueue operation: {}", operation);
             }
 
-            // Проверяем, что все задачи добавлены
-            // NOTE: cancel_opposite_time_entry_operations отменяет все противоположные операции за последние 30 секунд
-            // независимо от ID, поэтому когда добавляется "resume", она отменяет "pause"
-            // Итого: start, resume (pause отменена), stop = 3 задачи
+            // All 4 operations must be in queue (no cancel_opposite for Pause/Resume)
             let tasks = sync_manager.db.get_pending_sync_tasks(10).unwrap();
-            // Ожидаем 3 задачи: start, resume (pause была отменена), stop
-            assert_eq!(tasks.len(), 3, "Expected 3 tasks (pause was cancelled by resume), got {}", tasks.len());
-            
-            // Проверяем, что start, resume и stop есть
-            let task_types: Vec<&str> = tasks.iter().map(|(_, entity_type, _)| entity_type.as_str()).collect();
-            assert!(task_types.contains(&"time_entry_start"), "Start task should be present");
-            assert!(task_types.contains(&"time_entry_resume"), "Resume task should be present (pause was cancelled)");
-            assert!(task_types.contains(&"time_entry_stop"), "Stop task should be present");
+            assert_eq!(
+                tasks.len(),
+                4,
+                "Expected 4 tasks (start, pause, resume, stop), got {}",
+                tasks.len()
+            );
+
+            let task_types: Vec<&str> = tasks
+                .iter()
+                .map(|(_, entity_type, _)| entity_type.as_str())
+                .collect();
+            assert!(
+                task_types.contains(&"time_entry_start"),
+                "Start task should be present"
+            );
+            assert!(
+                task_types.contains(&"time_entry_pause"),
+                "Pause task must be present (no cancel_opposite)"
+            );
+            assert!(
+                task_types.contains(&"time_entry_resume"),
+                "Resume task should be present"
+            );
+            assert!(
+                task_types.contains(&"time_entry_stop"),
+                "Stop task should be present"
+            );
         }
 
         #[test]

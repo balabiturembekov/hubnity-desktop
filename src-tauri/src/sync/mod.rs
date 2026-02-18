@@ -2,7 +2,9 @@ use crate::auth::AuthManager;
 #[cfg(test)]
 use crate::models::TokenRefreshResult;
 use crate::Database;
+use scopeguard::guard;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -31,11 +33,13 @@ impl fmt::Display for SyncError {
     }
 }
 
-/// Конфигурация синхронизации (api_base_url, таймауты)
+/// Конфигурация синхронизации (api_base_url, таймауты, app_version)
 #[derive(Clone)]
 pub struct SyncConfig {
     pub api_base_url: String,
     pub http_timeout_secs: u64,
+    /// App version sent in X-App-Version header for debugging version skew
+    pub app_version: String,
 }
 
 impl Default for SyncConfig {
@@ -43,6 +47,7 @@ impl Default for SyncConfig {
         Self {
             api_base_url: "https://app.automatonsoft.de/api".to_string(),
             http_timeout_secs: 120,
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
         }
     }
 }
@@ -68,17 +73,21 @@ impl TaskPriority {
 }
 
 /// Менеджер синхронизации для обработки offline queue
-/// PRODUCTION-GRADE: single-flight sync, fresh tokens, adaptive batching
+/// PRODUCTION-GRADE: single-flight via AtomicBool, lock held only for DB ops (not network I/O)
 #[derive(Clone)]
 pub struct SyncManager {
     pub(crate) db: Arc<Database>,
     pub(crate) api_base_url: String,
     pub(crate) auth_manager: Arc<AuthManager>,
-    pub(crate) sync_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Single-flight: prevents concurrent sync runs
+    pub(crate) is_syncing: Arc<AtomicBool>,
     pub(crate) client: reqwest::Client,
+    pub(crate) app_version: String,
 }
 
 impl SyncManager {
+    /// Convenience constructor; tests and external callers use this.
+    #[allow(dead_code)]
     pub fn new(db: Arc<Database>) -> Self {
         Self::new_with_config(db, SyncConfig::default())
     }
@@ -92,8 +101,9 @@ impl SyncManager {
             db,
             api_base_url: config.api_base_url.clone(),
             auth_manager: Arc::new(AuthManager::new(config.api_base_url)),
-            sync_lock: Arc::new(tokio::sync::Mutex::new(())),
+            is_syncing: Arc::new(AtomicBool::new(false)),
             client,
+            app_version: config.app_version.clone(),
         }
     }
 
@@ -101,11 +111,11 @@ impl SyncManager {
     /// PRODUCTION: Адаптивный размер batch для эффективной синхронизации
     fn calculate_batch_size(&self, pending_count: i32) -> i32 {
         match pending_count {
-            0..=20 => 5,      // Маленькая очередь - маленький batch
-            21..=100 => 20,   // Средняя очередь - средний batch
-            101..=500 => 50,  // Большая очередь - большой batch
+            0..=20 => 5,       // Маленькая очередь - маленький batch
+            21..=100 => 20,    // Средняя очередь - средний batch
+            101..=500 => 50,   // Большая очередь - большой batch
             501..=2000 => 100, // Очень большая очередь
-            _ => 150,         // Огромная очередь - ускоренная обработка
+            _ => 150,          // Огромная очередь - ускоренная обработка
         }
     }
 
@@ -151,7 +161,8 @@ impl SyncManager {
 
     /// Добавить time entry операцию в очередь синхронизации
     /// PRODUCTION: Токены НЕ сохраняются в payload, получаются через AuthManager при синхронизации
-    /// FIX: Отменяет противоположные операции (resume <-> pause) перед добавлением новой
+    /// NOTE: We do NOT cancel opposite Pause/Resume tasks. Every state transition must reach the server
+    /// for accurate duration reporting. Redundant Resume calls are acceptable; losing a Pause is not.
     pub fn enqueue_time_entry(
         &self,
         operation: &str,
@@ -161,22 +172,7 @@ impl SyncManager {
     ) -> Result<i64, String> {
         // PRODUCTION: Токены НЕ сохраняются в payload
         // Они будут получаться через AuthManager.get_fresh_token() при синхронизации
-        
-        // FIX: Отменяем противоположные операции (resume <-> pause) перед добавлением новой
-        // Это предотвращает конфликты когда пользователь быстро нажимает resume/pause
-        if operation == "resume" || operation == "pause" {
-            // Для операций resume/pause payload содержит {"id": "timeEntryId"}
-            if let Some(time_entry_id) = payload.get("id").and_then(|v| v.as_str()) {
-                if let Err(e) = self.db.cancel_opposite_time_entry_operations(operation, time_entry_id) {
-                    warn!(
-                        "[SYNC] Failed to cancel opposite operations for {}: {}",
-                        operation, e
-                    );
-                    // Продолжаем - это не критично, синхронизация обработает конфликт
-                }
-            }
-        }
-        
+
         let payload_str = serde_json::to_string(&payload)
             .map_err(|e| format!("Failed to serialize payload: {}", e))?;
 
@@ -263,7 +259,8 @@ impl SyncManager {
 
         let mut request = method
             .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {}", access_token));
+            .header("Authorization", format!("Bearer {}", access_token))
+            .header("X-App-Version", &self.app_version);
         if let Some(key) = idempotency_key {
             request = request.header("X-Idempotency-Key", key);
         }
@@ -299,7 +296,8 @@ impl SyncManager {
             .client
             .post(&url)
             .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {}", access_token));
+            .header("Authorization", format!("Bearer {}", access_token))
+            .header("X-App-Version", &self.app_version);
         if let Some(key) = idempotency_key {
             request = request.header("X-Idempotency-Key", key);
         }
@@ -340,7 +338,7 @@ impl SyncManager {
                 // BUG FIX: Use expect with clear error message instead of unwrap to prevent panic
                 // This should never fail because we check starts_with above, but defensive programming
                 let operation = entity_type.strip_prefix("time_entry_").expect(
-                    "BUG: strip_prefix failed after starts_with check - this should never happen"
+                    "BUG: strip_prefix failed after starts_with check - this should never happen",
                 );
                 let builder = self.send_time_entry_request(
                     operation,
@@ -474,10 +472,10 @@ impl SyncManager {
             debug!("[SYNC] No pending tasks, skipping sync");
             // Обновляем last_sync_at даже при 0 задач — пользователь видит актуальное «Last sync»
             // (операции могли идти через direct API, очередь пуста = всё синхронизировано)
-            if let Err(e) = self.db.set_app_meta(
-                "last_sync_at",
-                &chrono::Utc::now().timestamp().to_string(),
-            ) {
+            if let Err(e) = self
+                .db
+                .set_app_meta("last_sync_at", &chrono::Utc::now().timestamp().to_string())
+            {
                 tracing::warn!("[SYNC] Failed to update last_sync_at (0 tasks): {}", e);
             }
             return Ok(0);
@@ -519,14 +517,20 @@ impl SyncManager {
 
         if tasks.is_empty() {
             debug!("[SYNC] No tasks ready for retry (backoff or empty), skipping");
-            if let Err(e) = self.db.set_app_meta(
-                "last_sync_at",
-                &chrono::Utc::now().timestamp().to_string(),
-            ) {
+            if let Err(e) = self
+                .db
+                .set_app_meta("last_sync_at", &chrono::Utc::now().timestamp().to_string())
+            {
                 tracing::warn!("[SYNC] Failed to update last_sync_at (backoff): {}", e);
             }
             return Ok(0);
         }
+
+        // Claim tasks: update last_retry_at so another sync won't pick them during network I/O
+        let task_ids: Vec<i64> = tasks.iter().map(|(id, _, _, _, _)| *id).collect();
+        self.db
+            .claim_tasks_for_sync(&task_ids)
+            .map_err(|e| SyncError::Db(format!("claim tasks: {}", e)))?;
 
         let mut synced_count = 0;
         let mut failed_in_batch = 0;
@@ -535,8 +539,7 @@ impl SyncManager {
         let mut by_type_failed: std::collections::HashMap<String, i32> =
             std::collections::HashMap::new();
 
-        // PRODUCTION: Partial success - обрабатываем все задачи в batch
-        // Ошибка одной задачи НЕ останавливает batch
+        // PRODUCTION: Network I/O OUTSIDE any lock - lock held only for DB ops
         for (id, entity_type, payload, retry_count, idempotency_key) in tasks {
             info!(
                 "[SYNC] Processing task {}: {} (retry {})",
@@ -708,24 +711,24 @@ impl SyncManager {
     }
 
     /// Синхронизировать очередь (обработать pending задачи)
-    /// PRODUCTION: Single-flight через sync_lock с таймаутом
+    /// PRODUCTION: Single-flight via AtomicBool; lock held only for DB ops, NOT during network I/O
+    /// Panic guard: is_syncing is always reset via scopeguard, even on panic
     pub async fn sync_queue(&self, max_retries: i32) -> Result<usize, String> {
-        match tokio::time::timeout(tokio::time::Duration::from_secs(300), self.sync_lock.lock())
-            .await
+        if self
+            .is_syncing
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
         {
-            Ok(lock) => {
-                let _lock = lock;
-                self.run_sync_internal(max_retries)
-                    .await
-                    .map_err(|e| e.to_string())
-            }
-            Err(_) => {
-                error!("[SYNC] CRITICAL: Sync lock timeout (300s) - previous sync may be stuck");
-                Err(
-                    "Sync lock timeout: previous sync may be stuck. Check logs for stuck sync task."
-                        .to_string(),
-                )
-            }
+            debug!("[SYNC] Another sync already in progress, skipping");
+            return Ok(0);
         }
+
+        let _guard = guard((), |_| {
+            self.is_syncing.store(false, Ordering::Release);
+        });
+
+        self.run_sync_internal(max_retries)
+            .await
+            .map_err(|e| e.to_string())
     }
 }
