@@ -19,6 +19,8 @@ pub struct TimerEngine {
     pub(crate) db: Option<Arc<Database>>,
     /// Этап 4: true если состояние было восстановлено из "running" как Paused (показать уведомление один раз)
     pub(crate) restored_from_running: Arc<Mutex<bool>>,
+    /// Причина последнего перехода (sleep/idle) — читается и очищается в get_state
+    pub(crate) last_transition_reason: Arc<Mutex<Option<String>>>,
 }
 /// Состояние таймера - строгая FSM
 /// Невозможные состояния физически невозможны
@@ -28,8 +30,11 @@ pub enum TimerState {
     Stopped,
     /// Таймер работает - хранит Instant начала сессии
     Running {
-        started_at_ms: u64,          // Unix timestamp в миллисекундах — точность для синхронизации
+        started_at_ms: u64, // Unix timestamp в миллисекундах — точность для синхронизации
         started_at_instant: Instant, // Монотонное время (для расчетов)
+        /// Windows: GetTickCount64 при старте — не тикает во время сна (в отличие от QPC/Instant)
+        #[cfg(target_os = "windows")]
+        started_at_tick64_ms: u64,
     },
     /// Таймер на паузе
     Paused,
@@ -40,15 +45,18 @@ pub struct TimerStateResponse {
     #[serde(flatten)]
     pub state: TimerStateForAPI,
     pub elapsed_seconds: u64,
-    pub accumulated_seconds: u64,   // Накопленное время за день
-    pub session_start: Option<u64>,     // Unix timestamp начала сессии в секундах (для совместимости)
-    pub session_start_ms: Option<u64>,  // Unix timestamp в миллисекундах — точная синхронизация
+    pub accumulated_seconds: u64,      // Накопленное время за день
+    pub session_start: Option<u64>, // Unix timestamp начала сессии в секундах (для совместимости)
+    pub session_start_ms: Option<u64>, // Unix timestamp в миллисекундах — точная синхронизация
     pub day_start: Option<u64>,     // Unix timestamp начала дня
     /// Секунды за текущий календарный день (для "Today" display). После rollover — только время с полуночи.
     pub today_seconds: u64,
     /// true если таймер был восстановлен из RUNNING как PAUSED после перезапуска (показать уведомление)
     #[serde(default)]
     pub restored_from_running: bool,
+    /// Причина перехода: None = ручной, Some("sleep") = sleep detection, Some("idle") = idle pause
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Упрощенная версия TimerState для API (без Instant)
@@ -71,6 +79,7 @@ impl TimerEngine {
             day_start_timestamp: Arc::new(Mutex::new(None)),
             db: None,
             restored_from_running: Arc::new(Mutex::new(false)),
+            last_transition_reason: Arc::new(Mutex::new(None)),
         }
     }
 }

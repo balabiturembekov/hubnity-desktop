@@ -1,24 +1,29 @@
 #[allow(unused_imports)] // Local используется в тестах
 use chrono::{Local, Utc};
-use tauri::{AppHandle, Manager, Listener};
+use std::panic;
+use std::sync::OnceLock;
+use tauri::{AppHandle, Emitter, Listener, Manager};
 use tracing::{debug, error, info, warn};
-mod commands;
-mod engine;
-mod sync;
 mod auth;
+mod commands;
 mod database;
-mod monitor;
+mod engine;
 mod models;
+mod monitor;
 mod network;
+mod sync;
+use crate::engine::TimerEngine;
+use crate::monitor::ActivityMonitor;
+use crate::sync::SyncManager;
+pub use crate::sync::TaskPriority;
+use commands::*;
 pub use database::Database;
 pub use network::check_online_status;
 pub use network::{extract_domain, extract_url_from_title};
-use commands::*;
-use crate::engine::{TimerEngine};
-use crate::sync::SyncManager;
-pub use crate::sync::TaskPriority;
-use crate::monitor::ActivityMonitor;
 use std::sync::Arc;
+
+/// Panic recovery: persist TimerState when a non-fatal panic occurs.
+static PANIC_ENGINE: OnceLock<Arc<TimerEngine>> = OnceLock::new();
 
 #[cfg(test)]
 mod tests;
@@ -31,7 +36,6 @@ struct SyncStatusResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     last_sync_at: Option<i64>,
 }
-
 
 // ============================================
 // SYSTEM SLEEP / WAKE HANDLING
@@ -53,6 +57,19 @@ fn setup_sleep_wake_handlers(_app: AppHandle, engine: Arc<TimerEngine>) -> Resul
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Panic recovery: attempt to persist TimerState before panic unwinds
+    let default_hook = panic::take_hook();
+    panic::set_hook(Box::new(move |info| {
+        if let Some(engine) = PANIC_ENGINE.get() {
+            if let Err(e) = engine.save_state() {
+                eprintln!("[PANIC_RECOVERY] Failed to persist timer state: {}", e);
+            } else {
+                eprintln!("[PANIC_RECOVERY] Timer state persisted before panic");
+            }
+        }
+        default_hook(info);
+    }));
+
     // Инициализация логирования: по умолчанию info (если RUST_LOG не задан), чтобы [AUTH]/[SYNC] были видны
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -63,6 +80,13 @@ pub fn run() {
 
     #[cfg(desktop)]
     let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            // Focus existing window when user tries to launch second instance
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.show();
+                let _ = win.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_cors_fetch::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
@@ -90,13 +114,19 @@ pub fn run() {
                 )
             })?;
             std::fs::create_dir_all(&app_data_dir).map_err(|e| {
+                let kind = e.kind();
+                let msg = match kind {
+                    std::io::ErrorKind::PermissionDenied => {
+                        "Permission denied. Check app data directory is writable."
+                    }
+                    std::io::ErrorKind::StorageFull => {
+                        "Disk full. Free space on drive."
+                    }
+                    _ => "Failed to create app data directory.",
+                };
                 std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!(
-                        "Failed to create app data directory at {}: {}",
-                        app_data_dir.display(),
-                        e
-                    ),
+                    kind,
+                    format!("{} Path: {} — {}", msg, app_data_dir.display(), e),
                 )
             })?;
 
@@ -110,16 +140,54 @@ pub fn run() {
                     ),
                 )
             })?;
-            let db = Arc::new(Database::new(db_path_str).map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to initialize database: {}", e),
-                )
-            })?);
+
+            // Auto-recovery from corrupted DB: on integrity/corruption failure, backup and retry once
+            let db = match Database::new(db_path_str) {
+                Ok(d) => Arc::new(d),
+                Err(e) => {
+                    let err_str = e.to_string();
+                    let is_corruption =
+                        err_str.contains("corruption") || err_str.contains("integrity");
+                    if !is_corruption || !db_path.exists() {
+                        return Err(Box::new(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("Failed to initialize database: {}", e),
+                        )));
+                    }
+                    let backup_path = app_data_dir.join(format!(
+                        "hubnity.db.corrupted.{}",
+                        chrono::Utc::now().timestamp()
+                    ));
+                    if let Err(rename_e) = std::fs::rename(&db_path, &backup_path) {
+                        warn!(
+                            "[DB] Failed to rename corrupted DB to {:?}: {}",
+                            backup_path, rename_e
+                        );
+                        return Err(Box::new(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("Database corrupted and could not backup: {}", e),
+                        )));
+                    }
+                    info!(
+                        "[DB] Corrupted DB backed up to {:?}, starting fresh",
+                        backup_path
+                    );
+                    let _ = app.handle().emit("db-recovered-from-corruption", ());
+                    Arc::new(Database::new(db_path_str).map_err(|e2| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("Failed to create fresh database: {}", e2),
+                        )
+                    })?)
+                }
+            };
 
             // Инициализируем TimerEngine с БД
             let engine = TimerEngine::with_db(db.clone());
             let engine_arc = Arc::new(engine);
+
+            // Panic recovery: register engine for persist-on-panic
+            let _ = PANIC_ENGINE.set(engine_arc.clone());
 
             // Настраиваем обработчики sleep/wake (не сохраняет ссылку на engine)
             setup_sleep_wake_handlers(app.handle().clone(), engine_arc.clone())?;
@@ -208,8 +276,12 @@ pub fn run() {
             // ДОКАЗАНО: Tauri State может работать с Arc<TimerEngine>, так как Arc: Send + Sync
             app.manage(engine_arc);
 
-            // Инициализируем SyncManager
-            let sync_manager = SyncManager::new(db.clone());
+            // Инициализируем SyncManager (с app_version для X-App-Version header)
+            let sync_config = crate::sync::SyncConfig {
+                app_version: app.package_info().version.to_string(),
+                ..Default::default()
+            };
+            let sync_manager = SyncManager::new_with_config(db.clone(), sync_config);
             // CRITICAL FIX: Сохраняем ссылку на sync_manager ДО manage(), чтобы фоновая задача использовала тот же экземпляр
             let sync_manager_bg = sync_manager.clone();
             app.manage(sync_manager);
@@ -234,9 +306,12 @@ pub fn run() {
                     
                     // ДОКАЗАНО: Если block_on паникует или завершается, цикл перезапустит runtime
                     let _result = rt.block_on(async {
-                        // PRODUCTION: Увеличиваем задержку для восстановления токенов из localStorage
-                        // Frontend восстанавливает токены при монтировании, нужно дать время
-                        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                        // PRODUCTION: Base delay for token recovery + network jitter (1-3s).
+                        // Prevents slamming API server on app start or wake from sleep.
+                        let base_secs = 10;
+                        let jitter_ms: u64 = rand::random::<u32>() as u64 % 2000 + 1000;
+                        let total_ms = base_secs * 1000 + jitter_ms;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(total_ms)).await;
 
                         info!("[SYNC] Starting background sync task");
                         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60)); // Каждую минуту
@@ -284,6 +359,7 @@ pub fn run() {
             sync_queue_now,
             get_sync_status,
             get_sync_queue_stats,
+            clear_sync_queue,
             mark_task_sent_by_id,
             get_failed_tasks,
             retry_failed_tasks,
@@ -311,10 +387,10 @@ pub fn run() {
             enqueue_time_entry,
             show_notification,
             update_tray_time,
+            get_tray_icon_path,
             log_message,
             show_idle_window,
             hide_idle_window,
-            update_idle_time,
             resume_tracking_from_idle,
             stop_tracking_from_idle,
             update_idle_state,

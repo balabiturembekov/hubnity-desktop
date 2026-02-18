@@ -5,6 +5,11 @@ use chrono::{Local, Utc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
 
+#[cfg(target_os = "windows")]
+fn get_tick64_ms() -> u64 {
+    unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() }
+}
+
 impl TimerEngine {
     /// Порог для sleep detection (минуты) — из app_meta или default 5
     fn get_sleep_gap_threshold_seconds(&self) -> u64 {
@@ -32,6 +37,11 @@ impl TimerEngine {
                 drop(state); // Освобождаем lock перед вызовом pause()
 
                 info!("[SLEEP] System sleep detected, pausing timer");
+
+                // Устанавливаем reason для фронта (shouldSkipStalePaused не должен скипать sleep)
+                if let Ok(mut r) = self.last_transition_reason.lock() {
+                    *r = Some("sleep".to_string());
+                }
 
                 // Используем существующий метод pause() для корректного перехода FSM
                 self.pause()?;
@@ -112,6 +122,8 @@ impl TimerEngine {
                 *state = TimerState::Running {
                     started_at_ms: now_ms,
                     started_at_instant: now_instant,
+                    #[cfg(target_os = "windows")]
+                    started_at_tick64_ms: get_tick64_ms(),
                 };
                 drop(state); // Освобождаем lock перед сохранением
 
@@ -139,6 +151,8 @@ impl TimerEngine {
                 *state = TimerState::Running {
                     started_at_ms: now_ms,
                     started_at_instant: now_instant,
+                    #[cfg(target_os = "windows")]
+                    started_at_tick64_ms: get_tick64_ms(),
                 };
                 drop(state); // Освобождаем lock перед сохранением
 
@@ -174,6 +188,9 @@ impl TimerEngine {
     /// Переход: Running → Paused при idle (исключаем время простоя)
     /// work_elapsed_secs — реальное время работы до lastActivityTime (без 2 мин простоя)
     pub fn pause_with_work_elapsed(&self, work_elapsed_secs: u64) -> Result<(), String> {
+        if let Ok(mut r) = self.last_transition_reason.lock() {
+            *r = Some("idle".to_string());
+        }
         self.pause_internal(Some(work_elapsed_secs))
     }
 
@@ -188,19 +205,25 @@ impl TimerEngine {
 
         match &*state {
             TimerState::Running {
-                started_at_ms,
                 started_at_instant,
+                #[cfg(target_os = "windows")]
+                started_at_tick64_ms,
                 ..
             } => {
                 // Допустимый переход: Running → Paused
+                // TIME MANIPULATION: Use ONLY monotonic clocks for accumulated increment.
+                // Immune to NTP sync, manual clock changes. macOS: Instant. Windows: GetTickCount64 (sleep-aware).
                 let now = Instant::now();
                 let monotonic_elapsed = now.duration_since(*started_at_instant).as_secs();
-                let now_wall_ms = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                let wall_elapsed = now_wall_ms.saturating_sub(*started_at_ms) / 1000;
-                let base_elapsed = wall_elapsed.min(monotonic_elapsed); // min для sleep protection
+                #[cfg(target_os = "windows")]
+                let awake_elapsed = {
+                    let tick64_now = get_tick64_ms();
+                    tick64_now.saturating_sub(*started_at_tick64_ms) / 1000
+                };
+                #[cfg(target_os = "windows")]
+                let base_elapsed = monotonic_elapsed.min(awake_elapsed); // GetTick64 doesn't tick during sleep
+                #[cfg(not(target_os = "windows"))]
+                let base_elapsed = monotonic_elapsed; // Instant doesn't tick during sleep on macOS
                 let session_elapsed = match work_elapsed_override {
                     Some(work) => {
                         // Idle pause: используем только время до lastActivityTime
@@ -295,6 +318,8 @@ impl TimerEngine {
                 *state = TimerState::Running {
                     started_at_ms: now_ms,
                     started_at_instant: now_instant,
+                    #[cfg(target_os = "windows")]
+                    started_at_tick64_ms: get_tick64_ms(),
                 };
                 drop(state); // Освобождаем lock перед сохранением
 
@@ -341,19 +366,23 @@ impl TimerEngine {
 
         match &*state {
             TimerState::Running {
-                started_at_ms,
                 started_at_instant,
+                #[cfg(target_os = "windows")]
+                started_at_tick64_ms,
                 ..
             } => {
                 // Допустимый переход: Running → Stopped
+                // TIME MANIPULATION: Use ONLY monotonic clocks for accumulated increment.
                 let now = Instant::now();
                 let monotonic_elapsed = now.duration_since(*started_at_instant).as_secs();
-                let now_wall_ms = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                let wall_elapsed = now_wall_ms.saturating_sub(*started_at_ms) / 1000;
-                let session_elapsed = wall_elapsed.min(monotonic_elapsed); // min для sleep protection
+                #[cfg(target_os = "windows")]
+                let session_elapsed = {
+                    let tick64_now = get_tick64_ms();
+                    let awake = tick64_now.saturating_sub(*started_at_tick64_ms) / 1000;
+                    monotonic_elapsed.min(awake)
+                };
+                #[cfg(not(target_os = "windows"))]
+                let session_elapsed = monotonic_elapsed;
 
                 // CRITICAL FIX: Вычисляем новый accumulated БЕЗ обновления в памяти
                 let new_accumulated = {
@@ -475,30 +504,46 @@ impl TimerEngine {
         // Расчет elapsed только для RUNNING состояния
         // Только wall clock (SystemTime) — синхронно с системным временем и Hubstaff.
         // Буфер 150ms: показываем секунду N только после N.15 (Stack Overflow — избежать «опережения»).
-        let (elapsed_seconds, session_start, session_start_ms, needs_sleep_handling) = match &*state {
+        let (elapsed_seconds, session_start, session_start_ms, needs_sleep_handling) = match &*state
+        {
             TimerState::Running {
                 started_at_ms,
                 started_at_instant,
+                #[cfg(target_os = "windows")]
+                started_at_tick64_ms,
+                ..
             } => {
                 let now = Instant::now();
                 let now_wall_ms = (now_wall_f64 * 1000.0) as u64;
-                let monotonic_elapsed = now.duration_since(*started_at_instant).as_secs();
                 let wall_elapsed = (now_wall_ms.saturating_sub(*started_at_ms) / 1000) as u64;
                 let wall_elapsed_f64 = (now_wall_f64 - (*started_at_ms as f64) / 1000.0).max(0.0);
 
-                // Sleep detection: реальный сон = разрыв между wall-clock и monotonic.
-                // Порог настраивается через app_meta "sleep_gap_threshold_minutes" (default 5)
+                // Sleep detection: разрыв wall-clock vs «время без сна».
+                // macOS: monotonic (Instant) не тикает во сне.
+                // Windows: GetTickCount64 не тикает во сне (QPC/Instant тикает).
                 let threshold_secs = self.get_sleep_gap_threshold_seconds();
-                let is_sleep = wall_elapsed > monotonic_elapsed
-                    && (wall_elapsed - monotonic_elapsed) >= threshold_secs;
+                #[cfg(target_os = "windows")]
+                let awake_elapsed_secs = {
+                    let tick64_now = get_tick64_ms();
+                    let tick64_elapsed_ms = tick64_now.saturating_sub(*started_at_tick64_ms);
+                    tick64_elapsed_ms / 1000
+                };
+                #[cfg(not(target_os = "windows"))]
+                let awake_elapsed_secs = now.duration_since(*started_at_instant).as_secs();
+                let is_sleep = wall_elapsed > awake_elapsed_secs
+                    && (wall_elapsed - awake_elapsed_secs) >= threshold_secs;
 
                 // Буфер 1.15s — устраняет опережение на 1с (Hubnity 34 при системных 33)
-                let displayed_elapsed =
-                    ((wall_elapsed_f64 - 1.15).floor().max(0.0)) as u64;
+                let displayed_elapsed = ((wall_elapsed_f64 - 1.15).floor().max(0.0)) as u64;
 
                 // Защита от переполнения при вычислении elapsed_seconds
                 let elapsed = accumulated.saturating_add(displayed_elapsed);
-                (elapsed, Some(*started_at_ms / 1000), Some(*started_at_ms), is_sleep)
+                (
+                    elapsed,
+                    Some(*started_at_ms / 1000),
+                    Some(*started_at_ms),
+                    is_sleep,
+                )
             }
             TimerState::Paused | TimerState::Stopped => {
                 // В PAUSED и STOPPED показываем только accumulated
@@ -509,6 +554,7 @@ impl TimerEngine {
         // Если обнаружен sleep (большой пропуск времени), вызываем handle_system_sleep для паузы
         if needs_sleep_handling {
             drop(state);
+            info!("[SLEEP_DETECTION] Sleep detected (gap or long session), pausing timer");
             if let Err(e) = self.handle_system_sleep() {
                 warn!("[SLEEP_DETECTION] handle_system_sleep failed: {}", e);
             }
@@ -532,6 +578,15 @@ impl TimerEngine {
             .lock()
             .map(|f| *f)
             .unwrap_or(false);
+
+        // Читаем и очищаем reason (одноразовое для фронта)
+        let reason = {
+            if let Ok(mut r) = self.last_transition_reason.lock() {
+                std::mem::take(&mut *r)
+            } else {
+                None
+            }
+        };
 
         // today_seconds: для "Today" display. При rollover (started_at_ms/1000 == day_start) — только время с полуночи.
         // Буфер 1.15s как у elapsed — иначе today_seconds может опережать elapsed и ломать today <= elapsed.
@@ -561,6 +616,7 @@ impl TimerEngine {
             day_start,
             today_seconds,
             restored_from_running,
+            reason,
         })
     }
 
@@ -664,6 +720,7 @@ impl TimerEngine {
                     TimerState::Running {
                         started_at_ms,
                         started_at_instant,
+                        ..
                     } => (*started_at_ms, *started_at_instant),
                     _ => {
                         drop(state);
@@ -764,8 +821,7 @@ impl TimerEngine {
             // Hubstaff-style: НЕ останавливаем таймер — обнуляем Today и продолжаем.
             // Сохраняем accumulated = time_until_midnight для полной длительности при stop.
             let elapsed_in_new_day = now_system.saturating_sub(old_day_end);
-            let new_started_at_instant =
-                Instant::now() - Duration::from_secs(elapsed_in_new_day);
+            let new_started_at_instant = Instant::now() - Duration::from_secs(elapsed_in_new_day);
 
             let mut state = self
                 .state
@@ -774,12 +830,12 @@ impl TimerEngine {
             *state = TimerState::Running {
                 started_at_ms: old_day_end * 1000,
                 started_at_instant: new_started_at_instant,
+                #[cfg(target_os = "windows")]
+                started_at_tick64_ms: get_tick64_ms(),
             };
             drop(state);
 
-            info!(
-                "[DAY_ROLLOVER] Timer continues running (Hubstaff-style), Today reset"
-            );
+            info!("[DAY_ROLLOVER] Timer continues running (Hubstaff-style), Today reset");
         }
 
         // Обнуляем accumulated_seconds для нового дня (только если НЕ was_running)

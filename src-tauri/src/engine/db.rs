@@ -72,6 +72,7 @@ impl TimerEngine {
             day_start_timestamp: Arc::new(Mutex::new(None)),
             db: Some(db),
             restored_from_running: Arc::new(Mutex::new(false)),
+            last_transition_reason: Arc::new(Mutex::new(None)),
         };
 
         // Восстанавливаем состояние из БД

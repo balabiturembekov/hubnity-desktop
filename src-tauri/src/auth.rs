@@ -5,6 +5,8 @@ use aes_gcm::{
 
 use crate::models::TokenRefreshResult;
 use std::fmt;
+use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -95,9 +97,13 @@ impl AuthManager {
     }
 
     /// Обновить токен через refresh token
-    pub async fn refresh_token(&self, refresh_token: &str) -> Result<TokenRefreshResult, AuthError> {
+    pub async fn refresh_token(
+        &self,
+        refresh_token: &str,
+    ) -> Result<TokenRefreshResult, AuthError> {
         let url = format!("{}/auth/refresh", self.api_base_url);
-        let response = self.client
+        let response = self
+            .client
             .post(&url)
             .header("Content-Type", "application/json")
             .json(&serde_json::json!({
@@ -143,20 +149,16 @@ pub struct TokenEncryption {
     cipher: Aes256Gcm,
 }
 
+const KEYRING_SERVICE: &str = "com.balabiturembek.hubnity";
+const KEYRING_USER: &str = "encryption_key";
+
 impl TokenEncryption {
-    /// Создать новый экземпляр с ключом из переменной окружения или дефолтным
-    /// В production должен использовать Keychain (macOS) или другой secure storage
-    pub fn new() -> Result<Self, String> {
-        // TODO: В production использовать Keychain для хранения ключа
-        // Для сейчас используем дефолтный ключ (НЕ БЕЗОПАСНО для production!)
-        let key = std::env::var("HUBNITY_ENCRYPTION_KEY")
-            .ok()
-            .and_then(|k| hex::decode(k).ok())
-            .unwrap_or_else(|| {
-                // Дефолтный ключ (32 байта) - НЕ БЕЗОПАСНО для production!
-                // Используем точно 32 байта
-                b"default-encryption-key-32-bytes!".to_vec()
-            });
+    /// Создать новый экземпляр с ключом из:
+    /// 1. HUBNITY_ENCRYPTION_KEY (hex) env var
+    /// 2. OS Keychain (macOS) / Credential Manager (Windows) / Secret Service (Linux)
+    /// 3. Fallback: randomly generated key stored in app_data_dir (never hardcoded)
+    pub fn new(app_data_dir: Option<&Path>) -> Result<Self, String> {
+        let key = Self::resolve_encryption_key(app_data_dir)?;
 
         if key.len() != 32 {
             return Err("Encryption key must be 32 bytes".to_string());
@@ -169,6 +171,78 @@ impl TokenEncryption {
         let cipher = Aes256Gcm::new(&key_array.into());
 
         Ok(Self { cipher })
+    }
+
+    fn resolve_encryption_key(app_data_dir: Option<&Path>) -> Result<Vec<u8>, String> {
+        // 1. Env var (hex) - for CI/deployment override
+        if let Ok(env_key) = std::env::var("HUBNITY_ENCRYPTION_KEY") {
+            if let Ok(decoded) = hex::decode(env_key.trim()) {
+                if decoded.len() == 32 {
+                    return Ok(decoded);
+                }
+            }
+        }
+
+        // 2. Fallback file only — keychain disabled on macOS (causes repeated prompts even with "Always Allow")
+        // File is in app_data_dir, protected by OS. Zero keychain prompts.
+        if let Some(dir) = app_data_dir {
+            if let Ok(key) = Self::get_key_from_fallback_file(dir) {
+                return Ok(key);
+            }
+            if let Ok(key) = Self::create_fallback_key_only(dir) {
+                return Ok(key);
+            }
+        }
+
+        Err(
+            "Encryption key unavailable: set HUBNITY_ENCRYPTION_KEY (hex), or ensure app data dir is writable".to_string(),
+        )
+    }
+
+    /// Read key from fallback file (no keychain access)
+    fn get_key_from_fallback_file(app_data_dir: &Path) -> Result<Vec<u8>, String> {
+        let key_file = app_data_dir.join(".hubnity_encryption_key");
+        if !key_file.exists() {
+            return Err("Fallback key file does not exist".to_string());
+        }
+        let hex_key =
+            fs::read_to_string(&key_file).map_err(|e| format!("Failed to read key file: {}", e))?;
+        let key = hex::decode(hex_key.trim()).map_err(|e| format!("Invalid key hex: {}", e))?;
+        if key.len() == 32 {
+            Ok(key)
+        } else {
+            Err("Key file invalid length".to_string())
+        }
+    }
+
+    /// Create new key and save to fallback file only (avoids keychain prompt loop on macOS)
+    fn create_fallback_key_only(app_data_dir: &Path) -> Result<Vec<u8>, String> {
+        let key_file = app_data_dir.join(".hubnity_encryption_key");
+        let key: [u8; 32] = rand::random();
+        let hex_key = hex::encode(key);
+        fs::write(&key_file, hex_key).map_err(|e| format!("Failed to write key file: {}", e))?;
+        Ok(key.to_vec())
+    }
+
+    #[allow(dead_code)]
+    fn get_key_from_keyring() -> Result<Vec<u8>, String> {
+        use keyring::Entry;
+        let entry = Entry::new(KEYRING_SERVICE, KEYRING_USER)
+            .map_err(|e| format!("Keyring entry creation failed: {}", e))?;
+        let hex_key = entry
+            .get_password()
+            .map_err(|e| format!("Keyring get failed: {}", e))?;
+        hex::decode(hex_key.trim()).map_err(|e| format!("Key hex decode failed: {}", e))
+    }
+
+    #[allow(dead_code)]
+    fn set_key_in_keyring(key: &[u8]) -> Result<(), String> {
+        use keyring::Entry;
+        let entry = Entry::new(KEYRING_SERVICE, KEYRING_USER)
+            .map_err(|e| format!("Keyring entry creation failed: {}", e))?;
+        entry
+            .set_password(&hex::encode(key))
+            .map_err(|e| format!("Keyring set failed: {}", e))
     }
 
     /// Зашифровать токен
@@ -210,5 +284,46 @@ impl TokenEncryption {
 
         String::from_utf8(plaintext).map_err(|e| format!("UTF-8 decode failed: {}", e))
     }
-}
 
+    /// Расшифровать с миграцией: при неудаче пробует legacy-ключ.
+    /// Возвращает (plaintext, true) если использован legacy — вызывающий код должен перешифровать и сохранить.
+    pub fn decrypt_with_legacy_fallback(&self, encrypted: &str) -> Result<(String, bool), String> {
+        match self.decrypt(encrypted) {
+            Ok(plaintext) => Ok((plaintext, false)),
+            Err(_) => {
+                if let Ok(plaintext) = Self::legacy_decrypt(encrypted) {
+                    tracing::warn!(
+                        "[AUTH] Migration: decrypted with legacy key, re-encrypt recommended"
+                    );
+                    Ok((plaintext, true))
+                } else {
+                    Err("Decryption failed with both current and legacy keys".to_string())
+                }
+            }
+        }
+    }
+
+    /// Расшифровать legacy-данные (pre-keyring ключ)
+    fn legacy_decrypt(encrypted: &str) -> Result<String, String> {
+        use base64::{engine::general_purpose, Engine as _};
+        let data = general_purpose::STANDARD
+            .decode(encrypted)
+            .map_err(|e| format!("Base64 decode failed: {}", e))?;
+
+        if data.len() < 12 {
+            return Err("Invalid encrypted data length".to_string());
+        }
+
+        let legacy_key: [u8; 32] = *b"default-encryption-key-32-bytes!";
+        let legacy_cipher = Aes256Gcm::new(&legacy_key.into());
+
+        let nonce = Nonce::from_slice(&data[..12]);
+        let ciphertext = &data[12..];
+
+        let plaintext = legacy_cipher
+            .decrypt(nonce, ciphertext)
+            .map_err(|e| format!("Legacy decryption failed: {}", e))?;
+
+        String::from_utf8(plaintext).map_err(|e| format!("UTF-8 decode failed: {}", e))
+    }
+}
