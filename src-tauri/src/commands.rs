@@ -15,35 +15,53 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tracing::{debug, error, info, warn};
 
 /// Activity detection constants and logic (testable).
+/// Aligned with Hubstaff: fixed 5s poll, 60s threshold, jitter buffer (2 consecutive checks).
 pub(crate) mod activity_emit {
     use std::time::{Duration, Instant};
 
-    pub const ACTIVITY_THRESHOLD: Duration = Duration::from_secs(5);
+    /// Idle below this = Active. 60s matches Hubstaff, filters micro-events (bumped desk, cat).
+    pub const IDLE_THRESHOLD_SECS: u64 = 60;
+    pub const IDLE_THRESHOLD: Duration = Duration::from_secs(IDLE_THRESHOLD_SECS);
+
+    /// Min interval between activity-detected emits (rate limit).
     pub const MIN_EMIT_INTERVAL: Duration = Duration::from_secs(10);
 
-    /// Returns true if we should emit activity-detected: idle < threshold and enough time since last emit.
-    pub fn should_emit(idle_duration: Duration, last_emit_time: Instant) -> bool {
-        idle_duration < ACTIVITY_THRESHOLD
-            && Instant::now().duration_since(last_emit_time) >= MIN_EMIT_INTERVAL
+    /// Fixed poll interval (5s) — reduces load, aligns with Hubstaff.
+    pub const POLL_INTERVAL_SECS: u64 = 5;
+    pub const POLL_INTERVAL: Duration = Duration::from_secs(POLL_INTERVAL_SECS);
+
+    /// Jitter buffer: Active only if idle < threshold for TWO consecutive checks.
+    /// Returns (should_emit, is_currently_active).
+    pub fn should_emit_with_jitter(
+        prev_idle: Option<Duration>,
+        current_idle: Duration,
+        last_emit_time: Instant,
+    ) -> (bool, bool) {
+        let prev_active = prev_idle.map_or(false, |p| p < IDLE_THRESHOLD);
+        let current_active = current_idle < IDLE_THRESHOLD;
+        let interval_ok = Instant::now().duration_since(last_emit_time) >= MIN_EMIT_INTERVAL;
+        let should_emit = prev_active && current_active && interval_ok;
+        (should_emit, current_active)
     }
 
-    /// Adaptive poll interval for battery: poll less often when user is away.
-    /// < 4 min -> 1s; 4-15 min -> 5s; > 15 min -> 10s.
-    pub fn adaptive_sleep_duration(idle_duration: Duration) -> Duration {
-        if idle_duration >= Duration::from_secs(15 * 60) {
-            Duration::from_secs(10)
-        } else if idle_duration >= Duration::from_secs(4 * 60) {
-            Duration::from_secs(5)
-        } else {
-            Duration::from_secs(1)
-        }
+    /// Fixed poll interval (configurable via constant).
+    pub fn poll_interval() -> Duration {
+        POLL_INTERVAL
+    }
+
+    #[cfg(test)]
+    /// Legacy: single-check emit (used only in tests).
+    pub fn should_emit(idle_duration: Duration, last_emit_time: Instant) -> bool {
+        idle_duration < IDLE_THRESHOLD
+            && Instant::now().duration_since(last_emit_time) >= MIN_EMIT_INTERVAL
     }
 }
 
 #[cfg(test)]
 mod activity_emit_tests {
     use super::activity_emit::{
-        adaptive_sleep_duration, should_emit, ACTIVITY_THRESHOLD, MIN_EMIT_INTERVAL,
+        poll_interval, should_emit, should_emit_with_jitter, IDLE_THRESHOLD, MIN_EMIT_INTERVAL,
+        POLL_INTERVAL,
     };
     use std::time::{Duration, Instant};
 
@@ -57,8 +75,8 @@ mod activity_emit_tests {
     #[test]
     fn test_should_not_emit_idle_above_threshold() {
         let last_emit = Instant::now() - MIN_EMIT_INTERVAL - Duration::from_secs(1);
-        assert!(!should_emit(Duration::from_secs(5), last_emit));
-        assert!(!should_emit(Duration::from_secs(10), last_emit));
+        assert!(!should_emit(Duration::from_secs(60), last_emit));
+        assert!(!should_emit(Duration::from_secs(120), last_emit));
     }
 
     #[test]
@@ -70,57 +88,55 @@ mod activity_emit_tests {
     #[test]
     fn test_threshold_boundary() {
         let last_emit = Instant::now() - MIN_EMIT_INTERVAL - Duration::from_secs(1);
-        // 4s < 5s — активность, emit
-        assert!(should_emit(Duration::from_secs(4), last_emit));
-        // 5s >= 5s — порог, не emit
-        assert!(!should_emit(Duration::from_secs(5), last_emit));
-        // 4.999s < 5s — emit
-        assert!(should_emit(Duration::from_millis(4999), last_emit));
+        assert!(should_emit(Duration::from_secs(59), last_emit));
+        assert!(!should_emit(Duration::from_secs(60), last_emit));
+        assert!(should_emit(Duration::from_millis(59999), last_emit));
     }
 
     #[test]
     fn test_interval_boundary() {
         let idle = Duration::from_secs(2);
-        // 9s с прошлого emit — ещё рано
         let last_emit_9s = Instant::now() - Duration::from_secs(9);
         assert!(!should_emit(idle, last_emit_9s));
-        // 10s — можно emit
         let last_emit_10s = Instant::now() - MIN_EMIT_INTERVAL;
         assert!(should_emit(idle, last_emit_10s));
     }
 
     #[test]
     fn test_constants() {
-        assert_eq!(ACTIVITY_THRESHOLD, Duration::from_secs(5));
+        assert_eq!(IDLE_THRESHOLD, Duration::from_secs(60));
         assert_eq!(MIN_EMIT_INTERVAL, Duration::from_secs(10));
+        assert_eq!(POLL_INTERVAL, Duration::from_secs(5));
     }
 
     #[test]
-    fn test_adaptive_sleep_duration() {
-        assert_eq!(
-            adaptive_sleep_duration(Duration::from_secs(0)),
-            Duration::from_secs(1)
+    fn test_poll_interval() {
+        assert_eq!(poll_interval(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_jitter_buffer_requires_two_consecutive_active() {
+        let last_emit = Instant::now() - MIN_EMIT_INTERVAL - Duration::from_secs(1);
+        // First check: no prev -> no emit even if current active
+        let (emit1, active1) = should_emit_with_jitter(None, Duration::from_secs(5), last_emit);
+        assert!(!emit1);
+        assert!(active1);
+        // Second check: prev active, current active -> emit
+        let (emit2, _) = should_emit_with_jitter(Some(Duration::from_secs(5)), Duration::from_secs(3), last_emit);
+        assert!(emit2);
+    }
+
+    #[test]
+    fn test_jitter_buffer_rejects_single_spike() {
+        let last_emit = Instant::now() - MIN_EMIT_INTERVAL - Duration::from_secs(1);
+        // Prev idle (user away), current briefly active (cat bump) -> no emit
+        let (emit, active) = should_emit_with_jitter(
+            Some(Duration::from_secs(120)),
+            Duration::from_secs(2),
+            last_emit,
         );
-        assert_eq!(
-            adaptive_sleep_duration(Duration::from_secs(3 * 60)),
-            Duration::from_secs(1)
-        );
-        assert_eq!(
-            adaptive_sleep_duration(Duration::from_secs(4 * 60)),
-            Duration::from_secs(5)
-        );
-        assert_eq!(
-            adaptive_sleep_duration(Duration::from_secs(10 * 60)),
-            Duration::from_secs(5)
-        );
-        assert_eq!(
-            adaptive_sleep_duration(Duration::from_secs(15 * 60)),
-            Duration::from_secs(10)
-        );
-        assert_eq!(
-            adaptive_sleep_duration(Duration::from_secs(60 * 60)),
-            Duration::from_secs(10)
-        );
+        assert!(!emit);
+        assert!(active);
     }
 }
 
@@ -128,9 +144,11 @@ mod activity_emit_tests {
 pub async fn start_activity_monitoring(
     monitor: State<'_, ActivityMonitor>,
     app: AppHandle,
+    engine: State<'_, Arc<TimerEngine>>,
 ) -> Result<(), String> {
     let is_monitoring = monitor.is_monitoring.clone();
     let last_activity = monitor.last_activity.clone();
+    let engine_clone = engine.inner().clone();
 
     // Use a single lock to check and set atomically to prevent race conditions
     {
@@ -159,12 +177,14 @@ pub async fn start_activity_monitoring(
         let is_monitoring_clone = is_monitoring.clone();
         let last_activity_clone = last_activity.clone();
         let app_clone = app.clone();
+        let engine_mac = engine_clone.clone();
 
         // Use system idle time instead of mouse position — more reliable, no false positives
         // when user is away (NSEvent.mouseLocation could drift due to Retina scaling, etc.)
         tokio::spawn(async move {
             use tauri::Emitter;
             let mut last_emit_time = Instant::now();
+            let mut prev_idle: Option<Duration> = None;
 
             loop {
                 {
@@ -187,25 +207,40 @@ pub async fn start_activity_monitoring(
                 let idle_duration = match idle_duration {
                     Some(d) => d,
                     None => {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        tokio::time::sleep(activity_emit::poll_interval()).await;
                         continue;
                     }
                 };
 
-                if activity_emit::should_emit(idle_duration, last_emit_time) {
+                let (should_emit, is_active) =
+                    activity_emit::should_emit_with_jitter(prev_idle, idle_duration, last_emit_time);
+                prev_idle = Some(idle_duration);
+
+                debug!(
+                    "[IDLE] System: {}s, Threshold: {}s, Status: {}",
+                    idle_duration.as_secs(),
+                    activity_emit::IDLE_THRESHOLD_SECS,
+                    if is_active { "Active" } else { "Idle" }
+                );
+
+                if should_emit {
+                    // WAKE: Suppress false "active" (idle 0) for 30s after sleep — get_idle_time resets
+                    let idle_secs = idle_duration.as_secs() as u32;
+                    if idle_secs == 0 && engine_mac.is_just_awoken() {
+                        tokio::time::sleep(activity_emit::poll_interval()).await;
+                        continue;
+                    }
                     let now = Instant::now();
                     if let Ok(mut last) = last_activity_clone.lock() {
                         *last = Instant::now();
                     }
-                    let idle_secs = idle_duration.as_secs() as u32;
-                    if let Err(e) = app_clone.emit("activity-detected", idle_secs) {
+                    if let Err(e) = app_clone.emit(crate::ipc::events::ACTIVITY_DETECTED, idle_secs) {
                         warn!("[ACTIVITY] Failed to emit activity-detected event: {:?}", e);
                     }
                     last_emit_time = now;
                 }
 
-                let sleep_duration = activity_emit::adaptive_sleep_duration(idle_duration);
-                tokio::time::sleep(sleep_duration).await;
+                tokio::time::sleep(activity_emit::poll_interval()).await;
             }
         });
     }
@@ -218,10 +253,12 @@ pub async fn start_activity_monitoring(
         let is_monitoring_clone = is_monitoring.clone();
         let last_activity_clone = last_activity.clone();
         let app_clone = app.clone();
+        let engine_win = engine_clone.clone();
 
         tokio::spawn(async move {
             use tauri::Emitter;
             let mut last_emit_time = Instant::now();
+            let mut prev_idle: Option<Duration> = None;
 
             loop {
                 {
@@ -244,25 +281,39 @@ pub async fn start_activity_monitoring(
                 let idle_duration = match idle_duration {
                     Some(d) => d,
                     None => {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        tokio::time::sleep(activity_emit::poll_interval()).await;
                         continue;
                     }
                 };
 
-                if activity_emit::should_emit(idle_duration, last_emit_time) {
+                let (should_emit, is_active) =
+                    activity_emit::should_emit_with_jitter(prev_idle, idle_duration, last_emit_time);
+                prev_idle = Some(idle_duration);
+
+                debug!(
+                    "[IDLE] System: {}s, Threshold: {}s, Status: {}",
+                    idle_duration.as_secs(),
+                    activity_emit::IDLE_THRESHOLD_SECS,
+                    if is_active { "Active" } else { "Idle" }
+                );
+
+                if should_emit {
+                    let idle_secs = idle_duration.as_secs() as u32;
+                    if idle_secs == 0 && engine_win.is_just_awoken() {
+                        tokio::time::sleep(activity_emit::poll_interval()).await;
+                        continue;
+                    }
                     let now = Instant::now();
                     if let Ok(mut last) = last_activity_clone.lock() {
                         *last = Instant::now();
                     }
-                    let idle_secs = idle_duration.as_secs() as u32;
-                    if let Err(e) = app_clone.emit("activity-detected", idle_secs) {
+                    if let Err(e) = app_clone.emit(crate::ipc::events::ACTIVITY_DETECTED, idle_secs) {
                         warn!("[ACTIVITY] Failed to emit activity-detected event: {:?}", e);
                     }
                     last_emit_time = now;
                 }
 
-                let sleep_duration = activity_emit::adaptive_sleep_duration(idle_duration);
-                tokio::time::sleep(sleep_duration).await;
+                tokio::time::sleep(activity_emit::poll_interval()).await;
             }
         });
     }
@@ -276,10 +327,12 @@ pub async fn start_activity_monitoring(
         let is_monitoring_clone = is_monitoring.clone();
         let last_activity_clone = last_activity.clone();
         let app_clone = app.clone();
+        let engine_linux = engine_clone.clone();
 
         tokio::spawn(async move {
             use tauri::Emitter;
             let mut last_emit_time = Instant::now();
+            let mut prev_idle: Option<Duration> = None;
 
             loop {
                 {
@@ -302,25 +355,39 @@ pub async fn start_activity_monitoring(
                 let idle_duration = match idle_duration {
                     Some(d) => d,
                     None => {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        tokio::time::sleep(activity_emit::poll_interval()).await;
                         continue;
                     }
                 };
 
-                if activity_emit::should_emit(idle_duration, last_emit_time) {
+                let (should_emit, is_active) =
+                    activity_emit::should_emit_with_jitter(prev_idle, idle_duration, last_emit_time);
+                prev_idle = Some(idle_duration);
+
+                debug!(
+                    "[IDLE] System: {}s, Threshold: {}s, Status: {}",
+                    idle_duration.as_secs(),
+                    activity_emit::IDLE_THRESHOLD_SECS,
+                    if is_active { "Active" } else { "Idle" }
+                );
+
+                if should_emit {
+                    let idle_secs = idle_duration.as_secs() as u32;
+                    if idle_secs == 0 && engine_linux.is_just_awoken() {
+                        tokio::time::sleep(activity_emit::poll_interval()).await;
+                        continue;
+                    }
                     let now = Instant::now();
                     if let Ok(mut last) = last_activity_clone.lock() {
                         *last = Instant::now();
                     }
-                    let idle_secs = idle_duration.as_secs() as u32;
-                    if let Err(e) = app_clone.emit("activity-detected", idle_secs) {
+                    if let Err(e) = app_clone.emit(crate::ipc::events::ACTIVITY_DETECTED, idle_secs) {
                         warn!("[ACTIVITY] Failed to emit activity-detected event: {:?}", e);
                     }
                     last_emit_time = now;
                 }
 
-                let sleep_duration = activity_emit::adaptive_sleep_duration(idle_duration);
-                tokio::time::sleep(sleep_duration).await;
+                tokio::time::sleep(activity_emit::poll_interval()).await;
             }
         });
     }
@@ -453,14 +520,11 @@ pub async fn enqueue_time_entry(
     Ok(queue_id)
 }
 
-#[tauri::command]
-pub async fn take_screenshot(_time_entry_id: String) -> Result<Vec<u8>, String> {
-    // PERFORMANCE: Capture, resize, and JPEG encode run on a dedicated thread pool.
-    // Prevents blocking the Tokio executor and main UI thread.
-    tokio::task::spawn_blocking(|| {
-        use image::{DynamicImage, ImageBuffer, Rgb, Rgba};
+/// Capture screenshot and encode as JPEG. Runs on blocking thread.
+fn capture_screenshot_jpeg() -> Result<Vec<u8>, String> {
+    use image::{DynamicImage, ImageBuffer, Rgb, Rgba};
 
-        let screens = screenshots::Screen::all().map_err(|e| {
+    let screens = screenshots::Screen::all().map_err(|e| {
         #[cfg(target_os = "macos")]
         let err_msg = format!(
             "Failed to get screens: {:?}. Please grant screen recording permission in System Settings -> Privacy & Security -> Screen Recording.",
@@ -475,24 +539,20 @@ pub async fn take_screenshot(_time_entry_id: String) -> Result<Vec<u8>, String> 
         err_msg
     })?;
 
-    // Check if we have any screens available
-        if screens.is_empty() {
-            error!("[SCREENSHOT ERROR] No screens available");
-            return Err("No screens available".to_string());
-        }
+    if screens.is_empty() {
+        error!("[SCREENSHOT ERROR] No screens available");
+        return Err("No screens available".to_string());
+    }
 
-        // Multi-monitor & DPI: Prefer primary display to avoid mixed-DPI distortion.
-        // Fallback to first screen if no primary.
-        let screen = screens
-            .iter()
-            .find(|s| s.display_info.is_primary)
-            .or_else(|| screens.first())
-            .ok_or_else(|| {
-                error!("[SCREENSHOT ERROR] No screen selected");
-                "No screens available (internal error)".to_string()
-            })?;
+    let screen = screens
+        .iter()
+        .find(|s| s.display_info.is_primary)
+        .or_else(|| screens.first())
+        .ok_or_else(|| {
+            error!("[SCREENSHOT ERROR] No screen selected");
+            "No screens available (internal error)".to_string()
+        })?;
 
-        // Capture screenshot
     let image = screen.capture().map_err(|e| {
         #[cfg(target_os = "macos")]
         let err_msg = format!(
@@ -508,11 +568,8 @@ pub async fn take_screenshot(_time_entry_id: String) -> Result<Vec<u8>, String> 
         err_msg
     })?;
 
-    // Get image dimensions and RGBA data
     let width = image.width();
     let height = image.height();
-
-    // Validate dimensions
     if width == 0 || height == 0 {
         error!(
             "[SCREENSHOT ERROR] Invalid screenshot dimensions: {}x{}",
@@ -521,45 +578,34 @@ pub async fn take_screenshot(_time_entry_id: String) -> Result<Vec<u8>, String> 
         return Err("Invalid screenshot dimensions".to_string());
     }
 
-    // Get RGBA buffer from image (this is a reference, no copy yet)
     let rgba_data = image.rgba();
-
-    // Create ImageBuffer from RGBA data - use as_raw() to avoid extra copy if possible
-    // But we need to convert to Vec<u8> for ImageBuffer
     let img_buffer: ImageBuffer<Rgba<u8>, Vec<u8>> =
         ImageBuffer::from_raw(width, height, rgba_data.to_vec()).ok_or_else(|| {
             error!("[SCREENSHOT ERROR] Failed to create ImageBuffer from RGBA data");
             "Failed to create ImageBuffer from RGBA data".to_string()
         })?;
 
-        // Resize for mixed DPI (Retina + external): physical pixels can be 2x.
-        // Target: max 1280x720, output < 300KB.
-        let max_width = 1280u32;
-        let max_height = 720u32;
+    let max_width = 1280u32;
+    let max_height = 720u32;
     let final_buffer = if width > max_width || height > max_height {
         info!(
             "[SCREENSHOT] Image too large ({}x{}), resizing to max {}x{}",
             width, height, max_width, max_height
         );
-
-        // Calculate new dimensions maintaining aspect ratio
         let aspect_ratio = width as f32 / height as f32;
         let (new_width, new_height) = if aspect_ratio > 1.0 {
-            // Landscape
             if width > max_width {
                 (max_width, (max_width as f32 / aspect_ratio) as u32)
             } else {
                 ((max_height as f32 * aspect_ratio) as u32, max_height)
             }
         } else {
-            // Portrait
             if height > max_height {
                 ((max_height as f32 * aspect_ratio) as u32, max_height)
             } else {
                 (max_width, (max_width as f32 / aspect_ratio) as u32)
             }
         };
-
         use image::imageops::resize;
         resize(
             &img_buffer,
@@ -571,52 +617,157 @@ pub async fn take_screenshot(_time_entry_id: String) -> Result<Vec<u8>, String> 
         img_buffer
     };
 
-    // Convert to JPEG for smaller file size (PNG is too large for nginx limit)
     let final_width = final_buffer.width();
     let final_height = final_buffer.height();
-
-    // Convert RGBA to RGB for JPEG (JPEG doesn't support alpha channel)
     let rgb_buffer: ImageBuffer<Rgb<u8>, Vec<u8>> =
         ImageBuffer::from_fn(final_width, final_height, |x, y| {
             let pixel = final_buffer.get_pixel(x, y);
             Rgb([pixel[0], pixel[1], pixel[2]])
         });
 
-        // Encode as JPEG with quality loop to stay under 300KB.
-        const MAX_JPEG_BYTES: usize = 300 * 1024;
-        let dynamic_img = DynamicImage::ImageRgb8(rgb_buffer);
-        let mut jpeg_bytes = Vec::new();
-        for quality in [85u8, 75, 60, 45, 30] {
-            jpeg_bytes.clear();
-            let mut cursor = std::io::Cursor::new(&mut jpeg_bytes);
-            let mut encoder =
-                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, quality);
-            encoder
-                .encode_image(&dynamic_img)
-                .map_err(|e| {
-                    let err_msg = format!("Failed to encode JPEG: {:?}", e);
-                    error!("[SCREENSHOT ERROR] {}", err_msg);
-                    err_msg
-                })?;
-            if jpeg_bytes.len() <= MAX_JPEG_BYTES {
-                break;
+    const MAX_JPEG_BYTES: usize = 300 * 1024;
+    let dynamic_img = DynamicImage::ImageRgb8(rgb_buffer);
+    let mut jpeg_bytes = Vec::new();
+    for quality in [85u8, 75, 60, 45, 30] {
+        jpeg_bytes.clear();
+        let mut cursor = std::io::Cursor::new(&mut jpeg_bytes);
+        let mut encoder =
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, quality);
+        encoder
+            .encode_image(&dynamic_img)
+            .map_err(|e| {
+                let err_msg = format!("Failed to encode JPEG: {:?}", e);
+                error!("[SCREENSHOT ERROR] {}", err_msg);
+                err_msg
+            })?;
+        if jpeg_bytes.len() <= MAX_JPEG_BYTES {
+            break;
+        }
+    }
+
+    if jpeg_bytes.is_empty() {
+        error!("[SCREENSHOT ERROR] Encoded JPEG data is empty");
+        return Err("Screenshot encoding produced empty result".to_string());
+    }
+
+    info!(
+        "[SCREENSHOT] Final JPEG size: {} bytes (target < 300KB)",
+        jpeg_bytes.len()
+    );
+    Ok(jpeg_bytes)
+}
+
+#[tauri::command]
+pub async fn take_screenshot(_time_entry_id: String) -> Result<Vec<u8>, String> {
+    tokio::task::spawn_blocking(capture_screenshot_jpeg)
+        .await
+        .map_err(|e| format!("Screenshot task panicked: {}", e))?
+}
+
+/// Captures screenshot to system temp directory via tauri::path API.
+/// Returns path to temp file. Use upload_screenshot_from_path to upload and delete.
+#[tauri::command]
+pub async fn take_screenshot_to_temp(
+    _time_entry_id: String,
+    app: AppHandle,
+) -> Result<String, String> {
+    use std::time::UNIX_EPOCH;
+    use tauri::path::BaseDirectory;
+    use tauri::Manager;
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| format!("System time error: {}", e))?
+        .as_millis();
+    let filename = format!("hubnity_screenshot_{}.jpg", now_ms);
+
+    let path = app
+        .path()
+        .resolve(&filename, BaseDirectory::Temp)
+        .map_err(|e| format!("Failed to resolve temp path: {}", e))?;
+
+    let bytes = tokio::task::spawn_blocking(capture_screenshot_jpeg)
+        .await
+        .map_err(|e| format!("Screenshot task panicked: {}", e))??;
+
+    tokio::fs::write(&path, &bytes)
+        .await
+        .map_err(|e| format!("Failed to write temp screenshot: {}", e))?;
+
+    Ok(path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub async fn upload_screenshot_from_path(
+    temp_path: String,
+    time_entry_id: String,
+    access_token: String,
+    refresh_token: Option<String>,
+    sync_manager: State<'_, SyncManager>,
+) -> Result<(), String> {
+    use std::path::Path;
+
+    let path = Path::new(&temp_path);
+
+    let result = async {
+        let data = tokio::fs::read(path)
+            .await
+            .map_err(|e| format!("Failed to read temp screenshot: {}", e))?;
+
+        if data.len() > MAX_SCREENSHOT_BODY_BYTES {
+            return Err(format!(
+                "Screenshot too large ({} bytes, max {} MB)",
+                data.len(),
+                MAX_SCREENSHOT_BODY_BYTES / (1024 * 1024)
+            ));
+        }
+
+        info!("[RUST] Enqueueing screenshot from path: {} bytes", data.len());
+        let queue_id =
+            sync_manager.enqueue_screenshot(data, time_entry_id, access_token, refresh_token)?;
+        info!("[RUST] Screenshot enqueued with ID: {}", queue_id);
+
+        match sync_manager.sync_queue(5).await {
+            Ok(count) => {
+                if count > 0 {
+                    info!("[RUST] Sync after screenshot: {} task(s) sent", count);
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "[RUST] Sync after screenshot failed (screenshot stays in queue): {}",
+                    e
+                );
             }
         }
+        Ok(())
+    }
+    .await;
 
-        if jpeg_bytes.is_empty() {
-            error!("[SCREENSHOT ERROR] Encoded JPEG data is empty");
-            return Err("Screenshot encoding produced empty result".to_string());
-        }
-
-        info!(
-            "[SCREENSHOT] Final JPEG size: {} bytes (target < 300KB)",
-            jpeg_bytes.len()
+    // Guaranteed cleanup: always try to remove temp file (remove_file returns Err if file is gone)
+    if let Err(e) = tokio::fs::remove_file(path).await {
+        debug!(
+            "[SCREENSHOT] Temp file remove (may already be gone): {} — {}",
+            path.display(),
+            e
         );
+    }
 
-        Ok(jpeg_bytes)
-    })
-    .await
-    .map_err(|e| format!("Screenshot task panicked: {}", e))?
+    result
+}
+
+/// Deletes a temp screenshot file when path-based upload is skipped (e.g. no accessToken).
+/// Prevents orphan files when fallback to bytes path is used.
+#[tauri::command]
+pub async fn delete_screenshot_temp_file(temp_path: String) -> Result<(), String> {
+    let path = std::path::Path::new(&temp_path);
+    if path.exists() {
+        tokio::fs::remove_file(path)
+            .await
+            .map_err(|e| format!("Failed to remove temp file: {}", e))?;
+        debug!("[SCREENSHOT] Orphan temp file removed: {}", path.display());
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -694,9 +845,22 @@ pub async fn show_idle_window(app: AppHandle) -> Result<(), String> {
         idle_window
             .center()
             .map_err(|e| format!("Failed to center idle window: {}", e))?;
-        idle_window
-            .set_focus()
-            .map_err(|e| format!("Failed to focus idle window: {}", e))?;
+        // macOS: set_focus can block when switching Spaces — run off main thread
+        #[cfg(target_os = "macos")]
+        {
+            let win = idle_window.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = win.set_focus() {
+                    tracing::warn!("[IDLE] set_focus failed (non-critical): {}", e);
+                }
+            });
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            idle_window
+                .set_focus()
+                .map_err(|e| format!("Failed to focus idle window: {}", e))?;
+        }
     } else {
         // Window doesn't exist - it should be created from config, but if not, we'll try to create it
         // In Tauri 2.0, windows are typically created from config, so this should not happen
@@ -735,7 +899,7 @@ pub async fn resume_tracking_from_idle(app: AppHandle) -> Result<(), String> {
     // Emit event to main window to resume tracking
     if let Some(main_window) = app.get_webview_window("main") {
         main_window
-            .emit("resume-tracking", ())
+            .emit(crate::ipc::events::RESUME_TRACKING, ())
             .map_err(|e| format!("Failed to emit resume event: {}", e))?;
     }
 
@@ -755,7 +919,7 @@ pub async fn stop_tracking_from_idle(app: AppHandle) -> Result<(), String> {
     // Emit event to main window to stop tracking
     if let Some(main_window) = app.get_webview_window("main") {
         main_window
-            .emit("stop-tracking", ())
+            .emit(crate::ipc::events::STOP_TRACKING, ())
             .map_err(|e| format!("Failed to emit stop event: {}", e))?;
     }
 
@@ -830,7 +994,7 @@ pub async fn update_idle_state(
     // Emit to idle window if it exists
     if let Some(idle_window) = app.get_webview_window("idle") {
         idle_window
-            .emit("idle-state-update", &payload)
+            .emit(crate::ipc::events::IDLE_STATE_UPDATE, &payload)
             .map_err(|e| format!("Failed to emit idle state update: {}", e))?;
     }
 
@@ -845,7 +1009,7 @@ pub async fn request_idle_state(app: AppHandle) -> Result<(), String> {
 
     if let Some(main_window) = app.get_webview_window("main") {
         main_window
-            .emit("request-idle-state-for-idle-window", ())
+            .emit(crate::ipc::events::REQUEST_IDLE_STATE, ())
             .map_err(|e| format!("Failed to emit request: {}", e))?;
     }
 

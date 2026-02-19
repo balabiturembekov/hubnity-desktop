@@ -21,6 +21,8 @@ pub struct TimerEngine {
     pub(crate) restored_from_running: Arc<Mutex<bool>>,
     /// Причина последнего перехода (sleep/idle) — читается и очищается в get_state
     pub(crate) last_transition_reason: Arc<Mutex<Option<String>>>,
+    /// Instant when sleep was last detected (for is_just_awoken grace period)
+    pub(crate) last_sleep_detected_at: Arc<Mutex<Option<std::time::Instant>>>,
 }
 /// Состояние таймера - строгая FSM
 /// Невозможные состояния физически невозможны
@@ -80,6 +82,7 @@ impl TimerEngine {
             db: None,
             restored_from_running: Arc::new(Mutex::new(false)),
             last_transition_reason: Arc::new(Mutex::new(None)),
+            last_sleep_detected_at: Arc::new(Mutex::new(None)),
         }
     }
 }

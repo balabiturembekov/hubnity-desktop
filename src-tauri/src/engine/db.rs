@@ -12,6 +12,33 @@ impl TimerEngine {
         self.save_state_with_accumulated_override(None)
     }
 
+    /// Сохранить в БД без мутации state (для pause/stop: save-first, rollback on failure)
+    pub(crate) fn save_pending_state(
+        &self,
+        accumulated: u64,
+        state_str: &str,
+        started_at: Option<u64>,
+    ) -> Result<(), String> {
+        let db = match &self.db {
+            Some(db) => db,
+            None => return Ok(()),
+        };
+        let day_start = *self
+            .day_start_timestamp
+            .lock()
+            .map_err(|e| format!("Mutex poisoned: {}", e))?;
+        let day = if let Some(day_start_ts) = day_start {
+            let utc_dt = chrono::DateTime::<Utc>::from_timestamp(day_start_ts as i64, 0)
+                .ok_or_else(|| "Invalid day_start timestamp".to_string())?;
+            utc_dt.with_timezone(&Local).format("%Y-%m-%d").to_string()
+        } else {
+            Local::now().format("%Y-%m-%d").to_string()
+        };
+        db.save_timer_state(&day, accumulated, state_str, started_at)
+            .map_err(|e| format!("Failed to save state to DB: {}", e))?;
+        Ok(())
+    }
+
     /// Сохранить состояние в БД с переопределением accumulated
     /// CRITICAL FIX: Используется для атомарного сохранения после pause/stop
     pub fn save_state_with_accumulated_override(
@@ -51,7 +78,7 @@ impl TimerEngine {
             Local::now().format("%Y-%m-%d").to_string()
         };
 
-        // Определяем строковое представление состояния и started_at_ms (миллисекунды для точной синхронизации)
+        // Определяем строковое представление состояния и started_at_ms
         let (state_str, started_at) = match &*state {
             TimerState::Stopped => ("stopped", None),
             TimerState::Running { started_at_ms, .. } => ("running", Some(*started_at_ms)),
@@ -73,6 +100,7 @@ impl TimerEngine {
             db: Some(db),
             restored_from_running: Arc::new(Mutex::new(false)),
             last_transition_reason: Arc::new(Mutex::new(None)),
+            last_sleep_detected_at: Arc::new(Mutex::new(None)),
         };
 
         // Восстанавливаем состояние из БД
@@ -103,9 +131,9 @@ impl TimerEngine {
                     // CRITICAL FIX: Если было running, добавляем elapsed time к accumulated
                     // С защитой от clock skew
                     // Миграция: saved_started_at < 1e12 = секунды (старый формат), иначе миллисекунды
-                    let final_accumulated = if state_str == "running" && saved_started_at.is_some()
+                    let final_accumulated = if let (true, Some(raw)) =
+                        (state_str == "running", saved_started_at)
                     {
-                        let raw = saved_started_at.unwrap();
                         let started_at_secs = if raw < 1_000_000_000_000 {
                             raw // старый формат: секунды
                         } else {
@@ -113,7 +141,7 @@ impl TimerEngine {
                         };
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
+                            .map_err(|e| format!("System time error: {}", e))?
                             .as_secs();
 
                         // CRITICAL FIX: Clock skew detection
@@ -127,28 +155,39 @@ impl TimerEngine {
                             // НЕ добавляем elapsed time - используем только saved accumulated
                             accumulated
                         } else {
-                            let elapsed_since_save = now.saturating_sub(started_at_secs);
+                            let raw_elapsed = now.saturating_sub(started_at_secs);
 
-                            // CRITICAL FIX: Проверка на нереалистично большое время (> 24 часов)
-                            // ДОКАЗАНО: Если elapsed > 24 часов, вероятно clock skew или системная ошибка
-                            const MAX_REASONABLE_ELAPSED: u64 = 24 * 60 * 60; // 24 часа
-                            if elapsed_since_save > MAX_REASONABLE_ELAPSED {
+                            // CLOCK SKEW: Cap by last_heartbeat — protects against forward skew before restart
+                            // elapsed <= (now - last_save) + 60s buffer
+                            let elapsed_since_save = match db.get_app_meta("last_heartbeat_wall_secs") {
+                                Ok(Some(s)) => {
+                                    if let Ok(last) = s.parse::<u64>() {
+                                        let cap = now.saturating_sub(last).saturating_add(60);
+                                        raw_elapsed.min(cap)
+                                    } else {
+                                        raw_elapsed
+                                    }
+                                }
+                                _ => raw_elapsed,
+                            };
+
+                            // CRITICAL FIX: Cap at 24h (unrealistic gap)
+                            const MAX_REASONABLE_ELAPSED: u64 = 24 * 60 * 60;
+                            let elapsed_since_save = elapsed_since_save.min(MAX_REASONABLE_ELAPSED);
+
+                            if raw_elapsed > elapsed_since_save {
                                 warn!(
-                                    "[RECOVERY] Unrealistic time gap detected: {}s ({} hours). Possible clock skew. Not adding elapsed time.",
-                                    elapsed_since_save, elapsed_since_save / 3600
+                                    "[RECOVERY] Clock skew cap applied: raw {}s -> {}s (last_heartbeat)",
+                                    raw_elapsed, elapsed_since_save
                                 );
-                                // НЕ добавляем elapsed time - используем только saved accumulated
-                                accumulated
-                            } else {
-                                // ДОКАЗАНО: Elapsed time разумен - добавляем к accumulated
-                                let new_accumulated =
-                                    accumulated.saturating_add(elapsed_since_save);
-                                info!(
-                                    "[RECOVERY] Timer was running: accumulated={}s, started_at={}, elapsed_since_save={}s, final_accumulated={}s",
-                                    accumulated, started_at_secs, elapsed_since_save, new_accumulated
-                                );
-                                new_accumulated
                             }
+                            let new_accumulated =
+                                accumulated.saturating_add(elapsed_since_save);
+                            info!(
+                                "[RECOVERY] Timer was running: accumulated={}s, started_at={}, elapsed_since_save={}s, final_accumulated={}s",
+                                accumulated, started_at_secs, elapsed_since_save, new_accumulated
+                            );
+                            new_accumulated
                         }
                     } else {
                         // ДОКАЗАНО: State не был running - используем saved accumulated

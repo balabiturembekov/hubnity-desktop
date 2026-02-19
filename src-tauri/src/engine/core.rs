@@ -23,6 +23,17 @@ impl TimerEngine {
         5 * 60 // default 5 minutes
     }
 
+    /// Returns true if sleep was detected < 30s ago (grace period to suppress false "active" from get_idle_time reset).
+    pub fn is_just_awoken(&self) -> bool {
+        const GRACE_SECS: u64 = 30;
+        if let Ok(guard) = self.last_sleep_detected_at.lock() {
+            if let Some(at) = *guard {
+                return at.elapsed().as_secs() < GRACE_SECS;
+            }
+        }
+        false
+    }
+
     /// Обработка системного sleep (вызывается при обнаружении большого пропуска времени в get_state)
     /// Если RUNNING → pause и сохранить состояние
     fn handle_system_sleep(&self) -> Result<(), String> {
@@ -198,7 +209,7 @@ impl TimerEngine {
         // Проверяем смену дня перед любыми операциями
         self.ensure_correct_day()?;
 
-        let mut state = self
+        let state = self
             .state
             .lock()
             .map_err(|e| format!("Mutex poisoned: {}", e))?;
@@ -213,6 +224,7 @@ impl TimerEngine {
                 // Допустимый переход: Running → Paused
                 // TIME MANIPULATION: Use ONLY monotonic clocks for accumulated increment.
                 // Immune to NTP sync, manual clock changes. macOS: Instant. Windows: GetTickCount64 (sleep-aware).
+                // SLEEP GAP: Instant/GetTick64 не тикают во сне — accumulated не включает время сна (Hubstaff-aligned).
                 let now = Instant::now();
                 let monotonic_elapsed = now.duration_since(*started_at_instant).as_secs();
                 #[cfg(target_os = "windows")]
@@ -251,32 +263,27 @@ impl TimerEngine {
                     new
                 };
 
-                // CRITICAL FIX: Обновляем accumulated в памяти ТОЛЬКО после успешного сохранения
-                // Это гарантирует, что если save_state() падает, accumulated не обновлен
-                // Переход в Paused (started_at_instant удаляется из state)
-                *state = TimerState::Paused;
-                drop(state); // Освобождаем lock перед сохранением
+                // CHAOS FIX: Save BEFORE mutating state — prevents inconsistent state on disk full
+                drop(state); // Release lock before DB I/O
+                if let Err(e) = self.save_pending_state(new_accumulated, "paused", None) {
+                    error!("[TIMER] Failed to save state before pause: {}", e);
+                    return Err(format!("Failed to save state: {}", e));
+                }
 
-                // CRITICAL FIX: Сохраняем состояние с новым accumulated в одной транзакции
-                // Если сохранение успешно, обновляем accumulated в памяти
-                match self.save_state_with_accumulated_override(Some(new_accumulated)) {
-                    Ok(_) => {
-                        // ДОКАЗАНО: Сохранение успешно - обновляем accumulated в памяти
-                        let mut accumulated = self
-                            .accumulated_seconds
-                            .lock()
-                            .map_err(|e| format!("Mutex poisoned: {}", e))?;
-                        *accumulated = new_accumulated;
-                        // Lock освобождается автоматически
-                    }
-                    Err(e) => {
-                        // ДОКАЗАНО: Сохранение не удалось - accumulated НЕ обновлен в памяти
-                        // State уже изменен на Paused, но accumulated остался старым
-                        // Это безопаснее, чем обновить accumulated до сохранения
-                        error!("[TIMER] Failed to save state after pause: {}", e);
-                        // Возвращаем ошибку, чтобы вызывающий код знал о проблеме
-                        return Err(format!("Failed to save state after pause: {}", e));
-                    }
+                // Save succeeded — now mutate in-memory state
+                {
+                    let mut state = self
+                        .state
+                        .lock()
+                        .map_err(|e| format!("Mutex poisoned: {}", e))?;
+                    *state = TimerState::Paused;
+                }
+                {
+                    let mut accumulated = self
+                        .accumulated_seconds
+                        .lock()
+                        .map_err(|e| format!("Mutex poisoned: {}", e))?;
+                    *accumulated = new_accumulated;
                 }
 
                 Ok(())
@@ -359,7 +366,7 @@ impl TimerEngine {
 
     /// Внутренний метод остановки без проверки дня (для использования в rollover)
     fn stop_internal(&self) -> Result<(), String> {
-        let mut state = self
+        let state = self
             .state
             .lock()
             .map_err(|e| format!("Mutex poisoned: {}", e))?;
@@ -401,50 +408,51 @@ impl TimerEngine {
                     new
                 };
 
-                // Переход в Stopped
-                *state = TimerState::Stopped;
-                drop(state); // Освобождаем lock перед сохранением
-
-                // Сбрасываем флаг восстановления после wake
+                // CHAOS FIX: Save BEFORE mutating (prevents inconsistent state on disk full)
+                drop(state);
+                if let Err(e) = self.save_pending_state(new_accumulated, "stopped", None) {
+                    error!("[TIMER] Failed to save state before stop: {}", e);
+                    return Err(format!("Failed to save state: {}", e));
+                }
+                {
+                    let mut state = self
+                        .state
+                        .lock()
+                        .map_err(|e| format!("Mutex poisoned: {}", e))?;
+                    *state = TimerState::Stopped;
+                }
+                {
+                    let mut accumulated = self
+                        .accumulated_seconds
+                        .lock()
+                        .map_err(|e| format!("Mutex poisoned: {}", e))?;
+                    *accumulated = new_accumulated;
+                }
                 if let Ok(mut f) = self.restored_from_running.lock() {
                     *f = false;
                 }
-
-                // CRITICAL FIX: Сохраняем состояние с новым accumulated в одной транзакции
-                match self.save_state_with_accumulated_override(Some(new_accumulated)) {
-                    Ok(_) => {
-                        // ДОКАЗАНО: Сохранение успешно - обновляем accumulated в памяти
-                        let mut accumulated = self
-                            .accumulated_seconds
-                            .lock()
-                            .map_err(|e| format!("Mutex poisoned: {}", e))?;
-                        *accumulated = new_accumulated;
-                    }
-                    Err(e) => {
-                        // ДОКАЗАНО: Сохранение не удалось - accumulated НЕ обновлен
-                        error!("[TIMER] Failed to save state after stop: {}", e);
-                        return Err(format!("Failed to save state after stop: {}", e));
-                    }
-                }
-
                 Ok(())
             }
             TimerState::Paused => {
-                // Допустимый переход: Paused → Stopped (accumulated уже сохранен)
-                *state = TimerState::Stopped;
-                drop(state); // Освобождаем lock перед сохранением
-
-                // Сбрасываем флаг восстановления после wake
+                let accumulated = *self
+                    .accumulated_seconds
+                    .lock()
+                    .map_err(|e| format!("Mutex poisoned: {}", e))?;
+                drop(state);
+                if let Err(e) = self.save_pending_state(accumulated, "stopped", None) {
+                    error!("[TIMER] Failed to save state before stop (Paused→Stopped): {}", e);
+                    return Err(format!("Failed to save state: {}", e));
+                }
+                {
+                    let mut state = self
+                        .state
+                        .lock()
+                        .map_err(|e| format!("Mutex poisoned: {}", e))?;
+                    *state = TimerState::Stopped;
+                }
                 if let Ok(mut f) = self.restored_from_running.lock() {
                     *f = false;
                 }
-
-                // Сохраняем состояние в БД
-                if let Err(e) = self.save_state() {
-                    error!("[TIMER] Failed to save state after stop: {}", e);
-                    return Err(format!("Failed to save state after stop: {}", e));
-                }
-
                 Ok(())
             }
             TimerState::Stopped => {
@@ -496,14 +504,13 @@ impl TimerEngine {
             .lock()
             .map_err(|e| format!("Mutex poisoned: {}", e))?;
 
-        let now_wall_f64 = SystemTime::now()
+        let now_wall_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(0.0);
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
 
-        // Расчет elapsed только для RUNNING состояния
-        // Только wall clock (SystemTime) — синхронно с системным временем и Hubstaff.
-        // Буфер 150ms: показываем секунду N только после N.15 (Stack Overflow — избежать «опережения»).
+        // Расчет elapsed только для RUNNING: Instant::now() - started_at (monotonic, u64 only).
+        // Запрещено: f64 (накопление ошибки), инкремент вручную. Буфер 1150ms — избежать опережения.
         let (elapsed_seconds, session_start, session_start_ms, needs_sleep_handling) = match &*state
         {
             TimerState::Running {
@@ -514,29 +521,34 @@ impl TimerEngine {
                 ..
             } => {
                 let now = Instant::now();
-                let now_wall_ms = (now_wall_f64 * 1000.0) as u64;
-                let wall_elapsed = (now_wall_ms.saturating_sub(*started_at_ms) / 1000) as u64;
-                let wall_elapsed_f64 = (now_wall_f64 - (*started_at_ms as f64) / 1000.0).max(0.0);
+                let wall_elapsed_secs = now_wall_ms.saturating_sub(*started_at_ms) / 1000;
 
                 // Sleep detection: разрыв wall-clock vs «время без сна».
-                // macOS: monotonic (Instant) не тикает во сне.
-                // Windows: GetTickCount64 не тикает во сне (QPC/Instant тикает).
+                // macOS: Instant не тикает во сне. Windows: GetTickCount64 не тикает во сне.
                 let threshold_secs = self.get_sleep_gap_threshold_seconds();
                 #[cfg(target_os = "windows")]
-                let awake_elapsed_secs = {
+                let awake_elapsed_ms = {
                     let tick64_now = get_tick64_ms();
-                    let tick64_elapsed_ms = tick64_now.saturating_sub(*started_at_tick64_ms);
-                    tick64_elapsed_ms / 1000
+                    tick64_now.saturating_sub(*started_at_tick64_ms)
                 };
+                #[cfg(target_os = "windows")]
+                let awake_elapsed_secs = awake_elapsed_ms / 1000;
                 #[cfg(not(target_os = "windows"))]
                 let awake_elapsed_secs = now.duration_since(*started_at_instant).as_secs();
-                let is_sleep = wall_elapsed > awake_elapsed_secs
-                    && (wall_elapsed - awake_elapsed_secs) >= threshold_secs;
+                let is_sleep = wall_elapsed_secs > awake_elapsed_secs
+                    && (wall_elapsed_secs - awake_elapsed_secs) >= threshold_secs;
 
-                // Буфер 1.15s — устраняет опережение на 1с (Hubnity 34 при системных 33)
-                let displayed_elapsed = ((wall_elapsed_f64 - 1.15).floor().max(0.0)) as u64;
+                // displayed = awake_elapsed - 1150ms buffer (u64 only, no f64)
+                #[cfg(target_os = "windows")]
+                let displayed_ms = awake_elapsed_ms.saturating_sub(1150);
+                #[cfg(not(target_os = "windows"))]
+                let displayed_ms = now
+                    .duration_since(*started_at_instant)
+                    .as_millis()
+                    .saturating_sub(1150);
+                let displayed_elapsed = (displayed_ms / 1000) as u64;
 
-                // Защита от переполнения при вычислении elapsed_seconds
+                // Защита от переполнения
                 let elapsed = accumulated.saturating_add(displayed_elapsed);
                 (
                     elapsed,
@@ -554,6 +566,9 @@ impl TimerEngine {
         // Если обнаружен sleep (большой пропуск времени), вызываем handle_system_sleep для паузы
         if needs_sleep_handling {
             drop(state);
+            if let Ok(mut t) = self.last_sleep_detected_at.lock() {
+                *t = Some(Instant::now());
+            }
             info!("[SLEEP_DETECTION] Sleep detected (gap or long session), pausing timer");
             if let Err(e) = self.handle_system_sleep() {
                 warn!("[SLEEP_DETECTION] handle_system_sleep failed: {}", e);
@@ -588,18 +603,20 @@ impl TimerEngine {
             }
         };
 
-        // today_seconds: для "Today" display. При rollover (started_at_ms/1000 == day_start) — только время с полуночи.
-        // Буфер 1.15s как у elapsed — иначе today_seconds может опережать elapsed и ломать today <= elapsed.
+        // today_seconds: для "Today" display. При rollover — время с полуночи. today <= elapsed всегда.
         let today_seconds = match &*state {
             TimerState::Running { started_at_ms, .. } => {
                 let rolled_over = day_start.map_or(false, |ds| *started_at_ms / 1000 == ds);
                 if rolled_over {
-                    day_start
+                    let from_midnight = day_start
                         .map(|ds| {
-                            let raw = (now_wall_f64 - (ds as f64)).max(0.0);
-                            ((raw - 1.15).floor().max(0.0)) as u64
+                            let day_start_ms = ds * 1000;
+                            let raw_ms = now_wall_ms.saturating_sub(day_start_ms);
+                            let displayed_ms = raw_ms.saturating_sub(1150);
+                            displayed_ms / 1000
                         })
-                        .unwrap_or(accumulated)
+                        .unwrap_or(accumulated);
+                    from_midnight.min(elapsed_seconds)
                 } else {
                     elapsed_seconds
                 }

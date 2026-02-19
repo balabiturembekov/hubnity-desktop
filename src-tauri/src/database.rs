@@ -32,6 +32,25 @@ fn log_io_error_if_any(context: &str, e: &rusqlite::Error) {
         }
     }
 }
+
+/// Convert rusqlite errors from enqueue_sync to user-friendly messages for frontend.
+/// CHAOS AUDIT: Ensures disk full / read-only errors surface as "Data sync unavailable (Disk Full?)".
+pub fn enqueue_error_to_user_message(e: &rusqlite::Error) -> String {
+    use rusqlite::ffi::ErrorCode;
+    if let rusqlite::Error::SqliteFailure(ffi_err, _) = e {
+        match ffi_err.code {
+            ErrorCode::DiskFull => "Data sync unavailable (Disk Full?)".to_string(),
+            ErrorCode::ReadOnly | ErrorCode::CannotOpen => {
+                "Data sync unavailable (Permission denied?)".to_string()
+            }
+            ErrorCode::SystemIoFailure => "Data sync unavailable (I/O error?)".to_string(),
+            _ => format!("Failed to enqueue: {}", e),
+        }
+    } else {
+        format!("Failed to enqueue: {}", e)
+    }
+}
+
 use crate::models::{FailedTaskInfo, QueueStats};
 use crate::sync::TaskPriority;
 use chrono::Utc;
@@ -51,7 +70,8 @@ impl Database {
     fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, rusqlite::Error> {
         self.conn.lock().map_err(|e| {
             InvalidParameterName(format!(
-                "Database mutex poisoned: {}. This indicates a panic occurred while holding the lock.",
+                "Database mutex poisoned: {}. A panic occurred while holding the lock. \
+                 Please restart the application to recover.",
                 e
             ))
         })
@@ -235,6 +255,11 @@ impl Database {
                     let _ = conn.execute("ROLLBACK", []);
                     e
                 })?;
+                // CLOCK SKEW: Store wall time for restore_state cap (protects against forward skew)
+                let _ = conn.execute(
+                    "INSERT INTO app_meta (key, value) VALUES ('last_heartbeat_wall_secs', ?1) ON CONFLICT(key) DO UPDATE SET value = ?1",
+                    params![now.to_string()],
+                );
                 Ok(())
             }
             Err(e) => {

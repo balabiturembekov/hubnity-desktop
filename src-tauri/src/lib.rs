@@ -2,11 +2,12 @@
 use chrono::{Local, Utc};
 use std::panic;
 use std::sync::OnceLock;
-use tauri::{AppHandle, Emitter, Listener, Manager};
+use tauri::{AppHandle, Emitter, Listener, Manager, RunEvent};
 use tracing::{debug, error, info, warn};
 mod auth;
 mod commands;
 mod database;
+mod ipc;
 mod engine;
 mod models;
 mod monitor;
@@ -101,6 +102,11 @@ pub fn run() {
         .setup(|app| {
             #[cfg(desktop)]
             {
+                #[cfg(target_os = "macos")]
+                {
+                    macos_app_nap::prevent();
+                    info!("[MACOS] App Nap disabled — activity monitor and timer run in background");
+                }
                 // BUG FIX: Log error if plugin fails to load instead of silently ignoring
                 if let Err(e) = app.handle().plugin(tauri_plugin_updater::Builder::new().build()) {
                     warn!("[SETUP] Failed to load updater plugin (non-critical): {:?}", e);
@@ -172,7 +178,7 @@ pub fn run() {
                         "[DB] Corrupted DB backed up to {:?}, starting fresh",
                         backup_path
                     );
-                    let _ = app.handle().emit("db-recovered-from-corruption", ());
+                    let _ = app.handle().emit(crate::ipc::events::DB_RECOVERED, ());
                     Arc::new(Database::new(db_path_str).map_err(|e2| {
                         std::io::Error::new(
                             std::io::ErrorKind::Other,
@@ -241,7 +247,7 @@ pub fn run() {
                 });
             });
 
-            // FIX: Push timer state from Rust каждые 200ms — только при RUNNING/PAUSED (не спамить при STOPPED)
+            // FIX: Один поток emit таймера (не создаётся при Active<->Idle). 1s + Skip при лагах.
             let engine_for_emit = engine_arc.clone();
             let app_handle_for_emit = app.handle().clone();
             std::thread::spawn(move || {
@@ -253,9 +259,23 @@ pub fn run() {
                     }
                 };
                 rt.block_on(async {
+                    use std::time::UNIX_EPOCH;
                     use tauri::Emitter;
                     use crate::engine::TimerStateForAPI;
-                    let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(200));
+                    use tokio::time::MissedTickBehavior;
+
+                    // Микро-синхронизация: первый тик — на границе системной секунды (12:00:00.000, не .500)
+                    if let Ok(now) = std::time::SystemTime::now().duration_since(UNIX_EPOCH) {
+                        let now_ms = now.as_millis();
+                        let next_sec_ms = (now_ms / 1000 + 1) * 1000;
+                        let delay_ms = (next_sec_ms - now_ms).min(999);
+                        if delay_ms > 0 {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms as u64)).await;
+                        }
+                    }
+
+                    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
+                    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
                     loop {
                         interval.tick().await;
                         if let Ok(state) = engine_for_emit.get_state() {
@@ -264,7 +284,11 @@ pub fn run() {
                                 TimerStateForAPI::Running { .. } | TimerStateForAPI::Paused
                             );
                             if should_emit {
-                                let _ = app_handle_for_emit.emit("timer-state-update", &state);
+                                let _ = app_handle_for_emit.emit(crate::ipc::events::TIMER_STATE_UPDATE, &state);
+                                // OS AUDIT: Notify frontend of wake — can suppress false "active" from get_idle_time() reset
+                                if state.reason.as_deref() == Some("sleep") {
+                                    let _ = app_handle_for_emit.emit(crate::ipc::events::SYSTEM_SLEEP_DETECTED, ());
+                                }
                             }
                         }
                     }
@@ -383,7 +407,10 @@ pub fn run() {
             listen_activity,
             request_screenshot_permission,
             take_screenshot,
+            take_screenshot_to_temp,
             upload_screenshot,
+            upload_screenshot_from_path,
+            delete_screenshot_temp_file,
             enqueue_time_entry,
             show_notification,
             update_tray_time,
@@ -397,6 +424,18 @@ pub fn run() {
             get_app_version,
             request_idle_state
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // CHAOS AUDIT FIX: Graceful shutdown — persist timer state on exit
+            if let RunEvent::ExitRequested { .. } = event {
+                if let Some(engine) = app_handle.try_state::<Arc<TimerEngine>>() {
+                    if let Err(e) = engine.save_state() {
+                        error!("[SHUTDOWN] Failed to save timer state on exit: {}", e);
+                    } else {
+                        info!("[SHUTDOWN] Timer state saved successfully on exit");
+                    }
+                }
+            }
+        });
 }

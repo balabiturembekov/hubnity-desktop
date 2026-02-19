@@ -56,6 +56,7 @@ tempfile = "3"
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = "0.23"
 objc = "0.2"
+macos-app-nap = "0.0.1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.52", features = ["Win32_System_SystemInformation"] }

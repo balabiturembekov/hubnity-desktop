@@ -1,4 +1,5 @@
 use crate::auth::AuthManager;
+use crate::database::enqueue_error_to_user_message;
 #[cfg(test)]
 use crate::models::TokenRefreshResult;
 use crate::Database;
@@ -178,7 +179,7 @@ impl SyncManager {
 
         self.db
             .enqueue_sync(&format!("time_entry_{}", operation), &payload_str)
-            .map_err(|e| format!("Failed to enqueue time entry: {}", e))
+            .map_err(|e| enqueue_error_to_user_message(&e))
     }
 
     /// Добавить скриншот в очередь синхронизации
@@ -205,9 +206,23 @@ impl SyncManager {
         let payload_str = serde_json::to_string(&payload)
             .map_err(|e| format!("Failed to serialize payload: {}", e))?;
 
+        // Log payload size — helps debug "Unterminated string in JSON" (truncation in DB/encryption/HTTP)
+        let payload_len = payload_str.len();
+        info!(
+            "[SYNC] Enqueue screenshot: payload_len={} bytes, imageData_len={} bytes",
+            payload_len,
+            image_data.len()
+        );
+        if payload_len > 5 * 1024 * 1024 {
+            warn!(
+                "[SYNC] Large screenshot payload {} MB — may hit SQLite/encryption/server limits",
+                payload_len / (1024 * 1024)
+            );
+        }
+
         self.db
             .enqueue_sync("screenshot", &payload_str)
-            .map_err(|e| format!("Failed to enqueue screenshot: {}", e))
+            .map_err(|e| enqueue_error_to_user_message(&e))
     }
 
     /// Построить и отправить HTTP-запрос для time_entry операции
@@ -272,6 +287,10 @@ impl SyncManager {
         Ok(request.json(&body))
     }
 
+    /// Max screenshot JSON body size (bytes). Many servers (nginx, etc.) default to 1MB.
+    /// Log and warn if exceeded — "Unterminated string in JSON" (400) often indicates truncation.
+    const MAX_SCREENSHOT_JSON_BYTES: usize = 10 * 1024 * 1024; // 10 MB
+
     /// Построить и отправить HTTP-запрос для screenshot
     fn send_screenshot_request(
         &self,
@@ -291,6 +310,23 @@ impl SyncManager {
             "timeEntryId": time_entry_id,
         });
 
+        // Log ACTUAL lengths before request — critical for debugging "Unterminated string in JSON" (400)
+        let body_str = serde_json::to_string(&payload)
+            .map_err(|e| SyncError::ParsePayload(format!("Screenshot JSON serialize: {}", e)))?;
+        let body_len = body_str.len();
+        let image_data_len = image_data.len();
+        info!(
+            "[SYNC] Screenshot request: body_len={} bytes, imageData_len={} bytes, timeEntryId={}",
+            body_len, image_data_len, time_entry_id
+        );
+        if body_len > Self::MAX_SCREENSHOT_JSON_BYTES {
+            warn!(
+                "[SYNC] Screenshot payload {} bytes exceeds {} MB — server may truncate (400 Unterminated string)",
+                body_len,
+                Self::MAX_SCREENSHOT_JSON_BYTES / (1024 * 1024)
+            );
+        }
+
         let url = format!("{}/screenshots", self.api_base_url);
         let mut request = self
             .client
@@ -301,7 +337,8 @@ impl SyncManager {
         if let Some(key) = idempotency_key {
             request = request.header("X-Idempotency-Key", key);
         }
-        Ok(request.json(&payload))
+        // Use body_str directly — single serialization, and we've validated it for logging
+        Ok(request.body(body_str))
     }
 
     /// Синхронизировать одну задачу из очереди
@@ -315,8 +352,21 @@ impl SyncManager {
         payload: String,
         idempotency_key: Option<String>,
     ) -> Result<bool, SyncError> {
-        let payload_json: serde_json::Value =
-            serde_json::from_str(&payload).map_err(|e| SyncError::ParsePayload(e.to_string()))?;
+        let payload_json: serde_json::Value = serde_json::from_str(&payload).map_err(|e| {
+            let msg = format!(
+                "{} (payload_len={} bytes, entity_type={})",
+                e,
+                payload.len(),
+                entity_type
+            );
+            if entity_type == "screenshot" {
+                warn!(
+                    "[SYNC] Screenshot payload parse failed: {} — check for truncation in DB/encryption",
+                    msg
+                );
+            }
+            SyncError::ParsePayload(msg)
+        })?;
 
         let mut access_token = self
             .auth_manager
@@ -335,11 +385,14 @@ impl SyncManager {
 
         loop {
             let response_result = if entity_type.starts_with("time_entry_") {
-                // BUG FIX: Use expect with clear error message instead of unwrap to prevent panic
-                // This should never fail because we check starts_with above, but defensive programming
-                let operation = entity_type.strip_prefix("time_entry_").expect(
-                    "BUG: strip_prefix failed after starts_with check - this should never happen",
-                );
+                let operation = entity_type
+                    .strip_prefix("time_entry_")
+                    .ok_or_else(|| {
+                        SyncError::UnknownOperation(format!(
+                            "strip_prefix failed for entity_type: {}",
+                            entity_type
+                        ))
+                    })?;
                 let builder = self.send_time_entry_request(
                     operation,
                     &payload_json,
