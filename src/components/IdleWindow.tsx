@@ -4,6 +4,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { Button } from './ui/button';
 import { RotateCcw, Square } from 'lucide-react';
 import { logger } from '../lib/logger';
+import { IPC_EVENTS } from '../lib/ipc';
 
 /**
  * Idle Window — shown when user is idle and timer was running.
@@ -180,7 +181,7 @@ export function IdleWindow() {
           lastActivityPerfRef?: number | null;
           isLoading: boolean;
           projectName?: string | null;
-        }>('idle-state-update', (event) => {
+        }>(IPC_EVENTS.IDLE_STATE_UPDATE, (event) => {
           logger.debug('IDLE_WINDOW', 'State update received', event.payload);
           
           // Handle null values correctly

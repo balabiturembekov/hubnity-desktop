@@ -64,13 +64,15 @@ App.checkIdleStatus (каждые 10 с)
 **Важно:** При idle паузе 2 мин простоя НЕ учитываются в accumulated. work_elapsed = (lastActivityTime/1000) - session_start.
 
 **Источники lastActivityTime:**
-- Rust `activity-detected` (system idle < 5s) — emit сразу при активности, min_emit_interval 10s
+- Rust `activity-detected` — emit при активности (jitter buffer: 2 последовательные проверки idle < 60s)
 - DOM fallback (mousemove, keydown, …) — только когда фокус на окне Hubnity, throttle 5s
 
-**Константы activity-detected (commands.rs activity_emit):**
+**Константы activity-detected (commands.rs activity_emit, Hubstaff-aligned):**
 | Константа | Значение | Назначение |
 |-----------|----------|------------|
-| ACTIVITY_THRESHOLD | 5s | idle < 5s = пользователь активен |
+| IDLE_THRESHOLD | 60s | idle < 60s = Active (фильтр микро-событий: стол, кошка) |
+| POLL_INTERVAL | 5s | фиксированный интервал опроса |
+| Jitter buffer | 2 проверки | Active только если idle < 60s в двух последовательных опросах |
 | MIN_EMIT_INTERVAL | 10s | не чаще 1 emit в 10s (throttle) |
 
 **При изменении:** DOM fallback в App.tsx; idleThreshold в store (min 1); checkIdleStatus не должен паузить при idlePauseStartTime !== null.

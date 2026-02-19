@@ -17,6 +17,22 @@ let loadActiveTimeEntryPromise: Promise<void> | null = null;
 let assertStateInvariantSkippedDueToLoading = 0;
 const ASSERT_STATE_INVARIANT_LOADING_STUCK_THRESHOLD = 12; // 12 * 5s = 60s
 
+/** CHAOS AUDIT: Surface enqueue errors to user (disk full, permission denied). */
+function handleEnqueueError(
+  op: string,
+  e: unknown,
+  set: (s: { error: string | null }) => void,
+): null {
+  const msg =
+    (e as { message?: string })?.message ??
+    (e as Error)?.toString?.() ??
+    'Data sync unavailable (Disk Full?)';
+  logger.warn(op, 'Failed to enqueue - sync queue unavailable', e);
+  set({ error: msg });
+  invoke('show_notification', { title: 'Sync Warning', body: msg }).catch(() => {});
+  return null;
+}
+
 export interface TrackerState {
   projects: Project[];
   selectedProject: Project | null;
@@ -840,10 +856,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
             payload: requestData,
             accessToken,
             refreshToken: refreshToken || null,
-          }).catch((e) => {
-            logger.warn('START', 'Failed to enqueue (background)', e);
-            return null;
-          });
+          }).catch((e) => handleEnqueueError('START', e, set));
           const timeEntry = await api.startTimeEntry(requestData);
             await api.sendHeartbeat(true);
             if (queueId != null) {
@@ -971,7 +984,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
                 payload: { id: entry.id },
                 accessToken,
                 refreshToken: refreshToken || null,
-              }).catch((e) => { logger.warn('PAUSE', 'Failed to enqueue stop (engine STOPPED)', e); return null; });
+              }).catch((e) => handleEnqueueError('PAUSE', e, set));
               await api.stopTimeEntry(entry.id);
               await api.sendHeartbeat(false);
               if (queueId != null) {
@@ -1041,7 +1054,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
               payload: { id: runningEntry.id },
               accessToken,
               refreshToken: refreshToken || null,
-            }).catch((e) => { logger.warn('PAUSE', 'Failed to enqueue pause', e); return null; });
+            }).catch((e) => handleEnqueueError('PAUSE', e, set));
             try {
               await api.pauseTimeEntry(runningEntry.id);
               await api.sendHeartbeat(false);
@@ -1111,7 +1124,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
                 payload: { id: lastId },
                 accessToken,
                 refreshToken: refreshToken || null,
-              }).catch((e) => logger.warn('PAUSE', 'Failed to enqueue (no-entry path)', e));
+              }).catch((e) => handleEnqueueError('PAUSE', e, set));
             }
           }
           set({
@@ -1321,10 +1334,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           payload: { id: entryIdToPause },
           accessToken,
           refreshToken: refreshToken || null,
-        }).catch((e) => {
-          logger.warn('PAUSE', 'Failed to enqueue', e);
-          return null;
-        });
+        }).catch((e) => handleEnqueueError('PAUSE', e, set));
       }
       if (isPaused) logger.debugTerminal('PAUSE', `entryIdToPause=${entryIdToPause} userId=${timeEntryToPause?.userId ?? '?'}`);
       if (isPaused && !entryIdToPause.startsWith('temp-')) (async () => {
@@ -1505,7 +1515,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
             payload: { id: lastId },
             accessToken,
             refreshToken: refreshToken || null,
-          }).catch((e) => { logger.warn('RESUME', 'Failed to enqueue (no-entry branch)', e); return null; });
+          }).catch((e) => handleEnqueueError('RESUME', e, set));
         }
         // Resume Timer Engine directly
         await TimerEngineAPI.resume();
@@ -1546,7 +1556,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
                     payload: { id: entryAfterLoad.id },
                     accessToken,
                     refreshToken: refreshToken || null,
-                  }).catch((e) => { logger.warn('RESUME', 'Failed to enqueue (no-entry branch bg)', e); return null; });
+                  }).catch((e) => handleEnqueueError('RESUME', e, set));
                 }
               }
               await api.resumeTimeEntry(entryAfterLoad.id);
@@ -1686,10 +1696,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           payload: { id: entryIdToResume },
           accessToken,
           refreshToken: refreshToken || null,
-        }).catch((e) => {
-          logger.warn('RESUME', 'Failed to enqueue', e);
-          return null;
-        });
+        }).catch((e) => handleEnqueueError('RESUME', e, set));
       }
       
       // API в фоне: проверка сервера + resume
@@ -1923,7 +1930,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           payload: { id: lastId },
           accessToken,
           refreshToken: refreshToken || null,
-        }).catch((e) => logger.warn('STOP', 'Failed to enqueue (no-entry path)', e));
+        }).catch((e) => handleEnqueueError('STOP', e, set));
       }
       try {
         const timerState = await TimerEngineAPI.getState();
@@ -2023,10 +2030,7 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           payload: { id: entryIdToStop },
           accessToken,
           refreshToken: refreshToken || null,
-        }).catch((e) => {
-          logger.warn('STOP', 'Failed to enqueue', e);
-          return null;
-        });
+        }).catch((e) => handleEnqueueError('STOP', e, set));
       }
       // API в фоне (пропускаем если entry с temp id — запись ещё не создана на сервере)
       if (isStopped && !entryIdToStop.startsWith('temp-')) (async () => {
@@ -2271,6 +2275,12 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
           
           const pauseStartTime = stateAfterPause.idlePauseStartTime;
           
+          // Show notification FIRST so it appears above IdleWindow (alwaysOnTop can overlay notifications)
+          await invoke('show_notification', {
+            title: 'Tracker paused',
+            body: `No activity for more than ${idleThreshold} minutes`,
+          });
+          
           // Show idle window and send initial state
           try {
             await invoke('show_idle_window');
@@ -2322,12 +2332,6 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
               logger.debug('IDLE_CHECK', 'Failed to log (non-critical)', e);
             });
           }
-          
-          // Send notification
-          await invoke('show_notification', {
-            title: 'Tracker paused',
-            body: `No activity for more than ${idleThreshold} minutes`,
-          });
         } else {
           // isPaused but idlePauseStartTime was null (race with Timer's updateTimerState clearing it)
           await logger.safeLogToRust(`[IDLE CHECK] Paused but idlePauseStartTime was null, syncing and showing idle window`).catch((e) => {
@@ -2345,6 +2349,10 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
                 idlePauseStartTime: pauseStartTime,
                 idlePauseStartPerfRef: pausePerfRef,
               });
+              await invoke('show_notification', {
+                title: 'Tracker paused',
+                body: `No activity for more than ${idleThreshold} minutes`,
+              }).catch(() => {});
               await invoke('show_idle_window');
               await new Promise(resolve => setTimeout(resolve, 1000));
               const lastActivityForRust = storeState.lastActivityTime && storeState.lastActivityTime > 0 ? Number(storeState.lastActivityTime) : null;
@@ -2357,10 +2365,6 @@ export const useTrackerStore = create<TrackerState>((set, get) => ({
                 lastActivityTime: lastActivityForRust,
                 lastActivityPerfRef: lastActivityPerfRefForRust,
                 projectName,
-              }).catch(() => {});
-              await invoke('show_notification', {
-                title: 'Tracker paused',
-                body: `No activity for more than ${idleThreshold} minutes`,
               }).catch(() => {});
             } else if (timerState.state === 'STOPPED') {
               set({

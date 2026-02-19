@@ -7,6 +7,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { TrayIcon } from '@tauri-apps/api/tray';
 import { logger } from '../lib/logger';
+import { IPC_EVENTS } from '../lib/ipc';
 import { cn } from '../lib/utils';
 
 function formatTime(seconds: number): string {
@@ -42,7 +43,6 @@ export function Timer() {
     lastActivityTime,
     lastActivityPerfRef,
     lastTimerStateFromStart,
-    clientSessionStartMs,
   } = useTrackerStore();
   const isOnline = useSyncStore((s) => s.status?.is_online ?? true);
   const isWindowVisible = useTrackerStore((s) => s.isWindowVisible);
@@ -66,6 +66,7 @@ export function Timer() {
     let isMounted = true;
     let timeoutId: ReturnType<typeof setTimeout>;
     let unlistenTimer: (() => void) | null = null;
+    let cancelled = false;
 
     const processState = (state: TimerStateResponse) => {
       if (!isMounted) return;
@@ -134,13 +135,14 @@ export function Timer() {
       return Date.now() - lastResumeTime < 5000;
     };
 
-    listen<TimerStateResponse>('timer-state-update', (ev) => {
+    listen<TimerStateResponse>(IPC_EVENTS.TIMER_STATE_UPDATE, (ev) => {
       if (!isMounted) return;
       const state = ev.payload;
       if (shouldSkipStalePaused(state)) return;
       processState(state);
     }).then((fn) => {
-      unlistenTimer = fn;
+      if (cancelled) fn();
+      else unlistenTimer = fn;
     });
 
     const pollOnce = async () => {
@@ -167,6 +169,7 @@ export function Timer() {
 
     return () => {
       isMounted = false;
+      cancelled = true;
       clearTimeout(timeoutId);
       unlistenTimer?.();
     };
@@ -391,24 +394,21 @@ export function Timer() {
             statusColor: undefined as undefined,
           };
 
-  // Тик каждую секунду при RUNNING — для интерполяции (таймер тикает сразу, не ждём push от Rust)
-  const [, setTick] = useState(0);
+  // Dumb display: только rustElapsed от Rust. Нет setInterval/интерполяции — источник истины backend.
   const rustElapsed = effectiveTimerState?.elapsed_seconds ?? 0;
-  const wallElapsed = clientSessionStartMs != null
-    ? Math.floor((Date.now() - clientSessionStartMs) / 1000)
-    : 0;
-  // Интерполяция: когда poll ещё не вернул RUNNING (оптимистичный старт) — показываем wallElapsed
-  const useInterpolation =
-    effectiveTimerState?.state === 'RUNNING' &&
-    clientSessionStartMs != null &&
-    pollStaleAfterStartResume;
+  const [displayedElapsed, setDisplayedElapsed] = useState(rustElapsed);
+  // Jump guard: при RUNNING обновлять только если incoming >= current (избежать 01→03)
   useEffect(() => {
-    if (!useInterpolation) return;
-    const id = setInterval(() => setTick((t) => t + 1), 1000);
-    return () => clearInterval(id);
-  }, [useInterpolation]);
+    const incoming = rustElapsed;
+    setDisplayedElapsed((prev) => {
+      if (effectiveTimerState?.state === 'RUNNING') {
+        return incoming >= prev ? incoming : prev;
+      }
+      return incoming;
+    });
+  }, [rustElapsed, effectiveTimerState?.state]);
 
-  const elapsedSeconds = useInterpolation ? wallElapsed : rustElapsed;
+  const elapsedSeconds = displayedElapsed;
   const totalTodaySeconds = effectiveTimerState?.today_seconds ?? elapsedSeconds;
 
   // FIX: Показываем таймер если есть active time entry, даже если selectedProject не установлен

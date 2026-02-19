@@ -16,6 +16,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from './components/ui/tabs';
 import { Button } from './components/ui/button';
 import { LogOut } from 'lucide-react';
 import { logger } from './lib/logger';
+import { IPC_EVENTS, IPC_COMMANDS } from './lib/ipc';
 import { setSentryUser } from './lib/sentry';
 import { setCurrentUser } from './lib/current-user';
 import { api, USER_ROLES } from './lib/api';
@@ -88,7 +89,7 @@ function App() {
       .catch(error => {
         logger.debug('APP', 'Failed to get app version', error);
         // Fallback to package.json version if available
-        setAppVersion('0.1.28'); // Fallback when get_app_version fails
+        setAppVersion('0.1.29'); // Fallback when get_app_version fails
       });
   }, []);
 
@@ -541,17 +542,20 @@ function App() {
   // Listen for DB recovery from corruption (Rust auto-recovery)
   // Persistent banner + notification so user understands why local history might be missing
   useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    listen('db-recovered-from-corruption', () => {
+    let unlisten: (() => void) | null = null;
+    let cancelled = false;
+    listen(IPC_EVENTS.DB_RECOVERED, () => {
       setDbRecoveredBannerVisible(true);
       invoke('show_notification', {
         title: 'Hubnity — Database Recovered',
         body: 'Database was corrupted and has been recovered. Pending sync data may have been lost. Please check your time entries.',
       }).catch(() => {});
     }).then((fn) => {
-      unlisten = fn;
+      if (cancelled) fn();
+      else unlisten = fn;
     });
     return () => {
+      cancelled = true;
       unlisten?.();
     };
   }, []);
@@ -751,6 +755,8 @@ function App() {
 
     let isCleanedUp = false;
     const unlistenRef = { current: null as (() => void) | null };
+    /** OS AUDIT: Suppress ACTIVITY_DETECTED for 30s after wake (get_idle_time resets to 0) */
+    const suppressActivityUntilRef = { current: 0 };
 
     // FIX: DOM fallback for lastActivityTime — macOS HIDIdleTime can fail to reset on keyboard-only
     // (Karabiner-Elements issue #385). Detect mousemove/keydown/etc in app window.
@@ -799,15 +805,24 @@ function App() {
 
     (async () => {
       try {
-        const unlisten = await listen<number>('activity-detected', (ev) => {
+        const unlistenActivity = await listen<number>(IPC_EVENTS.ACTIVITY_DETECTED, (ev) => {
           if (isCleanedUp) return;
+          // OS AUDIT: Suppress false "active" (idle 0) for 30s after wake — get_idle_time resets
+          if (Date.now() < suppressActivityUntilRef.current && ev.payload === 0) return;
           logger.safeLogToRust('[ACTIVITY] Event received from Rust').catch((e) => {
             logger.debug('ACTIVITY', 'Failed to log (non-critical)', e);
           });
           useTrackerStore.getState().updateActivityTime(ev.payload);
         });
-        unlistenRef.current = unlisten;
-        if (isCleanedUp) unlisten();
+        const unlistenSleep = await listen(IPC_EVENTS.SYSTEM_SLEEP_DETECTED, () => {
+          if (isCleanedUp) return;
+          suppressActivityUntilRef.current = Date.now() + 30_000;
+        });
+        unlistenRef.current = () => {
+          unlistenActivity();
+          unlistenSleep();
+        };
+        if (isCleanedUp) unlistenRef.current();
         await logger.safeLogToRust('[ACTIVITY] Activity listener set up successfully').catch(() => {});
       } catch (error) {
         logger.error('ACTIVITY', 'Failed to setup activity listener', error);
@@ -1140,28 +1155,67 @@ function App() {
           return; // State changed or idle, skip screenshot
         }
         
-        // Take screenshot via Rust
-        screenshotData = await invoke<number[]>('take_screenshot', {
-          timeEntryId: finalTimeEntryId,
-        });
-        
-        // Final check before upload
+        // Take screenshot via Rust — prefer temp file path (no binary over IPC)
+        const accessToken = useTrackerStore.getState().getAccessToken();
+        const refreshToken = localStorage.getItem('refresh_token');
+        let tempPath: string | null = null;
+
+        try {
+          tempPath = await invoke<string>(IPC_COMMANDS.TAKE_SCREENSHOT_TO_TEMP, {
+            timeEntryId: finalTimeEntryId,
+          });
+        } catch (tempErr: any) {
+          logger.warn('SCREENSHOT', 'take_screenshot_to_temp failed, falling back to bytes', tempErr);
+        }
+
+        // Path-based upload: no binary over IPC, backend deletes temp file
+        if (tempPath && !accessToken) {
+          invoke(IPC_COMMANDS.DELETE_SCREENSHOT_TEMP_FILE, { tempPath }).catch(() => {});
+        }
+        if (tempPath && accessToken) {
+          try {
+            await logger.safeLogToRust('[FRONTEND] Uploading via Rust (temp path)...').catch(() => {});
+            await invoke(IPC_COMMANDS.UPLOAD_SCREENSHOT_FROM_PATH, {
+              tempPath,
+              timeEntryId: finalTimeEntryId,
+              accessToken,
+              refreshToken: refreshToken || null,
+            });
+            await logger.safeLogToRust('[FRONTEND] Upload via Rust successful').catch(() => {});
+            if (!isCleanedUp) {
+              window.dispatchEvent(new CustomEvent('screenshot:uploaded'));
+              if (localStorage.getItem('hubnity_notify_on_screenshot') === 'true') {
+                invoke('show_notification', {
+                  title: 'Screenshot captured',
+                  body: 'Screenshot saved and synced',
+                }).catch(() => {});
+              }
+            }
+            return;
+          } catch (rustError: any) {
+            logger.warn('SCREENSHOT', 'upload_screenshot_from_path failed (temp file already deleted by backend)', rustError);
+            await invoke('show_notification', {
+              title: 'Screenshot error',
+              body: rustError?.message ?? 'Could not upload screenshot',
+            }).catch(() => {});
+            return;
+          }
+        }
+
+        // Fallback: bytes path (when take_screenshot_to_temp failed or no token)
+        if (!screenshotData) {
+          screenshotData = await invoke<number[]>(IPC_COMMANDS.TAKE_SCREENSHOT, { timeEntryId: finalTimeEntryId });
+        }
         if (isCleanedUp) return;
-        
-        // Validate screenshot data
         if (!screenshotData || screenshotData.length === 0) {
           throw new Error('Screenshot data is empty');
         }
-        
-        // Check if screenshot is too large (e.g., > 10MB)
-        const maxSize = 10 * 1024 * 1024; // 10MB
+
+        const maxSize = 10 * 1024 * 1024;
         if (screenshotData.length > maxSize) {
           logger.warn('SCREENSHOT', `Screenshot is too large: ${screenshotData.length} bytes`);
-          // Continue anyway, but log warning
         }
-        
-        // Convert to File and upload to backend
-        // Handle potential errors during Blob/File creation
+
         let blob: Blob;
         let file: File;
         try {
@@ -1170,49 +1224,30 @@ function App() {
         } catch (blobError: any) {
           throw new Error(`Failed to create file from screenshot data: ${blobError.message}`);
         }
-        
-        // Final check before upload
         if (isCleanedUp) return;
-        
-        // Try uploading via Rust first (more reliable for large files)
-        try {
-          const accessToken = useTrackerStore.getState().getAccessToken();
-          
-          if (accessToken) {
-            await logger.safeLogToRust('[FRONTEND] Uploading via Rust...').catch((e) => {
-              logger.debug('SCREENSHOT', 'Failed to log (non-critical)', e);
-            });
-            const refreshToken = localStorage.getItem('refresh_token');
-            await invoke('upload_screenshot', {
+
+        if (accessToken) {
+          try {
+            await logger.safeLogToRust('[FRONTEND] Uploading via Rust (bytes)...').catch(() => {});
+            await invoke(IPC_COMMANDS.UPLOAD_SCREENSHOT, {
               pngData: Array.from(screenshotData),
               timeEntryId: finalTimeEntryId,
-              accessToken: accessToken,
+              accessToken,
               refreshToken: refreshToken || null,
             });
-            await logger.safeLogToRust('[FRONTEND] Upload via Rust successful').catch((e) => {
-              logger.debug('SCREENSHOT', 'Failed to log (non-critical)', e);
-            });
-            
-            // Emit event to refresh screenshots view
+            await logger.safeLogToRust('[FRONTEND] Upload via Rust successful').catch(() => {});
             if (!isCleanedUp) {
               window.dispatchEvent(new CustomEvent('screenshot:uploaded'));
-              // Optional notification for transparency (Settings → Notify when screenshot is captured)
               if (localStorage.getItem('hubnity_notify_on_screenshot') === 'true') {
-                invoke('show_notification', {
-                  title: 'Screenshot captured',
-                  body: 'Screenshot saved and synced',
-                }).catch(() => {});
+                invoke('show_notification', { title: 'Screenshot captured', body: 'Screenshot saved and synced' }).catch(() => {});
               }
             }
-            return; // Success, exit
+            return;
+          } catch (rustError: any) {
+            logger.warn('SCREENSHOT', 'Rust upload failed, trying JS fallback', rustError);
           }
-        } catch (rustError: any) {
-          logger.warn('SCREENSHOT', 'Rust upload failed, trying JS fallback', rustError);
-          await logger.safeLogToRust(`[FRONTEND] Rust upload failed: ${rustError}, trying JS fallback...`).catch((e) => {
-            logger.debug('SCREENSHOT', 'Failed to log (non-critical)', e);
-          });
         }
-        
+
         await useTrackerStore.getState().uploadScreenshot(file, finalTimeEntryId);
         
         // Emit event to refresh screenshots view
@@ -1236,7 +1271,7 @@ function App() {
             const accessToken = useTrackerStore.getState().getAccessToken();
             const refreshToken = localStorage.getItem('refresh_token');
             if (accessToken && screenshotData && screenshotData.length > 0 && finalTimeEntryId) {
-              await invoke('upload_screenshot', {
+              await invoke(IPC_COMMANDS.UPLOAD_SCREENSHOT, {
                 pngData: Array.from(screenshotData),
                 timeEntryId: finalTimeEntryId,
                 accessToken,
@@ -1415,7 +1450,7 @@ function App() {
     const setupIdleWindowListeners = async () => {
       try {
         // Listen for resume event from idle window
-        const unlistenResume = await listen('resume-tracking', async () => {
+        const unlistenResume = await listen(IPC_EVENTS.RESUME_TRACKING, async () => {
           // FIX: Update lastActivityTime immediately — prevents checkIdleStatus from re-pausing during async resume (Windows)
           useTrackerStore.getState().updateActivityTime();
           const { resumeTracking } = useTrackerStore.getState();
@@ -1431,7 +1466,7 @@ function App() {
         });
 
         // Listen for stop event from idle window
-        const unlistenStop = await listen('stop-tracking', async () => {
+        const unlistenStop = await listen(IPC_EVENTS.STOP_TRACKING, async () => {
           // FIX: Update lastActivityTime immediately — prevents checkIdleStatus from re-pausing during async stop (Windows)
           useTrackerStore.getState().updateActivityTime();
           const { stopTracking } = useTrackerStore.getState();
@@ -1496,7 +1531,7 @@ function App() {
 
     const setupStateRequestListener = async () => {
       try {
-        const unlisten = await listen('request-idle-state-for-idle-window', async () => {
+        const unlisten = await listen(IPC_EVENTS.REQUEST_IDLE_STATE, async () => {
           logger.debug('APP', '🔔 Idle window requested current state');
           const state = useTrackerStore.getState();
           const { idlePauseStartTime, idlePauseStartPerfRef, isLoading, lastActivityTime, lastActivityPerfRef, selectedProject, currentTimeEntry } = state;
